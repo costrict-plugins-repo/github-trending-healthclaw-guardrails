@@ -1,0 +1,160 @@
+"""Transactional email via Resend — one-time codes only (no PHI, no marketing).
+
+In development (no key) codes are logged to stderr instead of sent, so the
+whole auth flow is exercisable locally without a provider.
+"""
+
+from __future__ import annotations
+
+import logging
+
+import requests
+
+logger = logging.getLogger("careagents.mail")
+
+# Three outcomes, not two. A provider call can also end without telling us
+# anything — the request went out and the answer never came back — and that is
+# NOT the same as a refusal. Collapsing it into "failed" makes the caller state
+# something it did not observe, which is the whole shape of #220.
+#
+# All three are truthy strings on purpose: `if send_code(...)` cannot be
+# written by accident the way `if not send_code(...)` could, and a stale fake
+# that returns True/None/a code string lands in UNCONFIRMED rather than
+# silently reading as success.
+SENT = "sent"
+NOT_SENT = "not_sent"
+UNCONFIRMED = "unconfirmed"
+
+
+def real_mail_allowed(cfg) -> bool:
+    """Only production sends real mail, unless CARE_ALLOW_REAL_MAIL=1.
+
+    The `flask` CLI loads the repository's .env, which can hold a real
+    provider key, so a local run or a test with the key set would
+    otherwise email real addresses. Anything not production logs
+    "mail suppressed (not production)" instead.
+    """
+    return (getattr(cfg, "app_env", "") == "production"
+            or bool(getattr(cfg, "allow_real_mail", False)))
+
+
+def send_code(cfg, email: str, code: str, purpose: str) -> str:
+    """Send a one-time code. Returns SENT, NOT_SENT, or UNCONFIRMED.
+
+    The rule: a response is the only evidence of an outcome. The provider
+    answering 2xx is a send; the provider answering anything else is a refusal
+    (Resend returns a message id on acceptance, so a non-2xx did not queue);
+    never reaching the provider is a refusal. A request that went out and was
+    never answered — a read timeout — is UNCONFIRMED, because the mail may
+    already be in the person's inbox.
+    """
+    # Named for what the code does (10-20 patient walk): "verify" is the
+    # first code for an address with no account, which makes one.
+    verb = ("Your code to make a new account" if purpose == "verify"
+            else "Your sign-in code")
+    if not cfg.resend_api_key:
+        logger.warning("DEV email — %s for %s: %s", verb, email, code)
+        return SENT
+    if not real_mail_allowed(cfg):
+        # As with no key: the code is in the log so local sign-in works.
+        logger.warning("mail suppressed (not production) — %s for %s: %s",
+                       verb, email, code)
+        return SENT
+    html = (
+        f"<div style='font-family:system-ui,sans-serif;max-width:420px'>"
+        f"<h2 style='color:#22190E'>CareAgents</h2>"
+        f"<p>{verb}. Enter this code — it expires in 10 minutes:</p>"
+        f"<p style='font-size:30px;font-weight:700;letter-spacing:.18em;"
+        f"color:#C2532E'>{code}</p>"
+        f"<p style='color:#5E5240;font-size:13px'>If you didn't request this, "
+        f"you can ignore it.</p></div>")
+    try:
+        r = requests.post(
+            "https://api.resend.com/emails",
+            headers={"Authorization": f"Bearer {cfg.resend_api_key}"},
+            json={"from": cfg.resend_from, "to": [email],
+                  "subject": f"{verb} — CareAgents", "html": html},
+            timeout=15)
+    except requests.ConnectionError as exc:
+        # DNS failure, refused connection, TLS failure — the request never
+        # reached Resend, so nothing was sent.
+        logger.error("resend send failed: %s", type(exc).__name__)
+        return NOT_SENT
+    except requests.RequestException as exc:
+        # Chiefly a read timeout: the POST was written and the answer was
+        # lost. Resend may well have accepted and delivered it.
+        logger.error("resend send unconfirmed: %s", type(exc).__name__)
+        return UNCONFIRMED
+    if r.status_code not in (200, 201):
+        logger.error("resend send http %s", r.status_code)
+        return NOT_SENT
+    return SENT
+
+
+def send_notice(cfg, email: str, subject: str, line: str) -> str:
+    """Send a one-line account notice (no PHI). Returns SENT, NOT_SENT or
+    UNCONFIRMED, as send_code does. With no provider key nothing is sent
+    and nothing is logged: a notice is not needed to sign in."""
+    if not cfg.resend_api_key:
+        return NOT_SENT
+    if not real_mail_allowed(cfg):
+        logger.warning("mail suppressed (not production)")
+        return NOT_SENT
+    html = (f"<div style='font-family:system-ui,sans-serif;max-width:420px'>"
+            f"<h2 style='color:#22190E'>CareAgents</h2><p>{line}</p></div>")
+    try:
+        r = requests.post(
+            "https://api.resend.com/emails",
+            headers={"Authorization": f"Bearer {cfg.resend_api_key}"},
+            json={"from": cfg.resend_from, "to": [email],
+                  "subject": f"{subject} — CareAgents", "html": html,
+                  "text": line},
+            timeout=15)
+    except requests.ConnectionError as exc:
+        logger.error("resend notice failed: %s", type(exc).__name__)
+        return NOT_SENT
+    except requests.RequestException as exc:
+        logger.error("resend notice unconfirmed: %s", type(exc).__name__)
+        return UNCONFIRMED
+    if r.status_code not in (200, 201):
+        logger.error("resend notice http %s", r.status_code)
+        return NOT_SENT
+    return SENT
+
+
+def send_message(cfg, email: str, subject: str, html: str, text: str,
+                 reply_to: str | None = None,
+                 cc: list[str] | None = None) -> str:
+    """Send a short message whose HTML carries links (a beta tester's
+    email). The caller escapes anything a visitor typed, and passes as
+    `reply_to` only an account's own address or the team inbox, and as
+    `cc` only the owner's configured addresses. Returns SENT, NOT_SENT or
+    UNCONFIRMED, as send_code does; with no provider key nothing is sent
+    and nothing is logged."""
+    if not cfg.resend_api_key:
+        return NOT_SENT
+    if not real_mail_allowed(cfg):
+        logger.warning("mail suppressed (not production)")
+        return NOT_SENT
+    payload = {"from": cfg.resend_from, "to": [email],
+               "subject": f"{subject} — CareAgents", "html": html,
+               "text": text}
+    if reply_to:
+        payload["reply_to"] = reply_to
+    if cc:
+        payload["cc"] = list(cc)
+    try:
+        r = requests.post(
+            "https://api.resend.com/emails",
+            headers={"Authorization": f"Bearer {cfg.resend_api_key}"},
+            json=payload, timeout=15)
+    except requests.ConnectionError as exc:
+        logger.error("resend message failed: %s", type(exc).__name__)
+        return NOT_SENT
+    except requests.RequestException as exc:
+        logger.error("resend message unconfirmed: %s", type(exc).__name__)
+        return UNCONFIRMED
+    if r.status_code not in (200, 201):
+        logger.error("resend message http %s", r.status_code)
+        return NOT_SENT
+    return SENT

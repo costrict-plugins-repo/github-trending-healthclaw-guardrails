@@ -1,0 +1,123 @@
+{#
+  Shared chrome for every page except index.html (standalone) and
+  review_base.html (relayed to careagents.cloud — see #396; it must not carry
+  navigation or same-origin assets).
+
+  TWO GROUNDS, and the default is deliberate.
+
+  `surface-console` + data-bs-theme="dark" is the DEFAULT so that any template
+  extending this file renders exactly as it did before the redesign. The
+  operational dashboards (r6_dashboard, fhir_control_panel, command_center)
+  style their own components in r6-dashboard.css and inherit the dark ground
+  from Bootstrap; repainting them was explicitly out of scope. A page opts IN
+  to the editorial ground:
+
+      {% block surface %}surface-paper{% endblock %}
+      {% block bstheme %}light{% endblock %}
+
+  Every asset below is self-hosted. Nothing here calls a CDN — that is what
+  lets the CSP in app.py stay default-src 'self'. Re-vendor with
+  scripts/vendor_frontend_assets.py; do not swap a local path back to a CDN to
+  pick up a newer version.
+#}<!DOCTYPE html>
+<html lang="en"
+      class="{% block surface %}surface-console{% endblock %}"
+      data-bs-theme="{% block bstheme %}dark{% endblock %}">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{% block title %}HealthClaw Guardrails{% endblock %}</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/fonts.css') }}">
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/vendor/bootstrap.min.css') }}">
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/vendor/fontawesome.min.css') }}">
+    {# healthclaw.css last of the shared sheets: it sets the type tokens that
+       override Bootstrap's, and the chrome below depends on them. #}
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/healthclaw.css') }}">
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/r6-dashboard.css') }}">
+    {% block head %}{% endblock %}
+</head>
+<body>
+    <a href="#main" class="visually-hidden">Skip to content</a>
+
+    <nav id="main-nav" class="hc-nav">
+      <div class="hc-nav__inner">
+        <a href="{{ url_for('index') }}" class="hc-nav__brand">
+          <span class="hc-nav__mark">HealthClaw</span>
+          {# Released version. tests/test_site_version_sync.py greps this file
+             for the literal and fails the build when a release moves past it
+             (RELEASING.md step 2). #}
+          <span class="hc-nav__ver">v2.1.0</span>
+        </a>
+        <div class="hc-nav__links">
+          <a class="hc-nav__link"
+             href="{{ url_for('index') }}"
+             {% if request.path == url_for('index') %}aria-current="page"{% endif %}>Home</a>
+          <a class="hc-nav__link"
+             href="{{ url_for('r6_dashboard') }}"
+             {% if request.path == url_for('r6_dashboard') %}aria-current="page"{% endif %}>Conformance</a>
+          <a class="hc-nav__link"
+             href="/command-center"
+             {% if request.path.startswith('/command-center') %}aria-current="page"{% endif %}>Command Center</a>
+          <a class="hc-nav__link"
+             href="{{ url_for('faq') }}"
+             {% if request.path == url_for('faq') %}aria-current="page"{% endif %}>FAQ</a>
+          <a class="hc-nav__link"
+             href="{{ url_for('wiki') }}"
+             {% if request.path == url_for('wiki') %}aria-current="page"{% endif %}>Wiki</a>
+          <a class="hc-nav__link"
+             href="{{ url_for('skills_index') }}"
+             {% if request.path == url_for('skills_index') %}aria-current="page"{% endif %}>Skills</a>
+          <a class="hc-nav__link"
+             href="{{ url_for('security') }}"
+             {% if request.path == url_for('security') %}aria-current="page"{% endif %}>Security</a>
+          <a class="hc-nav__link"
+             href="{{ url_for('about') }}"
+             {% if request.path == url_for('about') %}aria-current="page"{% endif %}>About</a>
+        </div>
+      </div>
+    </nav>
+
+    <main id="main" class="{% block mainclass %}container{% endblock %}">
+        {% with messages = get_flashed_messages(with_categories=true) %}
+            {% if messages %}
+                {% for category, message in messages %}
+                    <div class="flash flash--{{ category }}" role="alert">
+                        <span>{{ message }}</span>
+                        <button type="button" class="flash__close"
+                                data-bs-dismiss="alert" aria-label="Dismiss">&times;</button>
+                    </div>
+                {% endfor %}
+            {% endif %}
+        {% endwith %}
+
+        {% block content %}{% endblock %}
+    </main>
+
+    <footer class="hc-foot">
+      <div class="hc-foot__inner">
+        <div>
+          <div class="hc-foot__mark">HealthClaw Guardrails</div>
+          <div>FHIR R4 US Core v9 + R6 · MCP</div>
+          <div>Built by <a href="{{ url_for('about') }}">Vestel AI LLC</a></div>
+        </div>
+        <div class="hc-foot__col">
+          <div class="hc-foot__h">Project</div>
+          <a href="https://github.com/aks129/HealthClawGuardrails" target="_blank" rel="noopener noreferrer">GitHub</a>
+          <a href="{{ url_for('skills_index') }}">Skills</a>
+          <a href="{{ url_for('r6_dashboard') }}">Dashboard</a>
+        </div>
+        <div class="hc-foot__col">
+          <div class="hc-foot__h">Company</div>
+          <a href="{{ url_for('about') }}">About</a>
+          <a href="{{ url_for('security') }}">Security posture</a>
+          <div class="hc-foot__h push-4">Legal</div>
+          <a href="{{ url_for('privacy') }}">Privacy Policy</a>
+          <a href="{{ url_for('terms') }}">Terms &amp; Conditions</a>
+        </div>
+      </div>
+    </footer>
+
+    <script src="{{ url_for('static', filename='js/vendor/bootstrap.bundle.min.js') }}"></script>
+    {% block scripts %}{% endblock %}
+</body>
+</html>

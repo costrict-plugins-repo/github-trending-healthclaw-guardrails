@@ -1,0 +1,1103 @@
+"""
+Action lifecycle API — propose / commit / confirm / status / provider callbacks.
+
+Approve-is-the-commit (Task 10):
+  propose  -> tenant header only; red-flag screened + rail-validated;
+              returns draft for human review
+  commit   -> X-Step-Up-Token (validated, tuple destructured); SUBMITS the
+              action for out-of-band approval (202, awaiting_confirmation).
+              Nothing executes here — the spoofable X-Human-Confirmed gate
+              is gone.
+  confirm  -> the human's out-of-band Approve (dashboard/Telegram). The ONLY
+              place an action executes: guarded claim -> consent record ->
+              provider call.
+  callback -> shared-secret verification
+
+Audit detail and Telegram pushes use ProposedAction.summary() ONLY (no PHI).
+"""
+
+import json
+import logging
+import os
+import uuid
+from datetime import timedelta
+
+from flask import Blueprint, jsonify, request
+
+from models import db
+from r6 import constant_time
+from r6.runtime_config import internal_mint_secret
+from r6.access import (Scope, TenantRejected, TenantSource, has_grant,
+                       require_grant, require_open_tenant, tenant_from_request)
+from r6.actions import errors
+from r6.actions.confirmations import (ACTION_APPROVAL_AUDIENCE,
+                                      APPROVED_VIA_VALUES,
+                                      approval_operation,
+                                      consume_confirmation,
+                                      issue_confirmation,
+                                      approved_digests,
+                                      payload_digest)
+from r6.actions.models import ProposedAction, VALID_KINDS, _utcnow
+from r6.actions.registry import get_executor
+from r6.actions.rx_transfer import build_transfer_request, medication_names
+from r6.actions.safety import EMERGENCY_MESSAGE, screen_text
+from r6.actions.state import transition_action
+from r6.audit import add_audit_event
+from r6.rate_limit import rate_limit_middleware
+from r6.read_auth import authenticate_tenant_read, authorize_tenant_read
+from r6.stepup import generate_step_up_token
+from r6.telegram_push import notify_tenant
+from r6.body_guard import json_body_within_depth
+
+logger = logging.getLogger(__name__)
+
+actions_blueprint = Blueprint('actions', __name__, url_prefix='/r6/actions')
+
+# Register rate limiting (same pattern as r6_blueprint in r6/routes.py)
+rate_limit_middleware(actions_blueprint)
+
+
+
+def _error(status, message):
+    return jsonify({'error': message}), status
+
+
+def _tenant_or_none():
+    """Resolve X-Tenant-Id through the access kernel (spec §1.1, slice 10).
+
+    Returns a validated `Tenant`, or None when the header is ABSENT so every
+    handler keeps answering the 400 it always answered. A MALFORMED id now
+    raises out to the app-wide TenantRejected handler instead of collapsing
+    into the same None: the two failures were indistinguishable here, which
+    is how a blueprint ends up with one refusal message for two causes.
+
+    The accepted set does not move. The pattern this module used to keep
+    and the kernel's _TENANT_ID_PATTERN are both ``[a-zA-Z0-9_-]{1,64}``,
+    compared byte-for-byte before the swap; the local copy is deleted here
+    rather than left as a second definition of the same rule.
+
+    Returning the Tenant rather than the string is the point: require_grant
+    raises TypeError on a bare string, so the type is what proves the format
+    check ran. Handlers take ``.id`` where they need the string.
+    """
+    try:
+        return tenant_from_request(sources=(TenantSource.HEADER,))
+    except TenantRejected as exc:
+        if exc.reason == TenantRejected.MALFORMED:
+            raise
+        return None
+
+
+def _emergency_refusal_or_none(tenant_id, text):
+    """Mandatory red-flag screen on free-text at PROPOSE. A hit refuses the
+    action with 911/urgent-care escalation, audited like a Schedule-II
+    refusal (matched lexicon phrase only — never the free text itself)."""
+    hit = screen_text(text)
+    if hit is None:
+        return None
+    add_audit_event(
+        'create', resource_type='ProposedAction',
+        agent_id=request.headers.get('X-Agent-Id'), tenant_id=tenant_id,
+        outcome='failure', detail='emergency_indicated: %s' % hit['matched'],
+    )
+    db.session.commit()
+    return jsonify({'error_code': errors.EMERGENCY_INDICATED,
+                    'error': EMERGENCY_MESSAGE}), 422
+
+
+def _rail_validation_or_none(kind, payload):
+    """Executor validation when a rail is registered for this kind. A
+    VALID_KINDS entry with no registered rail (none today; possible for a
+    future kind) skips this — VALID_KINDS remains the propose gate, and
+    such a kind fails loud at confirm instead."""
+    ex = get_executor(kind)
+    if ex is None:
+        return None
+    errs = ex.validate(payload)
+    if errors.PROVIDER_NOT_CONFIGURED in errs:
+        # The rail is switched off on this server. Say that, not "invalid
+        # payload": nothing about the request is wrong, and nothing is staged.
+        return jsonify({'error_code': errors.PROVIDER_NOT_CONFIGURED,
+                        'error': 'The %s rail is turned off on this server, '
+                                 'so nothing was proposed.' % kind}), 503
+    if errs:
+        return jsonify({'error_code': errors.PAYLOAD_INVALID,
+                        'error': 'Action payload failed %s rail validation.'
+                                 % kind,
+                        'errors': errs}), 422
+    return None
+
+
+#: Kinds that reach a person through a paid provider: a call or a text per
+#: approval. The cap bounds how many one approval surface can turn into
+#: provider requests in a day, which the per-action human gate cannot.
+DAILY_CAPPED_KINDS = ('phone-call', 'insurance-call', 'sms')
+
+#: A product default, not an architecture one (human-gate spec 6.1).
+DEFAULT_DAILY_CAP = 10
+
+
+def daily_cap():
+    """ACTIONS_DAILY_CAP: executions per tenant, per capped kind, per UTC
+    day. 0 refuses every capped action. Anything unreadable falls back to
+    the default rather than to no cap."""
+    raw = os.environ.get('ACTIONS_DAILY_CAP', '').strip()
+    if raw.isdigit():
+        return int(raw)
+    if raw:
+        logger.warning('ACTIONS_DAILY_CAP is not a non-negative integer; '
+                       'using the default of %d', DEFAULT_DAILY_CAP)
+    return DEFAULT_DAILY_CAP
+
+
+def _over_daily_cap(action):
+    """True when this action's claim takes its tenant past the cap for its
+    kind today. Counts claims (claimed_at is stamped only by the confirm
+    claim), never proposals, so an agent cannot spend a person's cap without
+    a human tap. Runs after the claim, so the count includes this action.
+    Two different actions approved in the same instant can both pass the
+    boundary; the cap bounds a flood, not a race of two."""
+    if action.kind not in DAILY_CAPPED_KINDS:
+        return False
+    midnight = _utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+    claimed_today = ProposedAction.query.filter(
+        ProposedAction.tenant_id == action.tenant_id,
+        ProposedAction.kind == action.kind,
+        ProposedAction.claimed_at >= midnight,
+    ).count()
+    return claimed_today > daily_cap()
+
+
+def _resolve_from_executing(action, result):
+    """Map an executor verdict onto the state machine for an action just
+    claimed into 'executing'. The never-clobber rule lives HERE and only
+    here: every status change is a guarded transition from 'executing', and
+    a False return means a provider webhook resolved the action first — the
+    webhook's verdict wins and the authoritative state is reported (200)."""
+    action_id = action.id
+    tenant_id = action.tenant_id
+    agent_id = request.headers.get('X-Agent-Id')
+    label = action.summary().get('to') or 'recipient'
+
+    if result.status == 'executing':
+        # Provider accepted; a webhook will resolve. Store the ref WITHOUT
+        # touching status — a fast webhook may already have resolved the
+        # action; never clobber its verdict.
+        ProposedAction.query.filter_by(id=action_id).update(
+            {'external_ref': result.provider_ref}, synchronize_session=False)
+        db.session.commit()
+        db.session.refresh(action)
+        add_audit_event(
+            'update', resource_type='ProposedAction', resource_id=action.id,
+            agent_id=agent_id, tenant_id=tenant_id,
+            detail=json.dumps(action.summary()),
+        )
+        db.session.commit()
+        notify_tenant(tenant_id, '📤 %s to %s: %s'
+                      % (action.kind, label, action.status))
+        if action.status != 'executing':
+            # Fast webhook won while we were storing the ref — report the
+            # authoritative state.
+            return jsonify(action.to_dict()), 200
+        return jsonify({'id': action.id, 'status': 'executing',
+                        'note': 'provider accepted; webhook will resolve'}), 200
+
+    if result.status == 'completed':
+        fields = {'outcome_summary': (json.dumps(result.outcome)
+                                      if result.outcome else 'completed')}
+        if result.provider_ref:
+            fields['external_ref'] = result.provider_ref
+        resolved = transition_action(
+            action_id, from_states=('executing',), to_state='completed',
+            actor='confirm', **fields)
+        db.session.refresh(action)
+        if not resolved:
+            return jsonify(action.to_dict()), 200   # webhook won
+        add_audit_event(
+            'update', resource_type='ProposedAction', resource_id=action.id,
+            agent_id=agent_id, tenant_id=tenant_id,
+            detail=json.dumps(action.summary()),
+        )
+        db.session.commit()
+        notify_tenant(tenant_id, '✅ %s to %s: completed'
+                      % (action.kind, label))
+        return jsonify(action.to_dict()), 200
+
+    if result.status == 'needs_review':
+        resolved = transition_action(
+            action_id, from_states=('executing',), to_state='needs_review',
+            actor='confirm',
+            outcome_summary=(json.dumps(result.outcome)
+                             if result.outcome else 'needs review'))
+        db.session.refresh(action)
+        if not resolved:
+            return jsonify(action.to_dict()), 200   # webhook won
+        add_audit_event(
+            'update', resource_type='ProposedAction', resource_id=action.id,
+            agent_id=agent_id, tenant_id=tenant_id,
+            detail=json.dumps(action.summary()),
+        )
+        db.session.commit()
+        notify_tenant(tenant_id, '⚠️ %s to %s: needs review'
+                      % (action.kind, label))
+        return jsonify({'id': action.id, 'status': 'needs_review',
+                        'outcome_summary': action.outcome_summary}), 200
+
+    # result.status == 'failed' (ExecutionResult admits no other statuses).
+    # Post-send ambiguity (timeout/garbled response/5xx) -> 'unknown', never
+    # 'failed': failed invites re-propose -> duplicate call.
+    new_status = 'unknown' if result.outcome_unknown else 'failed'
+    resolved = transition_action(
+        action_id, from_states=('executing',), to_state=new_status,
+        actor='confirm', outcome_summary=result.error)
+    db.session.refresh(action)
+    if not resolved:
+        return jsonify(action.to_dict()), 200       # webhook won
+    add_audit_event(
+        'update', resource_type='ProposedAction', resource_id=action.id,
+        agent_id=agent_id, tenant_id=tenant_id,
+        outcome='failure', detail=result.error,
+    )
+    db.session.commit()
+    notify_tenant(tenant_id, '⚠️ %s to %s: %s'
+                  % (action.kind, label, new_status))
+    # Coerce onto the error taxonomy: executors SHOULD return codes from
+    # r6.actions.errors, but the API contract never leaks anything else.
+    error_code = (result.error if result.error in errors.ALL
+                  else errors.PROVIDER_ERROR)
+    response = {'id': action.id, 'status': new_status,
+                'error_code': error_code,
+                'error': 'Provider execution failed (%s).' % error_code}
+    if result.outcome_unknown:
+        response['note'] = ('Provider outcome unknown — the provider may '
+                            'have acted; do not re-propose without '
+                            'reconciliation.')
+    return jsonify(response), 502
+
+
+@actions_blueprint.route('/rx-transfer/propose', methods=['POST'])
+def propose_rx_transfer():
+    """Build a prescription-transfer request call from the tenant's active
+    MedicationRequests and stage it as a proposed phone-call action.
+
+    Body: {to_pharmacy: {name, phone}, from_pharmacy?: {name, phone},
+           medication_names?: [str]}  (names filter; default = all active)
+
+    Commit is the EXISTING /actions/<id>/commit — step-up stays mandatory and
+    commit only SUBMITS for out-of-band approval; this endpoint only drafts.
+    Schedule II medications are refused with an explanation (never
+    transferable; see rx_transfer.py).
+    """
+    tenant = _tenant_or_none()
+    if tenant is None:
+        return _error(400, 'X-Tenant-Id header is required')
+    tenant_id = tenant.id
+    tenant_id = authorize_tenant_read(tenant_id)
+    if tenant_id is None:
+        return _error(401, 'authentication required for this tenant')
+
+    body = request.get_json(silent=True) or {}
+    to_pharmacy = body.get('to_pharmacy') or {}
+    if not (isinstance(to_pharmacy, dict) and to_pharmacy.get('name')
+            and to_pharmacy.get('phone')):
+        return _error(400, 'to_pharmacy {name, phone} is required')
+    from_pharmacy = body.get('from_pharmacy') \
+        if isinstance(body.get('from_pharmacy'), dict) else None
+    name_filter = body.get('medication_names')
+
+    from r6.models import R6Resource
+    # Live rows only: a medication the patient deleted must not be drafted
+    # into a call a human is then asked to approve (#805's shape).
+    rows = R6Resource.query.filter_by(
+        resource_type='MedicationRequest', tenant_id=tenant_id,
+        is_deleted=False).all()
+    meds = [r.to_fhir_json() for r in rows]
+    if isinstance(name_filter, list) and name_filter:
+        wanted = {n.lower() for n in name_filter if isinstance(n, str)}
+        meds = [m for m in meds
+                if wanted & {n.lower() for n in medication_names(m)}]
+
+    result = build_transfer_request(meds, to_pharmacy,
+                                    from_pharmacy=from_pharmacy)
+    if result['action_payload'] is None:
+        return jsonify({
+            'error': 'no transferable medications',
+            'refused': result['refused'],
+            'detail': ('Nothing to transfer: no active medication orders '
+                       'matched, or all matches are Schedule II (which can '
+                       'never be transferred — a new prescription is '
+                       'required).'),
+        }), 422
+
+    # This endpoint becomes a write only when a transferable draft exists.
+    # Read-scoped credentials may preview the no-action/refusal response above,
+    # but persisting a ProposedAction requires an explicit write-capable token.
+    # Access kernel, slice 5. also_bearer replaces the hand-rolled
+    # Authorization fallback above it: the kernel reads X-Step-Up-Token
+    # first, then Bearer, which is the order this site already used.
+    require_grant(
+        scope=Scope.WRITE,
+        tenant=tenant,
+        also_bearer=True,
+        absent_status=401,
+        rejected_status=401,
+    )
+
+    refusal = _emergency_refusal_or_none(tenant_id,
+                                         result['action_payload'].get('body'))
+    if refusal is not None:
+        return refusal
+    invalid = _rail_validation_or_none('phone-call', result['action_payload'])
+    if invalid is not None:
+        return invalid
+
+    action = ProposedAction(tenant_id=tenant_id, kind='phone-call',
+                            payload=result['action_payload'])
+    db.session.add(action)
+    db.session.flush()
+    add_audit_event(
+        'create', resource_type='ProposedAction', resource_id=action.id,
+        agent_id=request.headers.get('X-Agent-Id'), tenant_id=tenant_id,
+        detail=json.dumps(action.summary()),
+    )
+    db.session.commit()
+
+    return jsonify({
+        'action': action.summary(),
+        'allowed': result['allowed'],
+        'refused': result['refused'],
+        'next_step': ('Review the draft with the patient, then submit via '
+                      'POST /r6/actions/%s/commit with X-Step-Up-Token. The '
+                      'patient then approves out of band (dashboard/Telegram) '
+                      'to execute.' % action.id),
+    }), 201
+
+
+@actions_blueprint.route('/propose', methods=['POST'])
+def propose_action():
+    tenant = _tenant_or_none()
+    if tenant is None:
+        return _error(400, 'X-Tenant-Id header is required')
+    tenant_id = tenant.id
+
+    # propose has no step-up gate at all — the tenant header is the whole
+    # credential — so this parse is reachable by anyone who can name a
+    # tenant. There is no auth gate to move above it; bounding the depth is
+    # the fix (#312).
+    body, too_deep = json_body_within_depth()
+    if too_deep:
+        return _error(400, 'request body nesting is too deep')
+    body = body or {}
+    if not isinstance(body, dict):
+        return _error(400, 'request body must be a JSON object')
+    kind = body.get('kind')
+    if kind not in VALID_KINDS:
+        return _error(400, 'kind must be one of: %s' % ', '.join(VALID_KINDS))
+    payload = body.get('payload')
+    if not isinstance(payload, dict) or not payload.get('body'):
+        return _error(400, 'payload.body is required')
+    if not isinstance(payload.get('body'), str):
+        return _error(400, 'payload.body must be a string')
+    to_label = payload.get('to')
+    if to_label is not None and (not isinstance(to_label, str) or len(to_label) > 128):
+        return _error(400, 'payload.to must be a string of at most 128 chars')
+    if len(json.dumps(payload)) > 65536:
+        return _error(400, 'payload too large (64KB max)')
+
+    refusal = _emergency_refusal_or_none(tenant_id, payload['body'])
+    if refusal is not None:
+        return refusal
+    invalid = _rail_validation_or_none(kind, payload)
+    if invalid is not None:
+        return invalid
+
+    action = ProposedAction(tenant_id=tenant_id, kind=kind, payload=payload)
+    db.session.add(action)
+    db.session.flush()
+    add_audit_event(
+        'create', resource_type='ProposedAction', resource_id=action.id,
+        agent_id=request.headers.get('X-Agent-Id'), tenant_id=tenant_id,
+        detail=json.dumps(action.summary()),
+    )
+    db.session.commit()
+    return jsonify(action.to_dict()), 201
+
+
+@actions_blueprint.route('/<action_id>/commit', methods=['POST'])
+def commit_action(action_id):
+    """SUBMIT-FOR-CONFIRMATION. Nothing executes here: commit moves the
+    proposal to awaiting_confirmation and pushes an approval request to the
+    patient's out-of-band channels. The old X-Human-Confirmed header gate is
+    gone — any caller could spoof a header; nobody can spoof the patient
+    tapping Approve in their own dashboard/Telegram."""
+    tenant = _tenant_or_none()
+    if tenant is None:
+        return _error(400, 'X-Tenant-Id header is required')
+    tenant_id = tenant.id
+
+    # Access kernel, slice 5. The "ALWAYS destructure the tuple" comment that
+    # stood here was a convention asking to be remembered; require_grant
+    # removes the tuple, so there is nothing left to remember.
+    require_grant(
+        scope=Scope.WRITE,
+        tenant=tenant,
+        absent_status=401,
+        rejected_status=401,
+    )
+    # A closed tenant arms nothing new (409, audited).
+    require_open_tenant(tenant)
+
+    action = ProposedAction.query.filter_by(
+        id=action_id, tenant_id=tenant_id).first()
+    if action is None:
+        return _error(404, 'Unknown action')
+
+    if action.status == 'proposed' and action.is_expired():
+        # Guarded expiry: only flips rows still 'proposed' — never clobbers a
+        # concurrently advanced action.
+        expired = transition_action(
+            action_id, from_states=('proposed',), to_state='expired',
+            actor='commit-route', detail='proposal expired')
+        db.session.refresh(action)
+        if expired:
+            add_audit_event(
+                'update', resource_type='ProposedAction', resource_id=action_id,
+                agent_id=request.headers.get('X-Agent-Id'), tenant_id=tenant_id,
+                detail='proposal expired',
+            )
+            db.session.commit()
+            return _error(410, 'Proposal expired — propose the action again')
+        return _error(409, 'Action is %s, not proposed' % action.status)
+
+    # The claim's WHERE re-checks expiry (extra_criteria), closing the TOCTOU
+    # between the snapshot check above and the claim: an expired row can
+    # never win, even if it expired between the two statements.
+    moved = transition_action(
+        action_id, from_states=('proposed',),
+        to_state='awaiting_confirmation', actor='commit-route',
+        extra_criteria=[ProposedAction.expires_at > _utcnow()])
+    db.session.refresh(action)
+    if not moved:
+        if action.status == 'proposed':
+            # Still 'proposed' means the expiry predicate refused the claim —
+            # flip it (guarded) and report, mirroring the snapshot path.
+            expired = transition_action(
+                action_id, from_states=('proposed',), to_state='expired',
+                actor='commit-route', detail='proposal expired')
+            db.session.refresh(action)
+            if expired:
+                add_audit_event(
+                    'update', resource_type='ProposedAction',
+                    resource_id=action_id,
+                    agent_id=request.headers.get('X-Agent-Id'),
+                    tenant_id=tenant_id, detail='proposal expired',
+                )
+                db.session.commit()
+                return _error(410, 'Proposal expired — propose the action '
+                                   'again')
+        if action.status == 'expired':
+            return _error(410, 'Proposal expired — propose the action again')
+        return _error(409, 'Action is %s, not proposed' % action.status)
+
+    add_audit_event(
+        'update', resource_type='ProposedAction', resource_id=action.id,
+        agent_id=request.headers.get('X-Agent-Id'), tenant_id=tenant_id,
+        detail=json.dumps(action.summary()),
+    )
+    db.session.commit()
+
+    # Telegram push: summary-level ONLY (kind + recipient label)
+    label = action.summary().get('to') or 'recipient'
+    # The surface that exists (#215, #748): the person's CareAgents agent
+    # page, "Waiting for you". There is no HealthClaw dashboard to approve
+    # in, and this chat cannot approve either (#738).
+    notify_tenant(tenant_id,
+                  '🔔 Approval needed: %s to %s. Open CareAgents — it is '
+                  'under "Waiting for you" on your agent.' % (action.kind, label))
+
+    return jsonify({
+        'id': action.id,
+        'status': 'awaiting_confirmation',
+        'next_step': ('Terminal for this turn: the patient must approve out '
+                      'of band, on their CareAgents review page ("Waiting '
+                      'for you"). Poll GET /r6/actions/%s or end your turn. '
+                      'Do not retry commit.' % action.id),
+    }), 202
+
+
+@actions_blueprint.route('/<action_id>/decline', methods=['POST'])
+def decline_action(action_id):
+    """The human's out-of-band Decline: an explicit no, recorded as one.
+
+    Until #520 a person who read the proposal and refused it landed in the
+    same record as a person who never opened it (`expired`). The audit trail
+    could prove nobody approved; it could not prove somebody objected. This
+    route is on the same footing as Approve: the same action-bound,
+    payload-bound, single-use credential, so only the surface that showed
+    the person the card can record their answer, and a declined credential
+    cannot be turned around to approve. Body optional:
+    {'declined_via': 'dashboard' | 'telegram' | 'review-page'}.
+
+    Terminal. A declined action is re-proposed, never revived. Nothing here
+    is ever inferred: a lapsed window stays `expired`.
+    """
+    tenant = _tenant_or_none()
+    if tenant is None:
+        return _error(400, 'X-Tenant-Id header is required')
+    tenant_id = tenant.id
+
+    body = request.get_json(silent=True) or {}
+    declined_via = body.get('declined_via', 'dashboard')
+    if declined_via not in APPROVED_VIA_VALUES:
+        return _error(400, 'declined_via must be one of: %s'
+                      % ', '.join(APPROVED_VIA_VALUES))
+
+    # Same gate as confirm, for the same reasons (see confirm_action): bound
+    # to the action and to the payload the person was shown, spent on use.
+    bound = ProposedAction.query.filter_by(
+        id=action_id, tenant_id=tenant_id).first()
+    require_grant(
+        scope=Scope.WRITE,
+        tenant=tenant,
+        audience=ACTION_APPROVAL_AUDIENCE,
+        operation=(approval_operation(action_id, bound.payload_json)
+                   if bound is not None else None),
+        consume_nonce=bound is not None,
+        absent_status=401,
+        rejected_status=401,
+    )
+
+    action = ProposedAction.query.filter_by(
+        id=action_id, tenant_id=tenant_id).first()
+    if action is None:
+        return _error(404, 'Unknown action')
+
+    # A lapsed window is a timeout, not a refusal; it stays `expired` even
+    # when the person taps Decline after the fact, so the record never says
+    # "declined" about an action nobody could still have approved.
+    if action.status == 'awaiting_confirmation' and action.is_expired():
+        lapsed = transition_action(
+            action_id, from_states=('awaiting_confirmation',),
+            to_state='expired', actor='decline',
+            detail='approval window lapsed')
+        db.session.refresh(action)
+        if lapsed:
+            # Same-session audit (the post-commit shim is ratcheted): the
+            # transition has committed, so this row lands in its own
+            # transaction only when the lapse really happened.
+            add_audit_event(
+                'update', resource_type='ProposedAction', resource_id=action_id,
+                agent_id=request.headers.get('X-Agent-Id'), tenant_id=tenant_id,
+                detail='approval window lapsed',
+            )
+            db.session.commit()
+        return _error(410, 'Approval window lapsed; nothing to decline')
+
+    moved = transition_action(
+        action_id, from_states=('awaiting_confirmation',),
+        to_state='declined', actor='decline',
+        detail='declined via %s' % declined_via,
+        extra_criteria=[ProposedAction.expires_at > _utcnow()])
+    db.session.refresh(action)
+    if not moved:
+        if action.status == 'awaiting_confirmation':
+            # Still awaiting means the expiry predicate refused the claim
+            # (the window lapsed between the snapshot check and the UPDATE):
+            # flip it, guarded, and report the timeout, mirroring confirm.
+            lapsed = transition_action(
+                action_id, from_states=('awaiting_confirmation',),
+                to_state='expired', actor='decline',
+                detail='approval window lapsed')
+            db.session.refresh(action)
+            if lapsed:
+                add_audit_event(
+                    'update', resource_type='ProposedAction',
+                    resource_id=action_id,
+                    agent_id=request.headers.get('X-Agent-Id'),
+                    tenant_id=tenant_id, detail='approval window lapsed')
+                db.session.commit()
+        if action.status == 'expired':
+            return _error(410, 'Approval window lapsed; nothing to decline')
+        return _error(409, 'Action is %s, not awaiting_confirmation'
+                      % action.status)
+
+    # PHI-free: the surface and the digest of what was refused, never the
+    # payload. A decline is evidence on the same footing as an approval.
+    add_audit_event(
+        'update', resource_type='ProposedAction', resource_id=action.id,
+        agent_id=request.headers.get('X-Agent-Id'), tenant_id=tenant_id,
+        detail='declined via %s; payload_digest=%s' % (
+            declined_via, payload_digest(action.payload_json)),
+    )
+    db.session.commit()
+    return jsonify({'id': action.id, 'status': action.status}), 200
+
+
+@actions_blueprint.route('/<action_id>/confirm', methods=['POST'])
+def confirm_action(action_id):
+    """The human's out-of-band Approve — the ONLY place an action executes.
+    Called by the dashboard/Telegram approve handler with a single-use token
+    bound to this exact action. Body optional: {'approved_via': 'dashboard'
+    | 'telegram'} (default 'dashboard').
+
+    Ordering rationale (do not reorder):
+      1. THE CLAIM FIRST. The guarded transition awaiting_confirmation ->
+         executing is the mutex — a single guarded UPDATE, so exactly one
+         concurrent Approve wins. It must precede issuing the confirmation:
+         transition_action() COMMITS the session on both branches, so a
+         pre-issued ActionConfirmation row would be committed even when the
+         claim loses — a consent record for an execution that never happened.
+      2. AFTER a winning claim, issue + immediately consume the
+         ActionConfirmation. The claim is the LOCK; the confirmation row
+         (issued and consumed at the same instant, one transaction) is the
+         CONSENT RECORD — the durable who/when/via artifact of the approval.
+    """
+    tenant = _tenant_or_none()
+    if tenant is None:
+        return _error(400, 'X-Tenant-Id header is required')
+    tenant_id = tenant.id
+
+    # Pure input validation FIRST: a 400 on a malformed body must not burn
+    # the single-use credential consumed just below. Everything that touches
+    # state (load/claim/execute) stays behind the consuming validation.
+    body = request.get_json(silent=True) or {}
+    approved_via = body.get('approved_via', 'dashboard')
+    if approved_via not in APPROVED_VIA_VALUES:
+        return _error(400, 'approved_via must be one of: %s'
+                      % ', '.join(APPROVED_VIA_VALUES))
+
+    # Access kernel, slice 5d. Slice 5 left this gate behind because the
+    # kernel collapsed every refusal into 'Invalid step-up token' and this
+    # endpoint's contract names the cause. The owner ruled on 2026-08-10 —
+    # always tell why — so the three reasons this contract pins ('already
+    # used (replay)', 'audience mismatch', 'operation mismatch') now survive
+    # the kernel. The one reason it withholds, 'Token tenant mismatch', was
+    # never part of this contract.
+    #
+    # consume_nonce: the action-bound confirm token is a SINGLE-USE execution
+    # credential (spec v3). Commit uses a separate generic write token;
+    # only the human's Approve surface can mint this credential, and confirm
+    # spends it so a captured token cannot authorize another execution. It
+    # stays behind the body validation above so a 400 on a malformed request
+    # does not burn the credential.
+    # (0) The credential is bound to the action AND to the keyed digest of
+    # the payload the person was shown when it was minted (#659, the push
+    # path's window that #658's confirmation digest could not cover). It is
+    # recomputed here from the payload about to execute, so a swap between
+    # the push and the tap fails the token's operation check before any
+    # claim, nonce or execution. Loaded tenant-scoped before the gate; an
+    # unauthenticated caller still gets the same 401 whether the action
+    # exists or not, because a token minted for another operation fails
+    # either way, and the 404 below stays behind the gate.
+    bound = ProposedAction.query.filter_by(
+        id=action_id, tenant_id=tenant_id).first()
+    # An action this tenant does not hold has no payload to bind to. The
+    # gate still runs (audience, tenant, expiry) so the 404 below stays
+    # behind it, but with no operation to match and the nonce left alone:
+    # nothing executes on this path, so the credential is not spent on a
+    # mistaken id, and a valid credential for another action learns only
+    # what the tenant-scoped status route already tells it.
+    require_grant(
+        scope=Scope.WRITE,
+        tenant=tenant,
+        audience=ACTION_APPROVAL_AUDIENCE,
+        operation=(approval_operation(action_id, bound.payload_json)
+                   if bound is not None else None),
+        consume_nonce=bound is not None,
+        absent_status=401,
+        rejected_status=401,
+    )
+    # An approval given before a disconnect does not execute after it: a
+    # closed tenant takes no new records (409, audited, nothing claimed).
+    require_open_tenant(tenant)
+
+    # (a) Load, tenant-scoped.
+    action = ProposedAction.query.filter_by(
+        id=action_id, tenant_id=tenant_id).first()
+    if action is None:
+        return _error(404, 'Unknown action')
+
+    # (b) Guarded expiry: a stale approval window lapses instead of dialing.
+    if action.status == 'awaiting_confirmation' and action.is_expired():
+        lapsed = transition_action(
+            action_id, from_states=('awaiting_confirmation',),
+            to_state='expired', actor='confirm',
+            detail='approval window lapsed')
+        db.session.refresh(action)
+        if lapsed:
+            add_audit_event(
+                'update', resource_type='ProposedAction', resource_id=action_id,
+                agent_id=request.headers.get('X-Agent-Id'), tenant_id=tenant_id,
+                detail='approval window lapsed',
+            )
+            db.session.commit()
+            return _error(410, 'Approval window lapsed — propose the action '
+                               'again')
+        # Lost to a concurrent claim — the claim below settles it.
+
+    # (c) THE CLAIM: single-winner mutex (see docstring for why this comes
+    # before the confirmation record). The WHERE re-checks expiry
+    # (extra_criteria), closing the TOCTOU between the snapshot check above
+    # and the claim: a lapsed approval window can never dial.
+    moved = transition_action(
+        action_id, from_states=('awaiting_confirmation',),
+        to_state='executing', actor='confirm',
+        attempt_id=str(uuid.uuid4()), claimed_at=_utcnow(),
+        extra_criteria=[ProposedAction.expires_at > _utcnow()])
+    if not moved:
+        db.session.refresh(action)
+        if action.status == 'awaiting_confirmation':
+            # Still awaiting means the expiry predicate refused the claim —
+            # flip it (guarded) and report, mirroring the snapshot path.
+            lapsed = transition_action(
+                action_id, from_states=('awaiting_confirmation',),
+                to_state='expired', actor='confirm',
+                detail='approval window lapsed')
+            db.session.refresh(action)
+            if lapsed:
+                add_audit_event(
+                    'update', resource_type='ProposedAction',
+                    resource_id=action_id,
+                    agent_id=request.headers.get('X-Agent-Id'),
+                    tenant_id=tenant_id, detail='approval window lapsed',
+                )
+                db.session.commit()
+                return _error(410, 'Approval window lapsed — propose the '
+                                   'action again')
+        if action.status == 'expired':
+            return _error(410, 'Approval window lapsed — propose the action '
+                               'again')
+        return _error(409, 'Action is %s, not awaiting_confirmation'
+                      % action.status)
+    db.session.refresh(action)
+
+    # (d) Consent record: issued + immediately consumed — same instant, one
+    # transaction. The claim above is the lock; this row is the audit
+    # artifact of who/when/via.
+    # (c2) Byte equality (#559, human-gate spec 8.3). Every confirmation ever
+    # minted for this action — expired ones included, since an expired one is
+    # still evidence of what was approved (#678) — signed a digest of the
+    # payload as the human saw it; the payload about
+    # to execute must hash to the same. The ORM seal (#528) cannot see a
+    # bulk update, a Core statement or raw SQL; this can, after the fact,
+    # which is the evidence the ledger promises. A row with no digest
+    # (minted before the column existed) proves nothing and is refused too.
+    current = payload_digest(action.payload_json)
+    stale = [c for c in approved_digests(action_id)
+             if c.payload_digest != current]
+    if stale:
+        approved = stale[0].payload_digest or 'none (confirmation carries no digest)'
+        summary = 'approved payload digest mismatch'
+        failed = transition_action(
+            action_id, from_states=('executing',), to_state='failed',
+            actor='confirm', outcome_summary=summary)
+        db.session.refresh(action)
+        if failed:
+            # Same-session audit (the post-commit shim is ratcheted): the
+            # transition above has committed, so this row lands in its own
+            # transaction only when the failure really happened.
+            add_audit_event(
+                'update', resource_type='ProposedAction', resource_id=action.id,
+                agent_id=request.headers.get('X-Agent-Id'), tenant_id=tenant_id,
+                outcome='failure',
+                detail='%s; approved=%s current=%s' % (summary, approved, current),
+            )
+            db.session.commit()
+        return jsonify({'id': action.id, 'status': action.status,
+                        'error_code': errors.APPROVED_PAYLOAD_MISMATCH,
+                        'error': 'The payload no longer matches what was '
+                                 'approved; nothing was executed.'}), 409
+
+    # (c3) Daily cap (#216, human-gate spec 6.1). Authoritative here, after
+    # the claim, so the count includes this action and a refused one never
+    # reaches the provider. The approval credential is already spent above,
+    # so `failed` is the honest end state, not a return to awaiting.
+    if _over_daily_cap(action):
+        summary = errors.DAILY_CAP_REACHED
+        failed = transition_action(
+            action_id, from_states=('executing',), to_state='failed',
+            actor='confirm', outcome_summary=summary)
+        db.session.refresh(action)
+        if failed:
+            add_audit_event(
+                'update', resource_type='ProposedAction', resource_id=action.id,
+                agent_id=request.headers.get('X-Agent-Id'), tenant_id=tenant_id,
+                outcome='failure',
+                detail='%s; kind=%s cap=%d' % (summary, action.kind, daily_cap()),
+            )
+            db.session.commit()
+        return jsonify({'id': action.id, 'status': action.status,
+                        'error_code': errors.DAILY_CAP_REACHED,
+                        'error': 'The daily limit for %s actions has been '
+                                 'reached; nothing was executed. Try again '
+                                 'tomorrow (UTC).' % action.kind}), 429
+
+    issue_confirmation(action_id, approved_via, ttl_minutes=15,
+                       payload_json=action.payload_json)
+    db.session.flush()
+    consume_confirmation(action_id)
+    add_audit_event(
+        'update', resource_type='ProposedAction', resource_id=action.id,
+        agent_id=request.headers.get('X-Agent-Id'), tenant_id=tenant_id,
+        detail='approved via %s; %s; payload_digest=%s' % (
+            approved_via, json.dumps(action.summary()), current),
+    )
+    db.session.commit()
+
+    # (e) A kind with no registered rail fails loud — never a fake success.
+    # Every VALID_KINDS entry has a rail today (form-fill's is a Task-3
+    # skeleton), so this is defensive for a future kind added to
+    # VALID_KINDS ahead of its rail. Checked before the provider_request_at
+    # stamp: no provider call is even possible here.
+    ex = get_executor(action.kind)
+    if ex is None:
+        summary = 'No executor for kind: %s' % action.kind
+        failed = transition_action(
+            action_id, from_states=('executing',), to_state='failed',
+            actor='confirm', outcome_summary=summary)
+        db.session.refresh(action)
+        if failed:
+            add_audit_event(
+                'update', resource_type='ProposedAction', resource_id=action.id,
+                agent_id=request.headers.get('X-Agent-Id'), tenant_id=tenant_id,
+                outcome='failure', detail=summary,
+            )
+            db.session.commit()
+            label = action.summary().get('to') or 'recipient'
+            notify_tenant(tenant_id, '⚠️ %s to %s: failed'
+                          % (action.kind, label))
+        return jsonify({'id': action.id, 'status': action.status,
+                        'error_code': errors.PROVIDER_NOT_CONFIGURED,
+                        'error': summary}), 502
+
+    # (f) Stamp provider_request_at immediately before the provider call so a
+    # crash is distinguishable: claimed-but-never-called (safe to fail) vs
+    # called-but-unresolved (needs review). Guarded update + commit.
+    ProposedAction.query.filter_by(id=action_id, status='executing').update(
+        {'provider_request_at': _utcnow()}, synchronize_session=False)
+    db.session.commit()
+
+    # (g) Execute, then (h) resolve — the never-clobber / webhook-wins
+    # mapping lives in ONE place: _resolve_from_executing().
+    result = ex.execute(action)
+    return _resolve_from_executing(action, result)
+
+
+@actions_blueprint.route('/<action_id>/approval-token', methods=['POST'])
+def issue_action_approval_token(action_id):
+    """Mint the least-privilege credential used by a human approval surface.
+
+    This endpoint is deliberately separate from the public/demo token mint.
+    Even public tenants must present the server-to-server internal secret, so
+    an agent that can obtain a normal tenant write token cannot mint its own
+    approval credential.
+    """
+    tenant = _tenant_or_none()
+    if tenant is None:
+        return _error(400, 'X-Tenant-Id header is required')
+    tenant_id = tenant.id
+
+    expected = internal_mint_secret()
+    provided = request.headers.get('X-Internal-Secret', '')
+    if not expected or not constant_time.equal(provided, expected):
+        return _error(403, 'Forbidden')
+
+    action = ProposedAction.query.filter_by(
+        id=action_id, tenant_id=tenant_id).first()
+    if action is None:
+        return _error(404, 'Unknown action')
+    if action.status != 'awaiting_confirmation':
+        return _error(409, 'Action is %s, not awaiting_confirmation'
+                      % action.status)
+    if action.is_expired():
+        return _error(410, 'Approval window lapsed — propose the action again')
+
+    token = generate_step_up_token(
+        tenant_id,
+        agent_id='human-approval',
+        audience=ACTION_APPROVAL_AUDIENCE,
+        # Bound to the action AND the bytes the person is being shown (#659).
+        operation=approval_operation(action_id, action.payload_json),
+    )
+    add_audit_event(
+        'update', resource_type='ProposedAction', resource_id=action.id,
+        agent_id='human-approval', tenant_id=tenant_id,
+        detail='action-bound approval credential issued',
+    )
+    db.session.commit()
+    return jsonify({'token': token, 'tenant_id': tenant_id,
+                    'action_id': action_id})
+
+
+_LIST_CAP = 50
+
+
+@actions_blueprint.route('', methods=['GET'])
+def list_pending_actions():
+    """The tenant's proposals awaiting a person's answer (#215): the one
+    engine read a pending-approvals surface needs. Summaries only — the
+    PHI-safe shape action_status already answers unaudited — so this route
+    persists nothing: no lazy expiry (a lapsed row is simply not listed),
+    no audit commit. Auth mirrors action_status."""
+    tenant = _tenant_or_none()
+    if tenant is None:
+        return _error(400, 'X-Tenant-Id header is required')
+    tenant_id = tenant.id
+    auth_err = authenticate_tenant_read(tenant_id)
+    if auth_err is not None:
+        return auth_err
+    status = request.args.get('status', 'awaiting_confirmation')
+    if status == 'recent':
+        return _recent_actions(tenant_id)
+    if status != 'awaiting_confirmation':
+        return _error(400, 'status must be awaiting_confirmation or recent')
+    rows = (ProposedAction.query
+            .filter_by(tenant_id=tenant_id, status=status)
+            .filter(ProposedAction.expires_at > _utcnow())
+            .order_by(ProposedAction.created_at.desc())
+            .limit(_LIST_CAP).all())
+    return jsonify({'actions': [a.summary() for a in rows],
+                    'count': len(rows)}), 200
+
+
+#: What became of an approved request: the states past the human gate. A
+#: request that finished, or did not, must not vanish from the person's hub
+#: the moment it leaves the pending list (#847). Declined and expired are
+#: the person's own answer or its absence, and are not listed.
+_RECENT_STATES = ('executing', 'completed', 'failed', 'needs_review',
+                  'unknown')
+_RECENT_DAYS = 7
+_RECENT_CAP = 10
+
+
+def _recent_actions(tenant_id):
+    """Requests that moved past approval in the last week, newest first.
+
+    The window is on `updated_at`. `expires_at` is the 30-minute proposal
+    window, so filtering on it would drop a completed request half an hour
+    after it was proposed. Same summaries and the same no-persist posture as
+    the pending list, plus when the request last moved."""
+    since = _utcnow() - timedelta(days=_RECENT_DAYS)
+    rows = (ProposedAction.query
+            .filter_by(tenant_id=tenant_id)
+            .filter(ProposedAction.status.in_(_RECENT_STATES))
+            .filter(ProposedAction.updated_at > since)
+            .order_by(ProposedAction.updated_at.desc())
+            .limit(_RECENT_CAP).all())
+    out = []
+    for a in rows:
+        item = a.summary()
+        item['updated_at'] = a.updated_at.replace(tzinfo=None).isoformat() + 'Z'
+        out.append(item)
+    return jsonify({'actions': out, 'count': len(out)}), 200
+
+
+@actions_blueprint.route('/<action_id>', methods=['GET'])
+def action_status(action_id):
+    tenant = _tenant_or_none()
+    if tenant is None:
+        return _error(400, 'X-Tenant-Id header is required')
+    tenant_id = tenant.id
+
+    # Read-auth: for non-public tenants (when the flag is on) require a
+    # tenant-bound token/bearer, same posture as FHIR + SMBP reads.
+    auth_err = authenticate_tenant_read(tenant_id)
+    if auth_err is not None:
+        return auth_err
+
+    action = ProposedAction.query.filter_by(
+        id=action_id, tenant_id=tenant_id).first()
+    if action is None:
+        return _error(404, 'Unknown action')
+
+    # Lazy expiry: a stale proposal flips to expired on read (guarded — never
+    # clobbers a concurrent claim that moved the row past 'proposed').
+    if action.status == 'proposed' and action.is_expired():
+        expired = transition_action(
+            action_id, from_states=('proposed',), to_state='expired',
+            actor='status-route', detail='proposal expired')
+        db.session.refresh(action)
+        if expired:
+            add_audit_event(
+                'update', resource_type='ProposedAction', resource_id=action_id,
+                agent_id=request.headers.get('X-Agent-Id'), tenant_id=tenant_id,
+                detail='proposal expired',
+            )
+            db.session.commit()
+
+    # Only a caller holding a valid tenant-bound step-up token gets the full
+    # record (phone number + message body). Everyone else gets the PHI-safe
+    # summary (id/kind/recipient-label/status). Kernel slice 17: this is a
+    # predicate, not a gate, so it asks has_grant, which answers None in
+    # exactly the cases require_grant would refuse (absent, malformed,
+    # expired, another tenant's token) and never raises. The grant is bound
+    # to the header tenant the kernel already validated above.
+    privileged = has_grant(scope=Scope.TENANT_BOUND, tenant=tenant) is not None
+    return jsonify(action.to_dict() if privileged else action.summary()), 200
+
+
+@actions_blueprint.route('/callback/<provider>', methods=['POST'])
+def action_callback(provider):
+    if provider not in ('bland', 'twilio'):
+        return _error(404, 'Unknown provider')
+
+    # Shared-secret verification (constant-time). The secret rides in the
+    # webhook URL registered with the provider at execution time. An
+    # unconfigured secret rejects ALL callbacks — fail closed.
+    expected = os.environ.get('ACTIONS_WEBHOOK_SECRET', '')
+    supplied = request.args.get('secret', '')
+    if not expected or not constant_time.equal(supplied, expected):
+        return _error(403, 'Webhook verification failed')
+
+    action_id = request.args.get('action_id', '')
+    action = ProposedAction.query.filter_by(id=action_id).first()
+    if action is None:
+        return _error(404, 'Unknown action')
+
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict):
+        # Twilio status callbacks are form-encoded (MessageStatus/MessageSid)
+        body = request.form.to_dict() if request.form else {}
+
+    provider_ref = str(body.get('call_id') or body.get('MessageSid') or '')
+    if provider_ref and action.external_ref and provider_ref != action.external_ref:
+        return _error(404, 'Unknown action')
+    provider_status = str(body.get('status') or body.get('MessageStatus') or '').lower()
+    if provider_status in ('completed', 'success', 'delivered'):
+        new_status = 'completed'
+    elif provider_status in ('failed', 'error', 'no-answer', 'busy', 'canceled',
+                             'cancelled', 'undelivered'):
+        new_status = 'failed'
+    else:
+        # Interim or unrecognized event (queued/sent/in-progress/ringing/...):
+        # acknowledge without resolving — the terminal webhook decides.
+        return jsonify({'ok': True, 'note': 'non-terminal status ignored'}), 200
+    summary = str(body.get('summary') or '')[:2000]
+
+    # Atomic first-verdict-wins: only resolves rows still in flight. A late
+    # or duplicate webhook (or one racing the confirm route) changes nothing.
+    # Via transition_action so webhook resolutions land in the ActionEvent
+    # ledger (state.py is the only sanctioned status writer; W1 views read
+    # these events).
+    updated = transition_action(
+        action_id, from_states=('executing', 'unknown'), to_state=new_status,
+        actor='callback:%s' % provider, outcome_summary=summary)
+    db.session.refresh(action)
+    if not updated:
+        return jsonify({'ok': True, 'note': 'no state change'}), 200
+
+    add_audit_event(
+        'update', resource_type='ProposedAction', resource_id=action.id,
+        tenant_id=action.tenant_id,
+        outcome='success' if new_status == 'completed' else 'failure',
+        detail=json.dumps(action.summary()),
+    )
+    db.session.commit()
+
+    # Telegram push: summary-level ONLY (kind + recipient label + status)
+    label = action.summary().get('to') or 'recipient'
+    icon = '✅' if new_status == 'completed' else '⚠️'
+    notify_tenant(action.tenant_id,
+                  '%s %s to %s: %s' % (icon, action.kind, label, new_status))
+
+    return jsonify({'ok': True}), 200

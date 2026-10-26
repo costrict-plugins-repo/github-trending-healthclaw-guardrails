@@ -1,0 +1,549 @@
+"""
+FHIR Resource Redaction.
+
+Standard redaction profile for PHI protection applied consistently
+on all resource access paths (not just context ingestion).
+
+- Names: Truncate family and given names to first initial only (e.g. "Rivera" → "R.")
+- Identifiers: Remove the value from every Identifier under a key in
+  `_IDENTIFIER_KEYS` (`identifier`, `accessionIdentifier`, `requisition`,
+  `valueIdentifier`, ...); keep `system` and `type`. Safe Harbor
+  §164.514(b)(2)(i)(G)/(H)/(I)/(J) list SSNs, medical record numbers,
+  health plan and account numbers among the identifiers to REMOVE — a
+  last-four suffix is a re-identification vector, not a redaction.
+  Coverage's plain-string member numbers (`subscriberId`, `dependent`,
+  R4 `class.value`) are removed too (#282). This names the keys the
+  supported types use; an identifier-like value under any other key is
+  not covered, so do not read the Safe Harbor citation as the codebase's
+  total Safe Harbor posture.
+- Addresses: Remove line/text/city/district/postalCode, keep state/country,
+  whether the element is a list or a single Address
+- Telecom: Replace values with [Redacted]
+- Birth dates: Truncate to year only
+- Photos: Remove entirely
+- Narratives: Replace with redacted div
+- Notes/comments: Replace with [Redacted]
+- Quantity units: Replace a unit that is not one short unit-shaped token
+  with [Redacted]; keep the coded `code` and `system`
+"""
+
+from r6.record_source import stamp as _stamp_record_source
+from r6.record_source import strip_meta as _strip_record_source
+from r6.us_core_profiles import filter_meta as _filter_profiles
+
+import json
+import re
+
+from r6.safe_read import code_shape, is_coding_shaped
+from r6.terminology import label_codings, malformed_snomed_code
+
+
+def apply_redaction(resource):
+    """
+    Apply standard redaction profile to a FHIR resource.
+    Returns a deep copy with PHI fields redacted.
+
+    Redaction strips every `display` and `text`, because upstream systems write
+    patient names into them. That left records with no readable name at all —
+    measured at 0 of 65 labelled on a live tenant — so afterwards we put back
+    labels for codes the SERVER recognises (r6/terminology.py). The order
+    matters: strip whatever the upstream said, then add only what we know
+    ourselves, keyed by code. Unrecognised codes stay unlabelled on purpose.
+    """
+    redacted = json.loads(json.dumps(resource))  # Deep copy
+    _redact_recursive(redacted)
+    label_codings(redacted)
+    # The walker removed every record-source tag; put back only the one the
+    # store vouched for, read off the input object, never out of its JSON.
+    _stamp_record_source(redacted, getattr(resource, 'record_source', None))
+
+    return redacted
+
+
+def _redact_fields(resource, narrative=True):
+    """Redact PHI fields from a single resource dict (in-place)."""
+    # Redact names: truncate family and given to first initial only
+    if 'name' in resource and isinstance(resource['name'], list):
+        for name_entry in resource['name']:
+            if isinstance(name_entry, dict):
+                if 'family' in name_entry and isinstance(name_entry['family'], str):
+                    f = name_entry['family']
+                    name_entry['family'] = (f[0] + '.') if len(f) > 0 else f
+                if 'given' in name_entry and isinstance(name_entry['given'], list):
+                    name_entry['given'] = [
+                        g[0] + '.' if isinstance(g, str) and len(g) > 0 else g
+                        for g in name_entry['given']
+                    ]
+                name_entry.pop('text', None)
+
+    # Truncate birth date to year only
+    if 'birthDate' in resource and isinstance(resource['birthDate'], str):
+        resource['birthDate'] = resource['birthDate'][:4]
+
+    # Remove photos
+    resource.pop('photo', None)
+
+    # Remove text narratives
+    if 'text' in resource and narrative:
+        resource['text'] = {
+            'status': 'empty',
+            'div': '<div xmlns="http://www.w3.org/1999/xhtml">[Redacted]</div>'
+        }
+    elif 'text' in resource:
+        resource.pop('text', None)
+
+    # Remove identifier values. Until 2026-09 this kept the last four
+    # characters, and SECURITY.md said so (docs/2026-08-16-hard-truths.md
+    # §4). `system` and `type` stay so a reader can see which kind of
+    # identifier existed without learning it. FHIR puts the Identifier
+    # datatype under other keys too (_IDENTIFIER_KEYS); those leaked whole
+    # until #282. A plain string under one of them (R4's
+    # Coverage.subscriberId, AuditEvent.agent.altId) is removed outright.
+    for key in _IDENTIFIER_KEYS:
+        identifiers = resource.get(key)
+        if isinstance(identifiers, str):
+            resource.pop(key)
+            continue
+        if isinstance(identifiers, dict):
+            identifiers = [identifiers]
+        if isinstance(identifiers, list):
+            for ident in identifiers:
+                if isinstance(ident, dict):
+                    ident.pop('value', None)
+
+    # Remove full addresses. Most resources carry a list; Location.address
+    # is a single Address, and leaked whole until #282.
+    addresses = resource.get('address')
+    if isinstance(addresses, dict):
+        addresses = [addresses]
+    if isinstance(addresses, list):
+        for addr in addresses:
+            if not isinstance(addr, dict):
+                continue
+            addr.pop('line', None)
+            addr.pop('text', None)
+            addr.pop('city', None)
+            addr.pop('district', None)
+            addr.pop('postalCode', None)
+            # State/country remain useful coarse demographics.
+
+    # Redact telecom (phone numbers, emails)
+    if 'telecom' in resource and isinstance(resource['telecom'], list):
+        for telecom in resource['telecom']:
+            if 'value' in telecom and isinstance(telecom['value'], str):
+                telecom['value'] = '[Redacted]'
+
+    # Redact Patient.contact[] — emergency-contact name / phone / address is
+    # PHI and must not pass through on reads (contact.name is a single
+    # HumanName, telecom a list, address a single Address).
+    if 'contact' in resource and isinstance(resource['contact'], list):
+        for c in resource['contact']:
+            if not isinstance(c, dict):
+                continue
+            cn = c.get('name')
+            if isinstance(cn, dict):
+                if isinstance(cn.get('family'), str) and cn['family']:
+                    cn['family'] = cn['family'][0] + '.'
+                if isinstance(cn.get('given'), list):
+                    cn['given'] = [
+                        g[0] + '.' if isinstance(g, str) and len(g) > 0 else g
+                        for g in cn['given']
+                    ]
+                cn.pop('text', None)
+            for tc in (c.get('telecom') or []):
+                if isinstance(tc, dict) and isinstance(tc.get('value'), str):
+                    tc['value'] = '[Redacted]'
+            ca = c.get('address')
+            if isinstance(ca, dict):
+                ca.pop('line', None)
+                ca.pop('text', None)
+                ca.pop('city', None)
+                ca.pop('district', None)
+                ca.pop('postalCode', None)
+            # Subscription.contact[] is a ContactPoint itself, not a
+            # Patient.contact entry, so its value sits right here (#282).
+            if isinstance(c.get('value'), str):
+                c['value'] = '[Redacted]'
+
+    # Coverage.dependent is a plain string; Coverage.class.value is a string
+    # in R4 and an Identifier from R5 on. Both are plan-membership numbers
+    # (Safe Harbor §164.514(b)(2)(i)(I)), and `value`/`dependent` mean other
+    # things elsewhere, so this is scoped by resource type (#282).
+    if resource.get('resourceType') == 'Coverage':
+        if isinstance(resource.get('dependent'), str):
+            resource.pop('dependent')
+        for cls in (resource.get('class') or []):
+            if not isinstance(cls, dict):
+                continue
+            if isinstance(cls.get('value'), str):
+                cls.pop('value')
+            elif isinstance(cls.get('value'), dict):
+                cls['value'].pop('value', None)
+
+    # A stored AuditEvent's agent carries a network address (an IP or host
+    # name, Safe Harbor (O)). `altId` is handled with the identifiers above.
+    if resource.get('resourceType') == 'AuditEvent':
+        for agent in (resource.get('agent') or []):
+            if not isinstance(agent, dict):
+                continue
+            if isinstance(agent.get('network'), dict):
+                agent['network'].pop('address', None)
+            agent.pop('networkString', None)
+            agent.pop('networkUri', None)
+
+    # CarePlan.title is written per patient by whoever made the plan. `title`
+    # elsewhere (Questionnaire, Requirements) is a definition's own label and
+    # stays, so this one is scoped by resource type (#282).
+    if resource.get('resourceType') == 'CarePlan' and \
+            isinstance(resource.get('title'), str):
+        resource.pop('title')
+
+    # Goal.statusReason is free text. On other resources the same key is a
+    # CodeableConcept or a list of them, which must keep its codes (#282).
+    if isinstance(resource.get('statusReason'), str):
+        resource.pop('statusReason')
+
+    # Remove notes/comments. DiagnosticReport.conclusion is the same kind of
+    # clinician free text and leaked on the standard read path until #282.
+    for field in ['note', 'comment', 'conclusion']:
+        if field in resource:
+            if isinstance(resource[field], list):
+                resource[field] = [{'text': '[Redacted]'}]
+            elif isinstance(resource[field], str):
+                resource[field] = '[Redacted]'
+
+
+_FREE_TEXT_KEYS = {
+    'display', 'description', 'valueString', 'valueMarkdown', 'valueUrl',
+    'valueUri', 'valueCanonical', 'valueBase64Binary',
+    # Free-text strings that survived a sweep of every string/markdown
+    # element of the supported types (#282). Each key is a string wherever
+    # FHIR uses it. authorString is Annotation's author NAME.
+    'patientInstruction', 'onsetString', 'abatementString',
+    'occurrenceString', 'performedString', 'scheduledString',
+    'authorString', 'detailString', 'ageString', 'bornString',
+    'deceasedString',
+}
+_DATE_KEYS = {
+    'birthDate', 'deceasedDateTime', 'valueDate', 'valueDateTime',
+}
+# Keys that hold the Identifier datatype in the supported types, whatever the
+# resource. `subscriberId` is Coverage's member id (a string in R4) and
+# `altId` an AuditEvent agent's alternate user id (a string).
+_IDENTIFIER_KEYS = (
+    'identifier', 'accessionIdentifier', 'masterIdentifier',
+    'groupIdentifier', 'requisition', 'preAdmissionIdentifier',
+    'valueIdentifier', 'subscriberId', 'altId',
+)
+# Elements only an Attachment has. `url` and `title` alone are not enough to
+# know one: an Extension has a `url`, a definition has both.
+_ATTACHMENT_ONLY_KEYS = (
+    'contentType', 'size', 'hash', 'creation', 'pages', 'frames',
+    'duration', 'height', 'width',
+)
+
+# A unit the engine passes on is one short token in UCUM's characters, with
+# no spaces ("mg/dL", "{beats}/min", "u[IU]/mL", "mg/(24.h)"). The engine
+# serves every kind of record and redacts on every read, so this is a guard
+# against prose and identifiers, not a UCUM validator: a rule strict enough
+# to stop every name also blanked real units on every read (#922 QA F1).
+# It refuses
+# - a run of nine or more letters (a long name or a word of an instruction),
+# - a run of four or more digits (a phone number, an SSN, a year),
+# - two or more runs of four or more letters ("IGNORE_ALL_PREVIOUS",
+#   "Zebulon.Quixtran"),
+# - a token of letters only that is not a known unit word,
+# - a letterless token other than %, 1 or a power of ten.
+# A single short word beside a non-letter ("{Smith}", "Smith/dL") still
+# fits. That residual is tracked on #925; consumers that put a unit in front
+# of a model or a person keep their own closed lists, which are the real
+# guard (careagents/labs_timeline.py UCUM_ALLOWED, r6/brief/engine.py).
+_UNIT_SHAPE = re.compile(r"[A-Za-z0-9%/.*^\[\]{}()#_'\-µ°]{1,24}")
+_LONG_WORD = re.compile(r"[A-Za-zµ°]{9,}")
+_LONG_NUMBER = re.compile(r"[0-9]{4,}")
+_LETTERLESS_UNIT = re.compile(r"%|1|10[*^][0-9]{1,2}")
+_LETTER_RUN = re.compile(r"[A-Za-zµ°]+")
+#: Units of letters only, compared case-insensitively. A superset of every
+#: letters-only unit on the consumers' closed lists, or the engine would
+#: blank one before they see it.
+_WORD_UNITS = frozenset(w.lower() for w in {
+    'g', 'mg', 'ug', 'mcg', 'ng', 'pg', 'kg', 'L', 'dL', 'mL', 'uL', 'fL',
+    'fl', 'm', 'cm', 'mm', 'km', 'um', 'nm', 's', 'ms', 'sec', 'min', 'h',
+    'hr', 'd', 'wk', 'mo', 'a', 'U', 'IU', 'mU', 'kU', 'mEq', 'mmol', 'umol',
+    'nmol', 'pmol', 'mol', 'Cel', 'bpm', 'lb', 'lbs', 'oz', 'in', 'ft',
+    'cal', 'kcal', 'kJ', 'Hz', 'Pa', 'kPa', 'mmHg', 'pH', 'mOsm', 'INR',
+    'tablet', 'tablets', 'tab', 'capsule', 'capsules', 'cap', 'puff',
+    'drop', 'drops', 'spray', 'patch', 'dose', 'unit', 'units', 'each',
+    'ea', 'serving', 'cup', 'steps', 'year', 'years', 'month', 'months',
+    'week', 'weeks', 'day', 'days', 'hour', 'hours', 'minute', 'minutes',
+    'second', 'seconds', 'µmol', 'µg', 'µL', 'degF',
+})
+UNIT_REDACTED = '[Redacted]'
+
+
+def unit_is_shaped(value):
+    """True when `value` could be a unit: see the rules above."""
+    if not isinstance(value, str) or not _UNIT_SHAPE.fullmatch(value):
+        return False
+    if _LONG_WORD.search(value) or _LONG_NUMBER.search(value):
+        return False
+    runs = _LETTER_RUN.findall(value)
+    if not runs:
+        return bool(_LETTERLESS_UNIT.fullmatch(value))
+    if value.isalpha():
+        return value.lower() in _WORD_UNITS
+    return sum(len(r) >= 4 for r in runs) <= 1
+
+
+def _is_quantity(obj):
+    """A Quantity (or Age, Duration, SimpleQuantity) by shape: a `unit`, or
+    a `value` beside a `code`. A Coding has no `value`."""
+    return ('resourceType' not in obj and 'coding' not in obj
+            and ('unit' in obj or ('value' in obj and 'code' in obj)))
+
+
+def _clean_unit(obj):
+    """Replace a `unit` that is not unit-shaped, in place; drop one that is
+    not a string or an object. Replaced rather than dropped: readers treat
+    an absent unit as "the analyte's usual unit" (r6/brief/engine.py), and a
+    number beside a unit it was not measured in is the defect #884 fixed.
+    The replacement is on no allow-list, so they show no number instead. An
+    object `unit` (ObservationDefinition's CodeableConcept) is walked like
+    any other.
+
+    A Quantity's `code` is its coded unit, which readers prefer to `unit`,
+    so it gets the same rule; one that fails is replaced too, never dropped,
+    so a coded unit is not lost on a read (#922 B4, QA F1)."""
+    if not _is_quantity(obj):
+        return
+    if isinstance(obj.get('code'), str) and not unit_is_shaped(obj['code']):
+        obj['code'] = UNIT_REDACTED
+    if 'unit' not in obj:
+        return
+    unit = obj['unit']
+    if isinstance(unit, dict):
+        return
+    if not isinstance(unit, str):
+        obj.pop('unit')
+    elif not unit_is_shaped(unit):
+        obj['unit'] = UNIT_REDACTED
+
+
+def clean_codings(obj):
+    """Apply the Coding rule to one dict: its `coding` list, and the dict
+    itself when it is Coding-shaped. Not recursive; each redaction path
+    calls it on every dict its own walk reaches. Shared by the standard and
+    patient-controlled profiles (via `_redact_recursive`) and by the
+    $deidentify preview in r6/health_compliance.py, so a junk system or
+    code is echoed by none of the three."""
+    for coding in obj.get('coding') if isinstance(obj.get('coding'), list) else ():
+        if isinstance(coding, dict):
+            _clean_coding(coding, in_coding_list=True)
+    if is_coding_shaped(obj):
+        _clean_coding(obj, in_coding_list=False)
+
+
+def _clean_coding(coding, *, in_coding_list):
+    """Drop a non-string system and a code that is no code, in place."""
+    if 'system' in coding and not isinstance(coding['system'], str):
+        coding.pop('system')
+    if 'code' not in coding:
+        return
+    shape = code_shape(coding['code'], in_coding_list=in_coding_list)
+    if shape == 'int':
+        coding['code'] = str(coding['code'])
+    elif shape == 'codings':
+        # Each item is a Coding, cleaned when the walk reaches it; anything
+        # that is not an object is no Coding and is dropped.
+        kept = [c for c in coding['code'] if isinstance(c, dict)]
+        if kept:
+            coding['code'] = kept
+        else:
+            coding.pop('code')
+    elif shape == 'bad' or malformed_snomed_code(coding.get('system'),
+                                                 coding['code']):
+        # A SNOMED "code" that is no concept id can carry its own term
+        # ("716186003|No known allergy|", #957): free text, so dropped.
+        coding.pop('code')
+
+
+def _redact_recursive(obj):
+    """Recursively minimize common PHI-bearing FHIR datatypes in-place."""
+    if isinstance(obj, list):
+        for item in obj:
+            _redact_recursive(item)
+        return
+    if not isinstance(obj, dict):
+        return
+
+    _redact_fields(obj, narrative=bool(obj.get('resourceType')))
+    # meta.source is a free URI that can name a patient-specific endpoint, and
+    # a tag in our record-source system is ours alone to set (#956): both go,
+    # at every depth, top level included. Our own stamp is put back after.
+    _strip_record_source(obj.get('meta'))
+    # meta.profile is free URI text too: only allow-listed canonicals stay
+    # (FHI-52). Idempotent, so a stored resource filtered once is unchanged.
+    _filter_profiles(obj.get('meta'))
+
+    # A Coding.system is a URI string. Anything else (a list, an object, a
+    # number) is not a system, made labelling raise for every read on the
+    # tenant (#885), and can carry whatever text was packed into it. It is
+    # dropped, never echoed. Coding.code likewise: a string stays, an int
+    # (CVX 3 written as 3) is kept as its string form, and anything else,
+    # an object or a list among them, is dropped. The same holds for every
+    # Coding-shaped dict, wherever it sits (R886-1); r6/safe_read.code_shape
+    # is the rule the validator applies on write too.
+    clean_codings(obj)
+    _clean_unit(obj)
+
+    # Attachment content and signed URLs can directly contain or reveal PHI.
+    # Every Attachment element is optional, so it is known by shape: an
+    # Attachment-only key, or `data` (SampledData also has `data`, with
+    # `dimensions`), or `url` with `title` on a datatype (a Questionnaire is
+    # a resource with both). Until #282 only `contentType` counted, so an
+    # attachment without one kept its body.
+    is_attachment = (
+        any(k in obj for k in _ATTACHMENT_ONLY_KEYS)
+        or ('data' in obj and 'dimensions' not in obj)
+        or ('url' in obj and 'title' in obj and 'resourceType' not in obj))
+    if is_attachment and any(k in obj for k in ('data', 'url', 'title')):
+        obj.pop('data', None)
+        obj.pop('url', None)
+        obj.pop('title', None)
+
+    # Organization/Practitioner names are often represented as a scalar.
+    if isinstance(obj.get('name'), str):
+        value = obj['name']
+        obj['name'] = value[0] + '.' if value else value
+
+    for key in list(obj):
+        value = obj.get(key)
+        if key in _FREE_TEXT_KEYS:
+            obj.pop(key, None)
+            continue
+        if key in _DATE_KEYS and isinstance(value, str):
+            obj[key] = value[:4]
+            continue
+        _redact_recursive(value)
+
+
+def apply_patient_controlled_redaction(resource, patient_id):
+    """
+    Patient-controlled deidentification mode.
+
+    The patient owns this store — they want their own data, minus
+    institutional identifiers that could re-identify them to third parties.
+
+    Rules (differ from the stricter de-identification preview):
+    - name[], telecom[], address[], photo[] — removed entirely at the top
+      level (a stronger guarantee than the standard profile's redact-to-
+      initial, since this output feeds external sharing: SHL / $share-bundle)
+    - birthDate — PRESERVED at the top level (patient wants their own DOB)
+    - Institutional identifiers (MRN, facility patient IDs) — removed
+    - The healthclaw patient_id is injected as the sole canonical top-level
+      identifier
+    - Clinical codes (SNOMED, ICD-10, LOINC, CVX, RxNorm) — pass through
+    - meta.tag stamped with 'deidentified' + 'patient-controlled'
+    - notes/comments — removed
+
+    #617: this function used to stop at the top level. `contained[]`,
+    `subject.display`, `generalPractitioner[].display` and any other nested
+    person-bearing field survived untouched inside a Bundle stamped
+    'ANONYED'. Fixed by running the same recursive walker `apply_redaction`
+    uses over the WHOLE tree first — every `display`/free-text key, every
+    nested name/telecom/address/photo/text/note, at any depth, gets the
+    standard profile's treatment — and then applying this function's own
+    STRONGER top-level-only policy (full removal instead of redaction,
+    verbatim birthDate, the single canonical identifier) on top. This is a
+    policy layered on the one walker, not a second one: nested resources
+    (a contained RelatedPerson, a referenced Practitioner's display) get the
+    standard profile's guarantee; the top-level resource — the one this
+    function exists to protect — gets the stronger one on top of it.
+
+    Args:
+        resource: FHIR resource dict (not modified in place)
+        patient_id: The healthclaw.io canonical patient ID to inject
+
+    Returns:
+        Deep copy with patient-controlled deidentification applied
+    """
+    import copy
+    result = copy.deepcopy(resource)
+    original_birth_date = result.get('birthDate')
+
+    # Base pass: the same walker apply_redaction uses, over the whole tree.
+    # Closes #617 — nothing nested (contained[], subject.display,
+    # generalPractitioner[].display, any reference's .display) survives this
+    # untouched, because the walker does not stop at the top level.
+    _redact_recursive(result)
+
+    # Everything below is this function's OWN, stronger, top-level-only
+    # policy layered on top of the base pass above.
+
+    # Remove direct identifiers entirely
+    result.pop('name', None)
+    result.pop('telecom', None)
+    result.pop('address', None)
+    result.pop('photo', None)
+    # Patient.contact[] carries emergency-contact name/phone/address — remove it
+    # wholesale (this output feeds SHL / $share-bundle external sharing).
+    result.pop('contact', None)
+
+    # birthDate is PRESERVED verbatim at the top level — patient wants their
+    # own DOB in their store. The base pass above truncated it to a year
+    # like every other date in the tree; restore the original here, only at
+    # the top level, only for this function.
+    if original_birth_date is not None:
+        result['birthDate'] = original_birth_date
+
+    # The healthclaw canonical id is the SOLE identifier — built, not
+    # filtered. The keyword denylist this replaced ('mrn', 'facility', ...)
+    # passed any upstream identifier whose system used other words through
+    # with its value intact, which is the same last-four-class gap the
+    # standard profile had (Safe Harbor §164.514(b)(2)(i)(H)).
+    result['identifier'] = [{
+        'system': 'https://healthclaw.io/patient-id',
+        'value': patient_id,
+    }]
+
+    # Remove notes/comments
+    for field in ('note', 'comment'):
+        result.pop(field, None)
+
+    # Remove narrative text
+    if 'text' in result:
+        result.pop('text')
+
+    # Stamp meta.tag with deidentified + patient-controlled. A stored meta or
+    # tag of the wrong shape is not trusted to hold Codings: only object
+    # tags are kept, and only a string code counts as already stamped. An
+    # object code here raised TypeError in the set below (QA on #886).
+    meta = result.get('meta')
+    if not isinstance(meta, dict):
+        meta = result['meta'] = {}
+    tags = meta.get('tag')
+    if isinstance(tags, dict):
+        tags = [tags]
+    tags = [t for t in tags if isinstance(t, dict)] \
+        if isinstance(tags, list) else []
+    existing_codes = {t['code'] for t in tags
+                      if isinstance(t.get('code'), str)}
+    if 'deidentified' not in existing_codes:
+        tags.append({
+            'system': (
+                'http://terminology.hl7.org/CodeSystem/v3-ObservationValue'
+            ),
+            'code': 'ANONYED',
+            'display': 'anonymized',
+        })
+    if 'patient-controlled' not in existing_codes:
+        tags.append({
+            'system': 'https://healthclaw.io/tags',
+            'code': 'patient-controlled',
+            'display': 'Patient-controlled deidentification',
+        })
+    meta['tag'] = tags
+    # As apply_redaction: only the store's own channel, never the JSON's.
+    _stamp_record_source(result, getattr(resource, 'record_source', None))
+
+    return result

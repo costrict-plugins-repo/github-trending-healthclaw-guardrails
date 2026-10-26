@@ -1,0 +1,48 @@
+# HealthClaw Guardrails — Health Context Declaration
+#
+# A single source of truth for who this deployment serves, under what rules.
+# Read by the guardrail stack (redaction, audit, step-up) and by any skill
+# or tool that needs to know jurisdiction/audience/sensitivity without
+# re-asking.
+#
+# The patient-facing surface is CareAgents (careagents/ in this repo), which
+# declares itself below. SmartHealthConnect, the original sister surface, was
+# archived 2026-07-19 (its skills live on as CareAgents advisors).
+
+name: HealthClaw Guardrails
+version: 2.1.0
+role: engine
+
+# Jurisdiction determines which regulatory overlay applies to reads/writes.
+# Supported today: us. Future: eu, us+eu.
+jurisdiction: us
+regulations:
+  - hipaa
+  - hitrust
+  - soc2
+
+# Audiences this deployment serves. Drives default redaction mode and
+# MCP App rendering choices.
+audience:
+  - patient
+  - developer
+
+# Sensitivity classification. `phi` = treat every resource as PHI by default.
+data_sensitivity: phi
+
+# Default tenant used when X-Tenant-Id header is absent (MCP clients like
+# Claude Desktop that don't let users set headers). Must match MCP server's
+# TENANT_ID env var for consistency.
+tenant_default: desktop-demo
+
+# The audit event agent string when no X-Agent-Id is supplied.
+audit_agent_default: healthclaw-guardrails
+
+# Surface products that call into this engine. Informational — not enforced.
+surfaces:
+  - name: CareAgents
+    repo: https://github.com/aks129/HealthClawGuardrails/tree/main/careagents
+    role: consumer app (accounts, advisors, web/Telegram/iMessage)
+  # SmartHealthConnect (patient-facing PHR) archived 2026-07-19 —
+  # https://github.com/aks129/SmartHealthConnect (read-only; salvage record
+  # in its issue #12).

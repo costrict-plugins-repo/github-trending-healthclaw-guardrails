@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "healthclaw-local": {
+      "type": "http",
+      "url": "http://localhost:3001/mcp",
+      "headers": {
+        "X-Tenant-ID": "desktop-demo"
+      }
+    },
+    "healthbankone": {
+      "type": "http",
+      "url": "https://mcp.app.healthbankone.com/mcp"
+    }
+  }
+}

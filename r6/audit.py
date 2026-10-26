@@ -1,0 +1,135 @@
+"""
+AuditEvent middleware for R6 FHIR operations.
+
+All reads and writes emit AuditEvent records.
+R6 defines AuditEvent as a record of events relevant for
+operations, privacy, security, maintenance, and performance analysis.
+"""
+
+import logging
+import re
+from models import db
+from r6.models import AuditEventRecord
+from r6.health_context import get as _hc_get
+from r6.log_safety import id_hash, loggable_id, scrub as scrub_credentials
+
+logger = logging.getLogger(__name__)
+
+#: The engine's id rule, and the width of `AuditEventRecord.agent_id`.
+_STORABLE_AGENT_ID = re.compile(r'[A-Za-z0-9._:-]{1,128}')
+
+
+def _storable_agent_id(agent_id):
+    """The agent id as the audit row may hold it.
+
+    It usually comes straight from the `X-Agent-Id` header. One outside the
+    engine's id rule is stored as its log hash: an over-long value overflowed
+    the column on Postgres and failed the audit write, and a credential
+    pasted into the header must not land in the audit table (FHI-60).
+    """
+    if isinstance(agent_id, str) and _STORABLE_AGENT_ID.fullmatch(agent_id):
+        return agent_id
+    return id_hash(agent_id)
+
+
+class AuditWriteError(RuntimeError):
+    """Raised when a mandatory AuditEvent could not be written.
+
+    "Every resource access emits an AuditEvent" is a graded conformance
+    property, so an access that cannot be audited must fail loudly rather
+    than proceed unrecorded. Swallowing this is what let a seed report
+    201/created-7 while persisting nothing (issue #182).
+    """
+
+
+def _new_audit_event(event_type, resource_type=None, resource_id=None,
+                     agent_id=None, context_id=None, outcome='success',
+                     detail=None, tenant_id=None, outcome_detail_code=None):
+    return AuditEventRecord(
+        event_type=event_type,
+        resource_type=resource_type,
+        resource_id=resource_id,
+        context_id=context_id,
+        tenant_id=tenant_id,
+        agent_id=(
+            _storable_agent_id(agent_id) if agent_id
+            else _hc_get('audit_agent_default', 'healthclaw-guardrails')
+        ),
+        outcome=outcome,
+        outcome_detail_code=outcome_detail_code,
+        detail=detail,
+    )
+
+
+def add_audit_event(event_type, resource_type=None, resource_id=None,
+                    agent_id=None, context_id=None, outcome='success',
+                    detail=None, tenant_id=None, outcome_detail_code=None):
+    """Add and flush an AuditEvent inside the caller-owned transaction.
+
+    Write paths should use this function before their domain commit so the
+    state change and mandatory audit record succeed or roll back together.
+    Audit failures deliberately propagate to the unit-of-work owner.
+    """
+    audit = _new_audit_event(
+        event_type, resource_type, resource_id, agent_id, context_id,
+        outcome, detail, tenant_id, outcome_detail_code,
+    )
+    db.session.add(audit)
+    db.session.flush()
+    return audit
+
+
+def record_audit_event(event_type, resource_type=None, resource_id=None,
+                       agent_id=None, context_id=None, outcome='success',
+                       detail=None, tenant_id=None, outcome_detail_code=None):
+    """
+    Record an audit event for a FHIR operation.
+
+    Uses a nested transaction (SAVEPOINT) so that audit failures
+    do not roll back the caller's already-committed work.
+
+    Args:
+        event_type: Type of event (read, create, update, delete, validate)
+        resource_type: FHIR resource type involved
+        resource_id: ID of the resource involved
+        agent_id: Identifier of the agent/user performing the action
+        context_id: Context envelope ID if applicable
+        outcome: Event outcome (success, failure)
+        detail: Additional detail text
+        tenant_id: Tenant identifier for isolation
+        outcome_detail_code: Allowlisted public outcome-evidence code
+    """
+    nested = None
+    try:
+        nested = db.session.begin_nested()
+        audit = _new_audit_event(
+            event_type, resource_type, resource_id, agent_id, context_id,
+            outcome, detail, tenant_id, outcome_detail_code,
+        )
+        db.session.add(audit)
+        nested.commit()
+        db.session.commit()
+        # The agent id can come straight from a request header, so it is
+        # hashed like the access log's; the resource id comes from the path
+        # and is scrubbed like it (FHI-60).
+        actor = loggable_id(agent_id) if agent_id else 'system'
+        logger.debug(scrub_credentials(
+            f'AuditEvent recorded: {event_type} on {resource_type}/{resource_id} '
+            f'by {actor}'
+        ))
+    except Exception as exc:
+        logger.error('Failed to record audit event: %s', type(exc).__name__)
+        # Roll back ONLY the savepoint. A full db.session.rollback() here
+        # discarded the caller's uncommitted work — the audit failure then
+        # became silent data loss behind a success status (#182).
+        try:
+            if nested is not None:
+                nested.rollback()
+        except Exception:
+            # The savepoint is already gone (or was never opened); leave the
+            # caller's transaction alone rather than escalating to a full
+            # rollback, which is the bug this handler exists to avoid.
+            pass
+        # Fail loud: an un-audited access must not be reported as success.
+        raise AuditWriteError(
+            f'audit write failed: {type(exc).__name__}') from exc

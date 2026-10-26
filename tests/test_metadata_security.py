@@ -1,0 +1,270 @@
+"""
+tests/test_metadata_security.py
+
+Reconciliation tests for the security disclosure work:
+  1. CapabilityStatement advertises real SMART-on-FHIR security (no more
+     "security: none") with an oauth-uris extension carrying live authorize
+     and token endpoints.
+  2. The privacy policy renders the reconciled (honest) security claims:
+     the reference-implementation note and the messaging-platforms posture.
+  3. The OpenClaw bot's /start welcome carries the one-time chat-channel
+     risk acknowledgment. This used to be a source-content assertion on the
+     grounds that the telegram SDK was not a test dependency; it is one now
+     (pyproject.toml), so the handler is driven and its reply read (#634 F8).
+"""
+
+import asyncio
+import os
+import re
+import sys
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
+
+
+def _privacy_prose(client):
+    """/privacy as a reader sees it: tags dropped, case folded, and every run
+    of whitespace, hyphens or dashes collapsed to one space. A banned claim
+    must not walk back in by a line wrap, an <em>, or 'summary only' written
+    without its hyphen (#634 F8)."""
+    body = client.get('/privacy').get_data(as_text=True)
+    text = re.sub(r'<[^>]+>', ' ', body).lower()
+    return re.sub(r'[\s \-‐-―]+', ' ', text)
+
+
+# ---------------------------------------------------------------------------
+# 1. CapabilityStatement security block
+# ---------------------------------------------------------------------------
+
+class TestMetadataSecurity:
+    def _rest_security(self, client):
+        resp = client.get('/r6/fhir/metadata')
+        assert resp.status_code == 200
+        cs = resp.get_json()
+        rest = cs['rest'][0]
+        assert 'security' in rest, "rest[0].security must be present (no 'security: none')"
+        return rest['security']
+
+    def test_security_service_is_smart_on_fhir(self, client):
+        security = self._rest_security(client)
+        code = security['service'][0]['coding'][0]['code']
+        assert code == 'SMART-on-FHIR'
+
+    def test_security_service_coding_system(self, client):
+        security = self._rest_security(client)
+        coding = security['service'][0]['coding'][0]
+        assert coding['system'] == (
+            'http://terminology.hl7.org/CodeSystem/restful-security-service'
+        )
+
+    def test_oauth_uris_extension_present(self, client):
+        security = self._rest_security(client)
+        ext = security['extension'][0]
+        assert ext['url'] == (
+            'http://fhir-registry.smarthealthit.org/StructureDefinition/oauth-uris'
+        )
+
+    def test_authorize_and_token_uris_nonempty_http(self, client):
+        security = self._rest_security(client)
+        uris = {
+            e['url']: e['valueUri']
+            for e in security['extension'][0]['extension']
+        }
+        for key in ('authorize', 'token'):
+            assert key in uris, f'{key} URI must be advertised'
+            assert uris[key], f'{key} URI must be non-empty'
+            assert uris[key].startswith('http'), f'{key} URI must be an http(s) URL'
+
+    def test_register_uri_present(self, client):
+        security = self._rest_security(client)
+        uris = {
+            e['url']: e['valueUri']
+            for e in security['extension'][0]['extension']
+        }
+        assert uris.get('register', '').startswith('http')
+
+    def test_oauth_uris_match_smart_configuration(self, client):
+        """The CapabilityStatement endpoints must match the discovery doc."""
+        security = self._rest_security(client)
+        cs_uris = {
+            e['url']: e['valueUri']
+            for e in security['extension'][0]['extension']
+        }
+        smart = client.get('/r6/fhir/.well-known/smart-configuration').get_json()
+        assert cs_uris['authorize'] == smart['authorization_endpoint']
+        assert cs_uris['token'] == smart['token_endpoint']
+        assert cs_uris['register'] == smart['registration_endpoint']
+
+
+# ---------------------------------------------------------------------------
+# 2. Privacy policy reconciliation
+# ---------------------------------------------------------------------------
+
+class TestPrivacyReconciliation:
+    def test_privacy_renders(self, client):
+        resp = client.get('/privacy')
+        assert resp.status_code == 200
+
+    def test_no_universal_authenticated_tenant_claim(self, client):
+        """MUTATION: write 'scoped to the\\n<em>authenticated</em> tenant' into
+        templates/privacy.html -> red. The raw-body check it replaced stayed
+        green: a template line wrap was enough to reinstate the claim."""
+        # The old overclaiming phrasing must be gone.
+        assert 'scoped to the authenticated tenant' not in _privacy_prose(client)
+
+    def test_reference_implementation_note_present(self, client):
+        body = client.get('/privacy').get_data(as_text=True)
+        assert 'Reference Implementation vs. Production' in body
+        assert 'tenant-authenticated reads' in body
+
+    def test_messaging_platforms_section_present(self, client):
+        body = client.get('/privacy').get_data(as_text=True)
+        assert 'Messaging Platforms' in body
+        assert 'patient-directed access' in body
+        assert 'individual right of access' in body
+        # Honest comparative point.
+        assert 'exceeds the security posture of typical consumer health' in body
+
+    def test_careagents_beta_tester_tenant_and_deletion_stated(self, client):
+        # Council ruling 2026-09-02 (D3), derived from what the code does, not
+        # from what we would like it to do; rewritten for #565 (2026-10-19).
+        # Every tester starts on careagents' "sample" connector (synthetic,
+        # no consent gate); a Fasten connection is refused without consent at
+        # tester_terms.CONSENT_VERSION before its connect URL exists
+        # (careagents/app.py _start_connection). Deletion is DELETE
+        # /api/connections/<id> -> /internal/purge-tenant, which purges and
+        # commits in the same request (r6/routes.py) and keeps the PHI-free
+        # audit rows (r6/purge.py).
+        body = _privacy_prose(client)
+        assert 'careagents beta testers' in body
+        assert 'sample patient whose records are made up' in body
+        assert 'no real health data is involved' not in body
+        assert ('accepts the tester terms before any of their records come in'
+                in body)
+        assert 'delete removes that source\'s records' in body
+        assert 'right away' in body
+
+    def test_careagents_retention_names_everything_that_survives(self, client):
+        # A retention statement that lists only the audit trail reads as the
+        # exhaustive list. It is not. After account delete
+        # (accounts.delete_account, #554) these outlive it: the engine's
+        # PHI-free audit rows and TenantClosure tombstone (r6/purge.py);
+        # hashed mailbox / handle rows (BetaMailCap, InviteJoin,
+        # ImessageHandleState and its STOP flag); aggregate day counts and
+        # Sendblue delivery rows. The old "no self-serve button, email
+        # support" line became false with #554 and must not come back.
+        body = _privacy_prose(client)
+        assert 'nothing else about you' not in body
+        assert 'no self serve' not in body
+        assert 'one thing outlives deletion' not in body
+        assert "careagents' own database holds no health records" in body
+        assert 'delete your whole account yourself in settings' in body
+        for survivor in ('log of when your records were looked at',
+                         'each deleted space was closed',
+                         'permissions you gave apps through the connector',
+                         'expire after 31 days',
+                         'scrambled codes made from your email address and '
+                         'messaging number',
+                         'keep honoring a stop',
+                         'daily totals that count everyone together'):
+            assert survivor in body, survivor
+
+    def test_rights_section_says_deletion_is_immediate(self, client):
+        body = _privacy_prose(client)
+        assert 'completes within 30 days' not in body
+        assert 'export your data as standard fhir at any time' not in body
+        assert 'with notes and identifiers removed' in body
+        assert 'deletion happens right away' in body
+        assert 'healthclaw never sells your data' in body
+
+
+class TestCareAgentsSurfaceCopy:
+    """The site's CareAgents card is landing copy for a product whose Telegram
+    surface is out of service for the beta (#536, D6). D6 hid the tile and
+    rewrote the tester guide; this bullet kept promising the surface from the
+    page a stranger reads before either of those. Documentation is part of the
+    product surface (docs/2026-08-02-retro.md, "reality drifted")."""
+
+    def test_landing_card_does_not_offer_telegram_as_a_careagents_surface(
+            self, client):
+        body = client.get('/').get_data(as_text=True)
+        card = body.split('<div class="card__title">careagents</div>')[1]
+        card = card.split('</a>')[0]
+        assert 'Passkey sign-in' in card, "the surface bullet moved or was renamed"
+        assert 'Telegram' not in card
+
+
+# ---------------------------------------------------------------------------
+# 3. Bot /start risk disclosure (source-content check)
+# ---------------------------------------------------------------------------
+
+class TestBotStartDisclosure:
+    def test_start_reply_leads_with_the_risk_acknowledgment(self):
+        """The welcome a user actually receives states the channel risk, and
+        states it before the command list rather than under it.
+
+        MUTATION: drop f'{risk_line}\\n\\n' from cmd_start's text -> red. The
+        source-substring check this replaced ('cmd_start', 'risk_line',
+        'chat apps aren' all present in bot.py) stayed green, because the
+        variable is still defined — it just never reaches the user.
+        """
+        os.environ.setdefault('TELEGRAM_BOT_TOKEN', 'test-token-for-start')
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'openclaw'))
+        import bot
+
+        replies = []
+
+        async def fake_reply(update, text, agent_id=None, **kw):
+            replies.append(text)
+
+        async def fake_log_incoming(update, command):
+            return 'agent-x'
+
+        update = SimpleNamespace(
+            effective_message=SimpleNamespace(text='/start'),
+            effective_chat=SimpleNamespace(id=6340),
+            effective_user=SimpleNamespace(username='tester', id=1),
+        )
+        with patch.object(bot, '_reply', fake_reply), \
+                patch.object(bot, '_log_incoming', fake_log_incoming), \
+                patch.object(bot, '_bind_chat_to_tenant',
+                             lambda chat_id, username: (True, 'bound')):
+            asyncio.run(bot.cmd_start(update, None))
+
+        assert len(replies) == 1
+        assert 'Commands:' in replies[0], 'the command list moved or was renamed'
+        before_commands = replies[0].split('Commands:')[0]
+        assert re.search(r"chat apps aren.t encrypted", before_commands)
+        assert 'shared by everyone' in before_commands
+
+    def test_start_promises_no_unimplemented_privacy_control(self):
+        """The disclosure must not offer a control that does not exist.
+
+        A summary-only mode was advertised in /start (and listed as a live
+        mitigation in the privacy policy) before it was built. Offering a
+        privacy control that does nothing is worse than silence: the user
+        continues on an unencrypted consumer channel partly *because* they
+        were told a mitigation was available. Both claims were removed; this
+        test keeps them from returning ahead of an implementation.
+
+        If summary-only ships, assert the real toggle here instead of
+        deleting this test.
+        """
+        src = (
+            Path(__file__).resolve().parent.parent / 'openclaw' / 'bot.py'
+        ).read_text(encoding='utf-8')
+        assert '/nophi' not in src, (
+            'bot.py references /nophi — do not advertise summary-only mode '
+            'until a toggle is implemented and gates the read formatters')
+
+    def test_privacy_policy_lists_no_unimplemented_mitigation(self, client):
+        """Same claim, second location — the policy is a legal document.
+
+        Still a phrase ban, not a property: nothing enumerates the mitigations
+        that exist to check the list against. It is at least a tolerant one.
+        MUTATION: add a '<li>Summary only mode</li>' mitigation to
+        templates/privacy.html -> red (the hyphen-exact check stayed green).
+        """
+        assert 'summary only' not in _privacy_prose(client), (
+            'privacy policy lists summary-only mode as a mitigation, but it '
+            'is not implemented')

@@ -1,0 +1,599 @@
+"""Appointment Brief engine — pure function, no I/O.
+
+Converts FHIR R4 resource lists into a structured BriefResult. Each field
+carries a source citation (resourceType + id) so the UI can link back to the
+exact record that produced the claim.
+
+Design rules (enforced by tests):
+1. Unknown is never absent. Empty input lists produce empty section lists,
+   not "none" strings. The template decides how to render an empty section.
+   Care gaps go further and carry their own state (see CareGapsSection): for
+   that section an empty list is itself a clinical claim, so it is only made
+   when the screening review actually produced one.
+2. No inference. Every output field projects a literal value from the record.
+   The engine never derives a clinical conclusion the record doesn't state.
+3. Read-only. The engine has no write path. It never modifies the input dicts.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+
+from r6 import terminology
+from r6.labs.interpret import LOINC_RANGES
+from r6.safe_read import as_dict, codes, is_number
+from r6.voice import PATIENT, SAMPLE
+
+
+@dataclass
+class BriefField:
+    label: str        # patient-facing label ("Hypertension")
+    value: str        # patient-facing value ("Active since 2021-03")
+    source_type: str  # FHIR resourceType ("Condition")
+    source_id: str    # FHIR resource.id — used to build the "View source" link
+
+
+# The care-gaps section has three states, not two: gaps found, no gaps found,
+# and could-not-evaluate. The third one exists because the first two are both
+# answers and the empty list that used to stand in for a failure reads to a
+# patient as "you are up to date on your cancer screenings" (#381). Modelled
+# on r6/labs/interpret.py's _indeterminate(): a result we could not judge
+# carries a reason and is never dressed up as a clean one.
+CARE_GAPS_OK = "ok"
+CARE_GAPS_UNAVAILABLE = "unavailable"
+
+CARE_GAPS_REASON_NO_RESULT = "the screening review did not run"
+CARE_GAPS_REASON_ENGINE_ERROR = "the screening review could not be completed"
+CARE_GAPS_REASON_UNREADABLE = "the screening review returned an unreadable result"
+
+
+@dataclass
+class CareGapsSection:
+    """The care-gaps fields plus whether the screening review ran.
+
+    Deliberately not a bare list. A list carries two states and the third one
+    is the whole point, so callers have to reach through `.fields` — which
+    makes "could not evaluate" impossible to mistake for "nothing is due".
+    `status` defaults to unavailable: the ok state is earned, never assumed.
+    """
+    fields: list[BriefField] = field(default_factory=list)
+    status: str = CARE_GAPS_UNAVAILABLE
+    reason: str = CARE_GAPS_REASON_NO_RESULT
+
+
+@dataclass
+class BriefResult:
+    problems: list[BriefField] = field(default_factory=list)
+    medications: list[BriefField] = field(default_factory=list)
+    labs: list[BriefField] = field(default_factory=list)
+    # How a result moved over time (the KDIGO creatinine check, #867), kept
+    # apart from `labs`, which lists single readings.
+    lab_trends: list[BriefField] = field(default_factory=list)
+    care_gaps: list[BriefField] = field(default_factory=list)
+    visits: list[BriefField] = field(default_factory=list)
+    # care_gaps alone cannot say whether it is empty because nothing is due or
+    # because nothing ran. These two say which.
+    care_gaps_status: str = CARE_GAPS_UNAVAILABLE
+    care_gaps_reason: str = CARE_GAPS_REASON_NO_RESULT
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+#: We hold a code but our terminology table cannot name it. Distinct from
+#: UNKNOWN on purpose: after #382 the brief reads REDACTED resources, so an
+#: unrecognised code arrives with its upstream text and display stripped and
+#: would otherwise be indistinguishable from a record that never had a code
+#: at all. Collapsing the two hands a clinician a document full of "Unknown"
+#: with no way to tell an absent entry from a stripped one — the #376 hole
+#: that #382 warns the naive fix creates.
+UNLABELLED = "Recorded, name unavailable"
+
+#: No code element at all. There is nothing to name.
+UNKNOWN = "Unknown"
+
+#: A medicine on the list whose name we cannot show (#884 G7).
+MEDICINE_UNNAMED = ("A medicine is listed, but we can't show its name. "
+                    "Ask your doctor.")
+
+#: What the brief says where the record holds no value it can show.
+#: Not "Dose not listed": an RxNorm name carries the strength ("Metformin
+#: 500 mg"), so that sat beside the dose it said was missing. What is left
+#: out is the directions, Dosage.text, which is free text from the source
+#: system (#884 QA F3). No "your", so it reads the same on sample records.
+DOSE_NOT_LISTED = "How to take it isn't shown here."
+RESULT_NOT_LISTED = "Result not listed in your records"
+#: RESULT_NOT_LISTED about a made-up sample person (r6/voice.py).
+SAMPLE_RESULT_NOT_LISTED = "Result not listed in these made-up records"
+
+
+#: SNOMED "no known allergy" (716186003 and its descendants) and "patient
+#: not asked" (1631000175102): terminology.ABSENCE_CONCEPTS, the one source
+#: (#950). Their labels are statements about allergies, not names: an active
+#: Condition coded 716186003 read "No known allergy: Active" on the brief, a
+#: fact about the person no one attested (#949 F3).
+_is_absence = terminology.is_absence_coding
+
+
+def _names_an_absence(concept: dict) -> bool:
+    return any(_is_absence(c) for c in concept.get("coding") or [])
+
+
+def _only_absences(resource: dict) -> bool:
+    """Coded as an absence and nothing else: no clinical finding, so not a
+    condition or a result. Shown as "Recorded, name unavailable · Active"
+    it read as a mystery illness (#949 patient tester). Any other coding,
+    odd or not, keeps the row, unlabeled."""
+    codings = as_dict(resource.get("code")).get("coding")
+    return (isinstance(codings, list) and bool(codings)
+            and all(_is_absence(c) for c in codings))
+
+
+def _concept_label(concept) -> str | None:
+    """The server's name for a CodeableConcept, looked up by code in
+    r6/terminology.py, or None.
+
+    Never `text` or `coding[].display`. Those are the two fields a real feed
+    puts patient names in, and CLAUDE.md forbids carrying them. The route
+    redacts first, which strips both and writes back table labels; the
+    engine does not lean on that (#884 QA F3), so it reads only the codes.
+    """
+    if not isinstance(concept, dict):
+        return None
+    if _names_an_absence(concept):
+        return None
+    for coding in concept.get("coding") or []:
+        if isinstance(coding, dict):
+            label = terminology.lookup(coding.get("system"), coding.get("code"))
+            if label:
+                return label
+    return None
+
+
+def _has_code(concept) -> bool:
+    """A coding was recorded: a code, or the system redaction leaves when
+    it drops a malformed code (#957). That entry reads "Recorded, name
+    unavailable", never "Unknown", which read like a mystery illness."""
+    return isinstance(concept, dict) and any(
+        isinstance(c, dict) and (c.get("code") or c.get("system"))
+        for c in concept.get("coding") or [])
+
+
+def _code_text(resource: dict) -> str:
+    """Best human-readable label from a FHIR code element.
+
+    Three outcomes, never two: a label we can stand behind, a code we hold
+    but cannot name, or nothing recorded.
+    """
+    code = resource.get("code") or resource.get("medicationCodeableConcept") or {}
+    label = _concept_label(code)
+    if label:
+        return label
+    if _has_code(code):
+        return UNLABELLED
+    return UNKNOWN
+
+
+_MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun",
+           "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+
+
+def _date_display(value: str) -> str:
+    """One date style on the brief (#884 G7): "Oct 6, 2026", or "Oct 2026"
+    / "2026" when the record holds only that much. Anything unreadable is
+    left out rather than shown raw."""
+    if not isinstance(value, str):
+        return ""
+    parts = value[:10].split("-")
+    try:
+        year = int(parts[0])
+        if len(parts) == 1:
+            return str(year)
+        month_n = int(parts[1])
+        # Month 00 indexed _MONTHS[-1] and read as December (#884 QA).
+        if not 1 <= month_n <= 12:
+            return ""
+        month = _MONTHS[month_n - 1]
+        if len(parts) == 2:
+            return f"{month} {year}"
+        day = int(parts[2])
+        if not 1 <= day <= 31:
+            return ""
+        return f"{month} {day}, {year}"
+    except (ValueError, IndexError):
+        return ""
+
+
+def _onset_display(resource: dict) -> str:
+    """Best onset date string from a Condition resource."""
+    onset = (
+        resource.get("onsetDateTime")
+        or resource.get("onsetPeriod", {}).get("start")
+        or resource.get("recordedDate")
+        or ""
+    )
+    if onset and len(onset) >= 7:
+        return _date_display(onset[:7])  # month precision: "Mar 2021"
+    return ""
+
+
+def _effective_display(resource: dict) -> str:
+    """Best effective date string from an Observation resource."""
+    dt = (
+        resource.get("effectiveDateTime")
+        or resource.get("effectivePeriod", {}).get("start")
+        or resource.get("issued")
+        or ""
+    )
+    if dt and len(dt) >= 10:
+        return _date_display(dt)
+    return ""
+
+
+#: The units the brief recognises, each mapped to how it reads. A closed
+#: list of exact, case-sensitive tokens, as careagents/agent.py keeps for
+#: the model (R875-3): any other string, however unit-shaped, could be a
+#: word, so it is never shown (R884-1). Every value here is itself a key,
+#: so only an exact allowlist token ever reaches the page. UCUM's bracket
+#: forms read as their plain spelling; both spellings are accepted.
+_UNIT_DISPLAY = {
+    # US conventional
+    "mg/dL": "mg/dL", "g/dL": "g/dL", "ng/mL": "ng/mL", "pg/mL": "pg/mL",
+    "ng/dL": "ng/dL", "ug/dL": "ug/dL", "mEq/L": "mEq/L",
+    # SI
+    "mmol/L": "mmol/L", "umol/L": "umol/L", "µmol/L": "µmol/L",
+    "nmol/L": "nmol/L", "pmol/L": "pmol/L", "mmol/mol": "mmol/mol",
+    "g/L": "g/L", "mg/L": "mg/L", "ug/L": "ug/L",
+    "10*9/L": "10^9/L", "10^9/L": "10^9/L", "10*12/L": "10^12/L",
+    "10^12/L": "10^12/L",
+    # either
+    "%": "%", "U/L": "U/L", "[IU]/L": "IU/L", "IU/L": "IU/L",
+    "mm[Hg]": "mmHg", "mmHg": "mmHg",
+    "mL/min/{1.73_m2}": "mL/min/1.73m2", "mL/min/1.73m2": "mL/min/1.73m2",
+    "10*3/uL": "10^3/uL", "10^3/uL": "10^3/uL",
+    "10*6/uL": "10^6/uL", "10^6/uL": "10^6/uL",
+    "fL": "fL", "pg": "pg", "mg/mmol": "mg/mmol", "mg/g": "mg/g",
+    "[pH]": "pH", "pH": "pH",
+}
+
+
+def _number(value) -> str | None:
+    """A finite number as text ("128", "6.1"), else None: a string, a bool,
+    NaN or an infinity in `value` is not a measurement (R884-1)."""
+    if not is_number(value):
+        return None
+    return str(int(value)) if float(value).is_integer() else f"{value:g}"
+
+
+def _unit(vq: dict, analyte_codes) -> str | None:
+    """The unit the reading stated, as the brief shows it, or None when it
+    stated one the brief does not recognise (#884 QA F1).
+
+    Never a unit the reading did not state: a creatinine reported in
+    umol/L is not "mg/dL" because that is creatinine's usual unit. So:
+    - its code (any system, or none) or its unit string is an exact
+      allowlist token: that unit;
+    - neither is present at all: the analyte's usual unit, or none;
+    - anything else: None, and the caller shows no number.
+    """
+    vq = as_dict(vq)
+    stated = [v for v in (vq.get("code"), vq.get("unit"))
+              if v is not None and v != ""]
+    for value in stated:
+        if isinstance(value, str) and value in _UNIT_DISPLAY:
+            return _UNIT_DISPLAY[value]
+    if stated:
+        return None
+    for analyte in analyte_codes:
+        known = _KNOWN_UNITS.get(analyte) or (
+            LOINC_RANGES.get(analyte) or {}).get("unit")
+        if known in _UNIT_DISPLAY:
+            return _UNIT_DISPLAY[known]
+    return ""
+
+
+def _obs_value(obs: dict) -> str:
+    """Human-readable value + unit from an Observation: a finite number and
+    the unit it stated, or "" (the caller says the result is not listed)."""
+    if "valueQuantity" in obs:
+        vq = as_dict(obs["valueQuantity"])
+        value = _number(vq.get("value"))
+        unit = _unit(vq, codes(obs.get("code")))
+        if value is None or unit is None:
+            return ""
+        return f"{value} {unit}".strip()
+    # No valueString branch. It is free text from the source system with no
+    # code to label it by, so nothing here can stand behind it (#877). The
+    # route strips it already (apply_redaction); the engine does not lean
+    # on that, because the brief reaches chat and text messages.
+    if "valueCodeableConcept" in obs:
+        # A coded value we cannot name is still a value: "Result not
+        # listed" said there was none (#949 review).
+        vcc = obs["valueCodeableConcept"]
+        return _concept_label(vcc) or (UNLABELLED if _has_code(vcc) else "")
+    return _blood_pressure(obs)
+
+
+#: LOINC systolic and diastolic, the two components of a blood pressure
+#: panel. The panel itself has no value; the numbers live here.
+_SYSTOLIC, _DIASTOLIC = "8480-6", "8462-4"
+
+#: Known units for codes LOINC_RANGES does not carry.
+_KNOWN_UNITS = {_SYSTOLIC: "mm[Hg]", _DIASTOLIC: "mm[Hg]"}
+
+
+def _blood_pressure(obs: dict) -> str:
+    """"120/80 mmHg" from a panel's components, or "" (#884 G7: the row
+    showed a date and no numbers)."""
+    values = {}
+    unit = ""
+    for comp in obs.get("component") or []:
+        if not isinstance(comp, dict):
+            continue
+        comp_codes = codes(comp.get("code"))
+        vq = as_dict(comp.get("valueQuantity"))
+        value = _number(vq.get("value"))
+        if value is None:
+            continue
+        for key in (_SYSTOLIC, _DIASTOLIC):
+            if key in comp_codes:
+                comp_unit = _unit(vq, [key])
+                if comp_unit is None:
+                    return ""       # a unit we do not recognise: not shown
+                values[key] = value
+                unit = unit or comp_unit
+    if _SYSTOLIC not in values or _DIASTOLIC not in values:
+        return ""
+    return f"{values[_SYSTOLIC]}/{values[_DIASTOLIC]} {unit}".strip()
+
+
+def _medication_display(resource: dict) -> str:
+    """Human-readable medication name from a MedicationRequest, by code.
+
+    medicationReference.display is upstream text with no code behind it, so
+    it is never shown (#884 QA F3). A reference or a code we cannot name is
+    the plain sentence MEDICINE_UNNAMED, as is a request with nothing to
+    name it by (#884 G7).
+    """
+    cc = resource.get("medicationCodeableConcept")
+    label = _concept_label(cc)
+    if label:
+        return label
+    if _has_code(cc) or (resource.get("medicationReference") or {}).get(
+            "reference"):
+        return MEDICINE_UNNAMED
+    return MEDICINE_UNNAMED
+
+
+def _encounter_display(enc: dict) -> str:
+    """Human-readable label for an Encounter: the visit type by code, never
+    its upstream text."""
+    type_text = ""
+    for t in enc.get("type", []):
+        type_text = _concept_label(t) or ""
+        if type_text:
+            break
+    period = enc.get("period", {})
+    date = _date_display(
+        period.get("start") or enc.get("meta", {}).get("lastUpdated", ""))
+    return (type_text or "Visit") + (f" ({date})" if date else "")
+
+
+# ---------------------------------------------------------------------------
+# Section builders (pure, exported for unit testing)
+# ---------------------------------------------------------------------------
+
+_ACTIVE_CONDITION_STATUSES = {"active", "recurrence", "relapse"}
+
+
+def build_problems(conditions: list[dict]) -> list[BriefField]:
+    """Active problem list from Condition resources."""
+    out = []
+    for c in conditions:
+        status = (c.get("clinicalStatus") or {}).get("coding", [{}])[0].get(
+            "code", ""
+        )
+        if status not in _ACTIVE_CONDITION_STATUSES or _only_absences(c):
+            continue
+        label = _code_text(c)
+        onset = _onset_display(c)
+        value = f"Active{f' since {onset}' if onset else ''}"
+        out.append(BriefField(
+            label=label,
+            value=value,
+            source_type="Condition",
+            source_id=c.get("id", ""),
+        ))
+    return out
+
+
+_ACTIVE_MED_STATUSES = {"active", "intended", "unknown"}
+
+
+def build_medications(medication_requests: list[dict]) -> list[BriefField]:
+    """Current medication list from MedicationRequest resources."""
+    out = []
+    for m in medication_requests:
+        status = m.get("status", "")
+        if status not in _ACTIVE_MED_STATUSES:
+            continue
+        label = _medication_display(m)
+        # Dosage.text is free text from the source system, with no code to
+        # label it by, so it is not shown (#884 QA F3).
+        out.append(BriefField(
+            label=label,
+            value=DOSE_NOT_LISTED,
+            source_type="MedicationRequest",
+            source_id=m.get("id", ""),
+        ))
+    return out
+
+
+_MAX_LABS = 10
+
+
+def build_labs(observations: list[dict],
+               voice: str = PATIENT) -> list[BriefField]:
+    """Most recent lab results from Observation resources (capped at 10)."""
+
+    def _sort_key(obs: dict) -> str:
+        return (
+            obs.get("effectiveDateTime")
+            or obs.get("effectivePeriod", {}).get("start")
+            or obs.get("issued")
+            or ""
+        )
+
+    sorted_obs = sorted((o for o in observations if not _only_absences(o)),
+                        key=_sort_key, reverse=True)
+    out = []
+    for obs in sorted_obs[:_MAX_LABS]:
+        label = _code_text(obs)
+        value = _obs_value(obs)
+        date = _effective_display(obs)
+        if not value:
+            value = (SAMPLE_RESULT_NOT_LISTED if voice == SAMPLE
+                     else RESULT_NOT_LISTED)
+        display_value = value + (f" ({date})" if date else "")
+        out.append(BriefField(
+            label=label,
+            value=display_value,
+            source_type="Observation",
+            source_id=obs.get("id", ""),
+        ))
+    return out
+
+
+def build_lab_trends(trend_lines: list[dict]) -> list[BriefField]:
+    """Trend sentences from r6/labs/trend.py, one field each.
+
+    Each item is {"analyte", "message", "source_id"}: the label is the
+    engine's name for the code and the value its own sentence, both already
+    written by r6/labs/trend.py and repeated here unchanged. No trend is an
+    empty list, never a sentence: "no rise found" would be a statement about
+    the person's kidneys that nothing here made.
+    """
+    out = []
+    for item in trend_lines or []:
+        if not isinstance(item, dict) or not item.get("message"):
+            continue
+        out.append(BriefField(
+            label=item.get("analyte") or "Lab trend",
+            value=item["message"],
+            source_type="Observation",
+            source_id=item.get("source_id") or "",
+        ))
+    return out
+
+
+def build_care_gaps(care_gap_result: dict) -> CareGapsSection:
+    """Open preventive-care gaps from the $care-gaps output.
+
+    `care_gap_result` is one of two things: a successful evaluation, which is
+    a "consumer" payload carrying a "due" list, or a caller's explicit
+    {"status": "unavailable", "reason": ...} marker. Anything else — {}, a
+    payload with no due list, a non-dict — is unavailable. "Nothing is due"
+    is a clinical claim about cancer screening, and it is only ever repeated
+    from a result that made it.
+    """
+    if not isinstance(care_gap_result, dict) or not care_gap_result:
+        return CareGapsSection(reason=CARE_GAPS_REASON_NO_RESULT)
+    if care_gap_result.get("status") == CARE_GAPS_UNAVAILABLE:
+        return CareGapsSection(
+            reason=care_gap_result.get("reason") or CARE_GAPS_REASON_NO_RESULT)
+
+    consumer = care_gap_result.get("consumer")
+    # `lines`, not `due`. r6/caregaps/report.py::build_consumer_summary owns
+    # this shape and has never emitted a "due" key at any point in its
+    # history, so every brief rendered CARE_GAPS_REASON_UNREADABLE for a key
+    # mismatch rather than an error (#387, #435) — reproduced against
+    # production on 2026-08-06. Two copies of one fact drifting; the fix is
+    # to keep one (Law 2, docs/2026-08-06-two-generators-three-laws.md).
+    if not isinstance(consumer, dict) or "lines" not in consumer:
+        return CareGapsSection(reason=CARE_GAPS_REASON_UNREADABLE)
+
+    # `lines` carries due AND up-to-date; this section is gaps only. Listing
+    # an up-to-date screening under "care gaps" tells a patient to chase one
+    # they have already had.
+    lines = consumer.get("lines") or []
+    out = []
+    for item in lines:
+        if not isinstance(item, dict) or item.get("status") != "due":
+            continue
+        out.append(BriefField(
+            label=item.get("title") or "Screening",
+            value=item.get("message") or "Due",
+            source_type="MeasureReport",
+            source_id=item.get("rule_id", ""),
+        ))
+
+    # An answer with a hole in it is not a whole answer. The producer already
+    # says which rules never decided and why (`unevaluated*`); discarding that
+    # would render an empty or partial gap list as a completed review, and
+    # "nothing is due" is a clinical claim only ever repeated from a result
+    # that made it (#428). It is also how a tenant with no Patient, or more
+    # than one, reaches this section: the route declares the caller reason
+    # and the note says which.
+    if consumer.get("unevaluated"):
+        return CareGapsSection(
+            fields=out, status=CARE_GAPS_UNAVAILABLE,
+            reason=consumer.get("unevaluated_note")
+            or CARE_GAPS_REASON_NO_RESULT)
+
+    return CareGapsSection(fields=out, status=CARE_GAPS_OK, reason="")
+
+
+def build_visits(encounters: list[dict]) -> list[BriefField]:
+    """Recent and upcoming encounters from Encounter resources."""
+
+    def _sort_key(enc: dict) -> str:
+        period = enc.get("period", {})
+        return period.get("start") or enc.get("meta", {}).get("lastUpdated", "")
+
+    sorted_encs = sorted(encounters, key=_sort_key, reverse=True)
+    out = []
+    for enc in sorted_encs[:5]:
+        label = _encounter_display(enc)
+        status = enc.get("status", "")
+        out.append(BriefField(
+            label=label,
+            value=status.capitalize() if status else "Scheduled",
+            source_type="Encounter",
+            source_id=enc.get("id", ""),
+        ))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Main entry point
+# ---------------------------------------------------------------------------
+
+def generate_brief(
+    conditions: list[dict],
+    medication_requests: list[dict],
+    observations: list[dict],
+    encounters: list[dict],
+    care_gap_result: dict,
+    lab_trends: list[dict] | None = None,
+    voice: str = PATIENT,
+) -> BriefResult:
+    """Generate a structured appointment brief from FHIR resource lists.
+
+    All inputs may be empty lists / empty dicts. Empty inputs produce empty
+    section lists — never error strings. The unknown-never-absent rule holds
+    for the wording *and* for the shape: no section says 'none' or 'no
+    records', and the care-gaps section reports whether it ran at all, so an
+    empty list there is never read back as reassurance (#381).
+    """
+    gaps = build_care_gaps(care_gap_result)
+    return BriefResult(
+        problems=build_problems(conditions),
+        medications=build_medications(medication_requests),
+        labs=build_labs(observations, voice),
+        lab_trends=build_lab_trends(lab_trends or []),
+        care_gaps=gaps.fields,
+        visits=build_visits(encounters),
+        care_gaps_status=gaps.status,
+        care_gaps_reason=gaps.reason,
+    )

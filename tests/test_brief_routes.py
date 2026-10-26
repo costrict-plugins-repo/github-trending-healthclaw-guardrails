@@ -1,0 +1,227 @@
+"""Route tests for the AppointmentBrief endpoint.
+
+#381: when the care-gaps evaluation raises, the brief must carry an explicit
+"unavailable" state. The old behaviour returned {} and produced a care-gaps
+section indistinguishable from a clean bill of health — a patient reading it
+was told they were up to date on colorectal, cervical and breast cancer
+screening by a component that never ran.
+
+NOTE the URL. r6_blueprint is mounted at /r6/fhir and the handler adds a
+second "/fhir", so the route registered at /r6/fhir/fhir/AppointmentBrief
+while its only client (careagents/healthclaw.py) requests
+/r6/fhir/AppointmentBrief. FIXED (#386) — the URLs now agree, and this
+file asserts the one the client actually requests. Left in the docstring
+because the failure mode is worth remembering: every gate passed, every test
+was green, and the feature had never once run for a patient.
+"""
+
+import json
+from datetime import date
+
+from r6.brief.engine import (
+    CARE_GAPS_OK,
+    CARE_GAPS_REASON_ENGINE_ERROR,
+    CARE_GAPS_UNAVAILABLE,
+)
+from r6.caregaps.report import _NOT_EVALUATED_NOTES
+from r6.models import R6Resource, db
+from r6.seed import _built_in_resources, seed_demo_data
+
+_URL = "/r6/fhir/AppointmentBrief"
+_SECTION_PREFIX = "https://healthclaw.io/fhir/StructureDefinition/brief-section-"
+
+
+def _birth_date_for_age(years):
+    """A birthDate that is `years` old whichever day the suite runs — the
+    route evaluates as of date.today() (tests/test_caregaps_routes.py)."""
+    return f"{date.today().year - years}-01-01"
+
+
+def _store(app, resource, tenant_id):
+    with app.app_context():
+        db.session.add(R6Resource(
+            resource_type=resource["resourceType"],
+            resource_json=json.dumps(resource),
+            resource_id=resource.get("id"),
+            tenant_id=tenant_id))
+        db.session.commit()
+
+
+def _section(body, name):
+    for ext in body.get("extension", []):
+        if ext.get("url") == _SECTION_PREFIX + name:
+            return ext
+    return None
+
+
+def _sub(section, url):
+    for e in section.get("extension", []):
+        if e.get("url") == url:
+            return e.get("valueString")
+    return None
+
+
+def _fields(section):
+    return [e for e in section.get("extension", []) if e.get("url") == "field"]
+
+
+def test_care_gaps_engine_failure_is_marked_unavailable(app, client, tenant_id,
+                                                        tenant_headers,
+                                                        monkeypatch):
+    def _boom(**kwargs):
+        raise RuntimeError("screening rule table is corrupt")
+
+    # A Patient on record, so the rules are actually reached: with none the
+    # brief never calls them and says so instead (see the no-patient test).
+    _store(app, {"resourceType": "Patient", "id": "p-boom",
+                 "birthDate": "1970-01-01", "gender": "female"}, tenant_id)
+    monkeypatch.setattr("r6.caregaps.evaluate.evaluate_care_gaps", _boom)
+
+    r = client.get(_URL, headers=tenant_headers)
+    assert r.status_code == 200  # a brief that 500s is worse than a named gap
+
+    gaps = _section(r.get_json(), "care-gaps")
+    assert gaps is not None
+    assert _sub(gaps, "status") == CARE_GAPS_UNAVAILABLE
+    assert _sub(gaps, "reason") == CARE_GAPS_REASON_ENGINE_ERROR
+    # The failure is named, not silently rendered as an answered-and-empty
+    # section: no consumer may read this as "no gaps".
+    assert _sub(gaps, "status") != CARE_GAPS_OK
+    assert _fields(gaps) == []
+
+
+def test_care_gaps_section_always_carries_a_status(client, tenant_headers):
+    """Every brief states whether the screening review ran.
+
+    Without the marker a parser has only the field list to go on, which is
+    the two-state shape #381 is about.
+    """
+    r = client.get(_URL, headers=tenant_headers)
+    assert r.status_code == 200
+    gaps = _section(r.get_json(), "care-gaps")
+    assert _sub(gaps, "status") in (CARE_GAPS_OK, CARE_GAPS_UNAVAILABLE)
+
+
+def test_other_sections_are_unchanged(client, tenant_headers):
+    """The status marker is care-gaps only — the other four sections keep
+    carrying nothing but fields."""
+    r = client.get(_URL, headers=tenant_headers)
+    body = r.get_json()
+    for name in ("problems", "medications", "labs", "visits"):
+        section = _section(body, name)
+        assert section is not None
+        assert all(e.get("url") == "field" for e in section["extension"])
+
+
+def test_brief_requires_a_tenant(client):
+    assert client.get(_URL).status_code == 400
+
+
+def test_the_route_serves_the_url_its_client_requests(app):
+    """#386. The defect that made every other test in this file meaningless.
+
+    The route registered at /r6/fhir/fhir/AppointmentBrief; the only client
+    (careagents/healthclaw.py) requested /r6/fhir/AppointmentBrief. Every gate
+    was green and the feature had never once run for a patient, because the
+    tests carried their own URL constant and so agreed with the route rather
+    than with the caller.
+
+    This asserts the two against each other instead: the path the client
+    builds must be a path the app serves. A test-visible URL is not a
+    contract; a shared one is.
+
+    MUTATION: restore "/fhir/AppointmentBrief" on the blueprint -> red.
+    Ran it, saw red.
+    """
+    from careagents.healthclaw import HealthClawClient
+
+    client_url = f"{HealthClawClient('http://x', 's').fhir}/AppointmentBrief"
+    path = client_url[len("http://x"):]
+
+    served = {str(rule) for rule in app.url_map.iter_rules()}
+    assert path in served, (
+        f"the client requests {path}, which the app does not serve. "
+        f"Brief-ish routes registered: "
+        f"{sorted(r for r in served if 'Brief' in r)}")
+
+
+# --- #435: the brief evaluates the tenant's own Patient ----------------------
+
+def _due_rule_ids_from_the_operation(client, headers):
+    r = client.post("/r6/fhir/Patient/$care-gaps", headers=headers, json={})
+    assert r.status_code == 200
+    params = {p["name"]: p["valueString"] for p in r.get_json()["parameter"]}
+    summary = json.loads(params["summary"])
+    return {g["rule_id"] for g in summary["gaps"]}
+
+
+def test_brief_shows_the_screenings_due_for_the_sample_patient(
+        app, client, tenant_id, tenant_headers):
+    """The brief called the rules with patient=None, so every brief said the
+    screening review had nothing to read — while Patient/$care-gaps found
+    four screenings due for the same synthetic patient. A clinician walking
+    through the brief saw "did not run" every time.
+
+    Asserted against the operation's own answer as well as the literal set,
+    so the two cannot drift apart again.
+
+    MUTATION: pass patient=None in r6/brief/routes.py::_care_gap_result -> red.
+    """
+    # The sample record, held at 41 whichever year the suite runs. Its fixed
+    # 1985 birthDate turns 45 in 2030, where colorectal screening goes
+    # undecided (#428) and the section would flip to unavailable.
+    resources = _built_in_resources()
+    patient = next(r for r in resources if r["resourceType"] == "Patient")
+    patient["birthDate"] = _birth_date_for_age(41)
+    with app.app_context():
+        seed_demo_data(tenant_id=tenant_id, resources=resources)
+
+    r = client.get(_URL, headers=tenant_headers)
+    assert r.status_code == 200
+    gaps = _section(r.get_json(), "care-gaps")
+    assert _sub(gaps, "status") == CARE_GAPS_OK, _sub(gaps, "reason")
+    assert _sub(gaps, "reason") is None
+
+    shown = {json.loads(f["valueString"])["sourceId"] for f in _fields(gaps)}
+    # Lipid screening is not due: the sample records carry a recent
+    # cholesterol panel (the dated lab series in r6/seed.py).
+    assert shown == {"cervical-screening", "mammography", "flu-immunization"}
+    assert shown == _due_rule_ids_from_the_operation(client, tenant_headers)
+
+    # The Patient row reaches the rules unredacted; nothing of it may reach
+    # the brief. Name, address, phone and MRN are all on the seeded row.
+    body = r.get_data(as_text=True)
+    for leaked in ("Rivera", "Maria", "Clinical Ave", "617-555", "MRN-2026"):
+        assert leaked not in body
+
+
+def test_brief_with_no_patient_says_there_is_none_rather_than_nothing_due(
+        client, tenant_headers):
+    """No Patient on record: the review does not run, and the reason says
+    why. Never an empty OK section — that reads as nothing due."""
+    r = client.get(_URL, headers=tenant_headers)
+    gaps = _section(r.get_json(), "care-gaps")
+    assert _sub(gaps, "status") == CARE_GAPS_UNAVAILABLE
+    assert _sub(gaps, "reason") == _NOT_EVALUATED_NOTES["no-patient"]
+    assert _fields(gaps) == []
+
+
+def test_brief_with_two_patients_does_not_guess_between_them(
+        app, client, tenant_id, tenant_headers, monkeypatch):
+    """Two Patients and no way to tell whose brief this is: nobody is picked,
+    the rules are never run, and the reason says so."""
+    for pid in ("p-one", "p-two"):
+        _store(app, {"resourceType": "Patient", "id": pid,
+                     "birthDate": "1970-01-01", "gender": "female"}, tenant_id)
+
+    def _must_not_run(**kwargs):
+        raise AssertionError("the rules ran for an unidentified patient")
+
+    monkeypatch.setattr("r6.caregaps.evaluate.evaluate_care_gaps",
+                        _must_not_run)
+
+    r = client.get(_URL, headers=tenant_headers)
+    gaps = _section(r.get_json(), "care-gaps")
+    assert _sub(gaps, "status") == CARE_GAPS_UNAVAILABLE
+    assert _sub(gaps, "reason") == _NOT_EVALUATED_NOTES["ambiguous-patient"]
+    assert _fields(gaps) == []

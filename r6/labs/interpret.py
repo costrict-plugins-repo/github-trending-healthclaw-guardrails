@@ -1,0 +1,235 @@
+"""Lab reference-range interpreter — pure engine.
+
+Interprets a FHIR Observation's numeric value against a reference range and
+returns an HL7 v3 ObservationInterpretation flag. The performing lab's own
+Observation.referenceRange always wins; LOINC_RANGES is the fallback. Unknown
+LOINC or unit mismatch yields an indeterminate result — never a false 'normal'.
+
+Standards: LOINC (analytes), UCUM (units), HL7 v3 ObservationInterpretation
+(flags). Every LOINC_RANGES entry carries a `source` key present in REFERENCES;
+a test enforces it. Values are adult defaults and should be clinician-reviewed
+(a licensed clinician) before a live demo.
+
+Decision support, not diagnosis.
+"""
+
+from r6.safe_read import as_dict, as_list, is_number
+
+# Citable provenance for the ranges below. Keys are referenced by each entry.
+REFERENCES = {
+    "adult-cc": "Standard adult clinical-chemistry reference ranges "
+                "(consensus values; MedlinePlus / common laboratory references).",
+    "panic": "Common critical (panic) value conventions "
+             "(consensus laboratory critical-value tables).",
+    "ata-lipid": "Adult lipid/HbA1c targets (ATP III / ADA-style thresholds).",
+    "kdigo-2012": "Kidney Disease: Improving Global Outcomes (KDIGO) Acute "
+                  "Kidney Injury Work Group. KDIGO Clinical Practice Guideline "
+                  "for Acute Kidney Injury. Kidney Int Suppl. 2012;2(1):1-138 "
+                  "(creatinine criteria and staging, sections 2.1.1-2.1.2). "
+                  "Used by r6/labs/trend.py.",
+    "si-creatinine": "Creatinine SI conversion: 1 mg/dL = 88.4 umol/L "
+                     "(molar mass 113.12 g/mol; AMA Manual of Style SI "
+                     "conversion table). Creatinine-specific; not a general "
+                     "mass-to-molar factor. Used by r6/labs/trend.py.",
+}
+
+# unit = expected UCUM unit; low/high optional (one-sided ranges allowed);
+# crit_low/crit_high optional panic thresholds; sex overrides optional.
+LOINC_RANGES = {
+    # --- BMP / CMP ---
+    "2951-2":  {"name": "Sodium", "unit": "mmol/L", "low": 135, "high": 145,
+                "crit_low": 120, "crit_high": 160, "source": "adult-cc"},
+    "2823-3":  {"name": "Potassium", "unit": "mmol/L", "low": 3.5, "high": 5.1,
+                "crit_low": 2.5, "crit_high": 6.5, "source": "adult-cc"},
+    "2075-0":  {"name": "Chloride", "unit": "mmol/L", "low": 98, "high": 107,
+                "source": "adult-cc"},
+    "2028-9":  {"name": "Carbon dioxide", "unit": "mmol/L", "low": 22, "high": 29,
+                "source": "adult-cc"},
+    "3094-0":  {"name": "Urea nitrogen (BUN)", "unit": "mg/dL", "low": 7, "high": 20,
+                "source": "adult-cc"},
+    "2160-0":  {"name": "Creatinine", "unit": "mg/dL", "low": 0.6, "high": 1.3,
+                "sex": {"male": {"low": 0.74, "high": 1.35},
+                        "female": {"low": 0.59, "high": 1.04}},
+                "source": "adult-cc"},
+    "2345-7":  {"name": "Glucose", "unit": "mg/dL", "low": 70, "high": 99,
+                "crit_low": 50, "crit_high": 500, "source": "adult-cc"},
+    "17861-6": {"name": "Calcium", "unit": "mg/dL", "low": 8.6, "high": 10.3,
+                "crit_low": 6.0, "crit_high": 13.0, "source": "adult-cc"},
+    "33914-3": {"name": "eGFR", "unit": "mL/min/{1.73_m2}", "low": 60,
+                "crit_low": 15, "source": "adult-cc"},
+    # --- CBC ---
+    "718-7":   {"name": "Hemoglobin", "unit": "g/dL", "low": 12.0, "high": 17.5,
+                "crit_low": 7.0, "crit_high": 20.0,
+                "sex": {"male": {"low": 13.5, "high": 17.5},
+                        "female": {"low": 12.0, "high": 15.5}},
+                "source": "adult-cc"},
+    "6690-2":  {"name": "White blood cell count", "unit": "10*3/uL",
+                "low": 4.5, "high": 11.0, "crit_low": 2.0, "crit_high": 30.0,
+                "source": "adult-cc"},
+    "777-3":   {"name": "Platelets", "unit": "10*3/uL", "low": 150, "high": 400,
+                "crit_low": 20, "crit_high": 1000, "source": "panic"},
+    # --- Lipids (target-based: high-side except HDL which is low-side) ---
+    "2093-3":  {"name": "Total cholesterol", "unit": "mg/dL", "high": 200,
+                "source": "ata-lipid"},
+    "13457-7": {"name": "LDL cholesterol", "unit": "mg/dL", "high": 130,
+                "source": "ata-lipid"},
+    "2085-9":  {"name": "HDL cholesterol", "unit": "mg/dL", "low": 40,
+                "sex": {"female": {"low": 50}},
+                "source": "ata-lipid"},
+    "2571-8":  {"name": "Triglycerides", "unit": "mg/dL", "high": 150,
+                "source": "ata-lipid"},
+    # --- Diabetes ---
+    "4548-4":  {"name": "Hemoglobin A1c", "unit": "%", "high": 5.7,
+                "source": "ata-lipid"},
+}
+
+
+LOINC_SYSTEM = "http://loinc.org"
+
+
+#: Why a result could not be decided. Grouped by the report layer into what
+#: it tells a reader, so each one is a fact about the input rather than a
+#: sentence about it (#689).
+UNKNOWN_ANALYTE = "unknown-analyte"        #: no reference range for this code
+NO_NUMERIC_VALUE = "no-numeric-value"      #: nothing to compare
+UNIT_MISMATCH = "unit-mismatch"            #: units differ from the range's
+RANGE_NOT_ASSERTED = "range-not-asserted"  #: one-sided lab range, wrong side
+
+
+# The write API stores what it is given, so any field may hold a string, a
+# list or null where FHIR says object. One such row used to raise here and
+# turn the whole $interpret call into a 500 for every patient in the tenant
+# (#869). The readers are shared with every other engine route (#879).
+_dict, _list = as_dict, as_list
+
+
+def _loinc(obs):
+    for c in _list(_dict(obs.get("code")).get("coding")):
+        if isinstance(c, dict) and c.get("system") == LOINC_SYSTEM \
+                and isinstance(c.get("code"), str) and c["code"]:
+            return c["code"]
+    return None
+
+
+# Finite only: a stored NaN or Infinity is not a measurement, and an
+# infinite value read as "high" put a bare Infinity token in the response.
+_is_number = is_number
+
+
+def _apply_sex(entry, patient):
+    low, high = entry.get("low"), entry.get("high")
+    gender = _dict(patient).get("gender")
+    gender = gender if isinstance(gender, str) else None
+    override = entry.get("sex", {}).get(gender) if gender else None
+    if override:
+        low = override.get("low", low)
+        high = override.get("high", high)
+    return low, high
+
+
+def _resource_range(obs, value_unit):
+    """The performing lab's range — trusted only when its unit is consistent
+    with the value's unit (a range quoted in a different unit would invert the
+    interpretation, so we skip it and fall back to the table)."""
+    for rr in _list(obs.get("referenceRange")):
+        if not isinstance(rr, dict):
+            continue
+        low_q, high_q = _dict(rr.get("low")), _dict(rr.get("high"))
+        low, high = low_q.get("value"), high_q.get("value")
+        if low is None and high is None:
+            continue
+        if not all(b is None or _is_number(b) for b in (low, high)):
+            continue  # a bound that is not a number cannot be compared
+        units = [q.get("unit") for q in (low_q, high_q) if q.get("unit")]
+        if any(value_unit and u != value_unit for u in units):
+            continue  # unit-inconsistent lab range — don't trust it
+        return low, high
+    return None
+
+
+def _flag(value, low, high, crit_low, crit_high):
+    # Panic thresholds are INCLUSIVE — a value exactly at the panic line is
+    # critical (a K of 6.5 with crit_high 6.5 must be HH, not H).
+    if crit_low is not None and value <= crit_low:
+        return "LL"
+    if low is not None and value < low:
+        return "L"
+    if crit_high is not None and value >= crit_high:
+        return "HH"
+    if high is not None and value > high:
+        return "H"
+    return "N"
+
+
+def _indeterminate(analyte, loinc, value, unit, reason, cause):
+    """`cause` is the machine-readable half of `reason`.
+
+    The prose is for a reader; a caller deciding how to describe an
+    undecided result must not have to parse it. r6/caregaps/report.py carries
+    `indeterminate_reason` for the same purpose, and the report layer here
+    groups on it (#689).
+    """
+    return {"analyte": analyte, "loinc": loinc, "value": value, "unit": unit,
+            "range_source": "none", "low": None, "high": None,
+            "flag": None, "critical": False, "indeterminate_reason": cause,
+            "note": f"indeterminate: {reason}"}
+
+
+def interpret_observation(obs, patient=None):
+    """Interpret one Observation. Resource range wins; table is fallback."""
+    loinc = _loinc(obs)
+    entry = LOINC_RANGES.get(loinc)
+    analyte = entry["name"] if entry else None
+    vq = _dict(obs.get("valueQuantity"))
+    value, unit = vq.get("value"), vq.get("unit")
+
+    # value must be a real number (bool is an int subclass — exclude it).
+    if not _is_number(value):
+        return _indeterminate(analyte, loinc, value, unit, "no numeric value",
+                              NO_NUMERIC_VALUE)
+    if loinc is None or entry is None:
+        return _indeterminate(analyte, loinc, value, unit, "unknown analyte",
+                              UNKNOWN_ANALYTE)
+
+    crit_low, crit_high = entry.get("crit_low"), entry.get("crit_high")
+
+    resource_rng = _resource_range(obs, unit)
+    if resource_rng is not None:
+        low, high = resource_rng
+        source, note = "resource", "used the performing lab's reference range"
+    else:
+        # Table fallback requires a confirmed matching unit — an absent or
+        # mismatched unit is indeterminate, never a guessed normal.
+        if unit != entry["unit"]:
+            return _indeterminate(analyte, loinc, value, unit,
+                                  f"unit {unit!r} != expected {entry['unit']!r}",
+                                  UNIT_MISMATCH)
+        low, high = _apply_sex(entry, patient)
+        source = "table"
+        note = "adult default range" + (
+            "" if isinstance(_dict(patient).get("gender"), str)
+            or not entry.get("sex")
+            else "; sex unknown — used non-specific range")
+
+    flag = _flag(value, low, high, crit_low, crit_high)
+
+    # One-sided resource range: the lab asserted only one bound. If the value
+    # is "normal" only because the other bound is missing, and it crosses the
+    # TABLE's bound on that side, we cannot honestly call it normal — and we
+    # won't invent an H/L from a range the lab didn't assert. Indeterminate.
+    if flag == "N" and source == "resource" and (low is None) != (high is None) \
+            and unit == entry["unit"]:
+        t_low, t_high = _apply_sex(entry, patient)
+        crosses_missing_side = (
+            (high is None and t_high is not None and value > t_high)
+            or (low is None and t_low is not None and value < t_low))
+        if crosses_missing_side:
+            return _indeterminate(
+                analyte, loinc, value, unit,
+                "value is outside the population range on the side the "
+                "performing lab's one-sided reference range does not cover",
+                RANGE_NOT_ASSERTED)
+
+    return {"analyte": analyte, "loinc": loinc, "value": value, "unit": unit,
+            "range_source": source, "low": low, "high": high,
+            "flag": flag, "critical": flag in ("LL", "HH"), "note": note}

@@ -1,0 +1,218 @@
+"""SMBP Flask blueprint — enroll, log reading, clinician report.
+
+Read-shaped endpoints are tenant-authenticated; the reading write requires a
+step-up token (it creates an Observation). All FHIR writes emit an AuditEvent.
+Outbound patient contact (reminders, calls) is NOT issued here — it goes through
+the r6/actions propose -> human-confirm -> commit loop.
+"""
+
+import json
+import logging
+
+from flask import Blueprint, request, jsonify, Response
+
+from r6.models import R6Resource, db
+from r6.access import (Scope, TenantRejected, TenantSource, require_grant,
+                       require_open_tenant, tenant_from_request)
+from r6.fasten.models import tenant_closed
+from r6.audit import add_audit_event
+from r6.smbp.models import SMBPSession
+from r6.smbp.monitoring import build_bp_observation
+from r6.smbp.triage import classify
+from r6.smbp.report import build_report, render_html, render_pdf
+from r6.safe_read import subject_reference
+from r6.body_guard import json_body_within_depth
+from r6.read_auth import authenticate_tenant_read
+
+logger = logging.getLogger(__name__)
+
+smbp_blueprint = Blueprint("smbp", __name__, url_prefix="/r6/smbp")
+
+
+def _tenant():
+    """Resolve X-Tenant-Id through the access kernel (spec §1.1, slice 9).
+
+    Returns a validated `Tenant`, or None when the header is absent so each
+    handler keeps answering the 400 + OperationOutcome it always answered. A
+    MALFORMED id raises out to the app-wide TenantRejected handler: this
+    blueprint accepted any string until now, so nothing can depend on the
+    shape of a refusal that never happened.
+    """
+    try:
+        return tenant_from_request(sources=(TenantSource.HEADER,))
+    except TenantRejected as exc:
+        if exc.reason == TenantRejected.MALFORMED:
+            raise
+        return None
+
+
+def _oo(severity, code, diagnostics):
+    return {"resourceType": "OperationOutcome",
+            "issue": [{"severity": severity, "code": code, "diagnostics": diagnostics}]}
+
+
+@smbp_blueprint.route("/enroll", methods=["POST"])
+def enroll():
+    tenant = _tenant()
+    if tenant is None:
+        return jsonify(_oo("error", "security", "X-Tenant-Id required")), 400
+    tenant_id = tenant.id
+    # enroll is a WRITE guarded by the tenant header alone (see the matrix
+    # row), so this parse is reachable with no credential. No gate to move
+    # above it; the depth bound is the fix (#312).
+    body, too_deep = json_body_within_depth()
+    if too_deep:
+        return jsonify(_oo("error", "invalid",
+                           "request body nesting is too deep")), 400
+    body = body or {}
+    if not isinstance(body, dict):
+        return jsonify(_oo("error", "invalid",
+                           "request body must be a JSON object")), 400
+    patient_ref = body.get("patient_ref")
+    if not patient_ref:
+        return jsonify(_oo("error", "invalid", "patient_ref required")), 400
+    try:
+        days = int(body.get("days", 14))
+    except (ValueError, TypeError):
+        return jsonify(_oo("error", "invalid", "days must be an integer")), 400
+    session = SMBPSession(
+        tenant_id=tenant_id,
+        patient_ref=patient_ref,
+        language=body.get("language", "en"),
+        days=days,
+        consent_captured=bool(body.get("consent_captured", False)),
+    )
+    db.session.add(session)
+    db.session.flush()
+    add_audit_event("create", "SMBPSession", session.id,
+                    agent_id=request.headers.get("X-Agent-Id"),
+                    tenant_id=tenant_id, detail="smbp enroll")
+    db.session.commit()
+    return jsonify(session.to_dict()), 201
+
+
+@smbp_blueprint.route("/reading", methods=["POST"])
+def reading():
+    tenant = _tenant()
+    if tenant is None:
+        return jsonify(_oo("error", "security", "X-Tenant-Id required")), 400
+
+    # Access kernel, slice 3 (docs/2026-08-03-access-kernel-spec.md §2.5). The
+    # 401/401 dialect below is the one this route already answered; normalizing
+    # 401 vs 403 across the seven gates is a separate, deliberate decision.
+    grant = require_grant(
+        scope=Scope.WRITE,
+        tenant=tenant,
+        absent_status=401,
+        rejected_status=401,
+    )
+    # Disconnected or deleted in CareAgents: no new readings (409, audited).
+    require_open_tenant(grant.tenant_id)
+
+    body = request.get_json(silent=True) or {}
+    try:
+        systolic = int(body["systolic"])
+        diastolic = int(body["diastolic"])
+        patient_ref = body["patient_ref"]
+        effective = body["effective"]
+    except (KeyError, ValueError, TypeError):
+        return jsonify(_oo("error", "invalid",
+                           "patient_ref, systolic, diastolic, effective required")), 400
+
+    triage = classify(systolic, diastolic, body.get("symptoms"))
+    obs = build_bp_observation(patient_ref, systolic, diastolic, effective)
+    # grant.tenant_id, not the header: the handler must not be able to write to
+    # a tenant the grant did not authorize (spec §3(e)).
+    row = R6Resource(resource_type="Observation",
+                     resource_json=json.dumps(obs), tenant_id=grant.tenant_id)
+    db.session.add(row)
+    add_audit_event("create", "Observation", row.id,
+                    agent_id=request.headers.get("X-Agent-Id"),
+                    tenant_id=grant.tenant_id,
+                    detail="smbp reading band=%s" % triage["band"])
+    db.session.commit()
+    return jsonify({"observation_id": row.id, "triage": triage}), 201
+
+
+@smbp_blueprint.route("/report/<session_id>", methods=["GET"])
+def report(session_id):
+    tenant = _tenant()
+    if tenant is None:
+        return jsonify(_oo("error", "security", "X-Tenant-Id required")), 400
+    tenant_id = tenant.id
+    auth_err = authenticate_tenant_read(tenant_id)
+    if auth_err is not None:
+        return auth_err[0], auth_err[1]
+    session = SMBPSession.query.filter_by(id=session_id, tenant_id=tenant_id).first()
+    if session is None:
+        return jsonify(_oo("error", "not-found", "session not found")), 404
+
+    # Live rows only: a reading the patient deleted must not reach the
+    # clinician's report as a row, an average or a flag.
+    rows = R6Resource.query.filter_by(resource_type="Observation",
+                                      tenant_id=tenant_id,
+                                      is_deleted=False).all()
+    observations = []
+    for r in rows:
+        obs = r.to_fhir_json()
+        if subject_reference(obs) == session.patient_ref:
+            observations.append(obs)
+
+    label = session.patient_ref.split("/")[-1]
+    rep = build_report(session.patient_ref, label, session.days, observations)
+
+    add_audit_event("read", "SMBPSession", session.id,
+                    agent_id=request.headers.get("X-Agent-Id"),
+                    tenant_id=tenant_id,
+                    detail="smbp report readings=%d" % len(observations))
+    db.session.commit()
+
+    if request.args.get("format") == "pdf":
+        pdf = render_pdf(rep)
+        # The report is a read and stays open on a closed tenant; only the
+        # DocumentReference it would file is a new record, so it is skipped.
+        if not tenant_closed(tenant_id):
+            _persist_document_reference(tenant_id, session, len(pdf))
+        return Response(pdf, mimetype="application/pdf")
+    return Response(render_html(rep), mimetype="text/html")
+
+
+def _persist_document_reference(tenant_id, session, size):
+    doc = {
+        "resourceType": "DocumentReference",
+        "status": "current",
+        "type": {"coding": [{"system": "http://loinc.org", "code": "57075-4",
+                             "display": "SMBP report"}]},
+        "subject": {"reference": session.patient_ref},
+        "content": [{"attachment": {"contentType": "application/pdf",
+                                    "title": "SMBP report",
+                                    "size": size}}],
+    }
+    row = R6Resource(resource_type="DocumentReference",
+                     resource_json=json.dumps(doc), tenant_id=tenant_id)
+    db.session.add(row)
+    add_audit_event("create", "DocumentReference", row.id,
+                    tenant_id=tenant_id, detail="smbp report pdf")
+    db.session.commit()
+
+
+# --- Reminder scheduler (GET /r6/smbp/reminders/due — #61) ---
+# Registered onto smbp_blueprint here so main.py's app.register_blueprint picks
+# it up automatically.
+from r6.smbp.scheduler_routes import register_scheduler_routes  # noqa: E402
+
+register_scheduler_routes(smbp_blueprint, {
+    "operation_outcome": _oo,
+    "authenticate_tenant_read": authenticate_tenant_read,
+})
+
+
+# --- BP trend chart (GET /r6/smbp/trend) ---
+# Same registration pattern as the scheduler above, and in its own module so
+# the chart does not land in r6/routes.py.
+from r6.smbp.trend_routes import register_trend_routes  # noqa: E402
+
+register_trend_routes(smbp_blueprint, {
+    "operation_outcome": _oo,
+    "authenticate_tenant_read": authenticate_tenant_read,
+})

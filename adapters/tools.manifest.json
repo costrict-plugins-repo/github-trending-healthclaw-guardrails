@@ -1,0 +1,881 @@
+{
+  "source": "healthclaw-mcp",
+  "tool_count": 29,
+  "tools": [
+    {
+      "name": "context_get",
+      "title": "Get Health Context",
+      "description": "Retrieve a pre-built context envelope with patient-centric FHIR resources. Returns bounded, policy-stamped, time-limited context.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "context_id": {
+            "type": "string",
+            "description": "Context envelope ID"
+          }
+        },
+        "required": [
+          "context_id"
+        ]
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "openWorldHint": false
+      }
+    },
+    {
+      "name": "fhir_read",
+      "title": "Read FHIR Resource",
+      "description": "Read a specific FHIR resource by type and ID. Supports FHIR R4 US Core v9 stable resources and FHIR R6 ballot3 experimental resources. Returns redacted resource with PHI protection.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "resource_type": {
+            "type": "string",
+            "enum": [
+              "Patient",
+              "Encounter",
+              "Observation",
+              "AuditEvent",
+              "Consent",
+              "Permission",
+              "SubscriptionTopic",
+              "Subscription",
+              "NutritionIntake",
+              "NutritionProduct",
+              "DeviceAlert",
+              "DeviceAssociation",
+              "Requirements",
+              "ActorDefinition",
+              "Condition",
+              "Provenance",
+              "AllergyIntolerance",
+              "Immunization",
+              "MedicationRequest",
+              "MedicationStatement",
+              "Medication",
+              "MedicationDispense",
+              "Procedure",
+              "DiagnosticReport",
+              "CarePlan",
+              "CareTeam",
+              "Goal",
+              "DocumentReference",
+              "Location",
+              "Organization",
+              "Practitioner",
+              "PractitionerRole",
+              "RelatedPerson",
+              "Coverage",
+              "ServiceRequest",
+              "Specimen",
+              "FamilyMemberHistory"
+            ]
+          },
+          "resource_id": {
+            "type": "string",
+            "description": "The resource ID"
+          }
+        },
+        "required": [
+          "resource_type",
+          "resource_id"
+        ]
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "openWorldHint": false
+      }
+    },
+    {
+      "name": "fhir_search",
+      "title": "Search FHIR Resources",
+      "description": "Search for FHIR resources. Supports FHIR R4 US Core v9 stable resources and FHIR R6 ballot3 experimental resources. Supports patient, code, status, _lastUpdated, _count, _sort parameters. Returns paginated, redacted Bundle.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "resource_type": {
+            "type": "string",
+            "enum": [
+              "Patient",
+              "Encounter",
+              "Observation",
+              "AuditEvent",
+              "Consent",
+              "Permission",
+              "SubscriptionTopic",
+              "Subscription",
+              "NutritionIntake",
+              "NutritionProduct",
+              "DeviceAlert",
+              "DeviceAssociation",
+              "Requirements",
+              "ActorDefinition",
+              "Condition",
+              "Provenance",
+              "AllergyIntolerance",
+              "Immunization",
+              "MedicationRequest",
+              "MedicationStatement",
+              "Medication",
+              "MedicationDispense",
+              "Procedure",
+              "DiagnosticReport",
+              "CarePlan",
+              "CareTeam",
+              "Goal",
+              "DocumentReference",
+              "Location",
+              "Organization",
+              "Practitioner",
+              "PractitionerRole",
+              "RelatedPerson",
+              "Coverage",
+              "ServiceRequest",
+              "Specimen",
+              "FamilyMemberHistory"
+            ]
+          },
+          "patient": {
+            "type": "string",
+            "description": "Patient reference filter (e.g., 'Patient/pt-1')"
+          },
+          "code": {
+            "type": "string",
+            "description": "Code filter — matches code.coding[].code in JSON (e.g., '2339-0' for Glucose)"
+          },
+          "status": {
+            "type": "string",
+            "description": "Status filter (e.g., 'final', 'active', 'completed')"
+          },
+          "_lastUpdated": {
+            "type": "string",
+            "description": "Date filter with prefix (e.g., 'ge2024-01-01', 'le2024-12-31')"
+          },
+          "_count": {
+            "type": "integer",
+            "description": "Max results (1-50, capped for token safety)",
+            "default": 20
+          },
+          "_sort": {
+            "type": "string",
+            "description": "Sort order: '_lastUpdated' (asc) or '-_lastUpdated' (desc, default)"
+          }
+        },
+        "required": [
+          "resource_type"
+        ]
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "openWorldHint": false
+      }
+    },
+    {
+      "name": "fhir_validate",
+      "title": "Validate FHIR Resource",
+      "description": "Validate a proposed FHIR R6 resource against structural rules. Returns OperationOutcome.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "resource": {
+            "type": "object",
+            "description": "The FHIR resource to validate"
+          }
+        },
+        "required": [
+          "resource"
+        ]
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "openWorldHint": false
+      }
+    },
+    {
+      "name": "questionnaire_populate",
+      "title": "Pre-fill Health Form",
+      "description": "SDC $populate — pre-fill a Questionnaire for a subject. Returns a QuestionnaireResponse. Read tier; mints a tenant token for non-public tenants.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "questionnaire_id": {
+            "type": "string",
+            "description": "Stored Questionnaire id"
+          },
+          "questionnaire": {
+            "type": "object",
+            "description": "Inline Questionnaire (overrides questionnaire_id)"
+          },
+          "subject_reference": {
+            "type": "string",
+            "description": "Subject reference, e.g. 'Patient/p1'"
+          }
+        },
+        "required": [
+          "subject_reference"
+        ]
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "openWorldHint": false
+      }
+    },
+    {
+      "name": "questionnaire_extract",
+      "title": "Extract Form Data to FHIR",
+      "description": "SDC $extract — extract FHIR resources from a completed QuestionnaireResponse into a transaction Bundle. Write tier; requires step-up authorization, including for dry_run=true previews.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "questionnaire_response": {
+            "type": "object",
+            "description": "Completed QuestionnaireResponse"
+          },
+          "questionnaire": {
+            "type": "object",
+            "description": "The referenced Questionnaire (optional if resolvable by reference)"
+          },
+          "dry_run": {
+            "type": "boolean",
+            "description": "Preview the Bundle without committing",
+            "default": false
+          }
+        },
+        "required": [
+          "questionnaire_response"
+        ]
+      },
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "openWorldHint": false
+      }
+    },
+    {
+      "name": "fhir_propose_write",
+      "title": "Propose FHIR Write",
+      "description": "Propose a write — validates the resource and returns a preview. Does NOT commit. Write tier: step-up authorization is required and is supplied by the deployment as an X-Step-Up-Token header. You cannot obtain or pass it yourself. If it is absent this returns requires_step_up; tell the patient authorization is needed rather than attempting another route.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "resource": {
+            "type": "object",
+            "description": "The FHIR resource to write"
+          },
+          "operation": {
+            "type": "string",
+            "enum": [
+              "create",
+              "update"
+            ],
+            "description": "Write operation type"
+          }
+        },
+        "required": [
+          "resource",
+          "operation"
+        ]
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "openWorldHint": false
+      }
+    },
+    {
+      "name": "fhir_commit_write",
+      "title": "Commit FHIR Write",
+      "description": "Commit a previously proposed write. Requires step-up authorization token. This is a destructive operation.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "resource": {
+            "type": "object",
+            "description": "The FHIR resource to commit"
+          },
+          "operation": {
+            "type": "string",
+            "enum": [
+              "create",
+              "update"
+            ]
+          }
+        },
+        "required": [
+          "resource",
+          "operation"
+        ]
+      },
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "openWorldHint": false
+      }
+    },
+    {
+      "name": "fhir_stats",
+      "title": "Observation Statistics",
+      "description": "Compute statistics (count, min, max, mean) over numeric Observation values. Standard FHIR $stats (since R4). Only supports valueQuantity. Filter by patient and/or code.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string",
+            "description": "LOINC code to filter Observations (e.g., '2339-0' for Glucose)"
+          },
+          "patient": {
+            "type": "string",
+            "description": "Patient reference filter (e.g., 'Patient/pt-1')"
+          }
+        },
+        "required": []
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "openWorldHint": false
+      }
+    },
+    {
+      "name": "fhir_interpret_labs",
+      "title": "Interpret Lab Results",
+      "description": "Interpret lab Observations against reference ranges — flags each value low/normal/high/critical (HL7 v3 ObservationInterpretation) and returns clinician + consumer summaries. Decision support, not diagnosis. Read-tier. Response includes _meta.ui.resourceUri pointing to an embeddable trend timeline.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "observation": {
+            "type": "object",
+            "description": "A single FHIR Observation to interpret"
+          },
+          "bundle": {
+            "type": "object",
+            "description": "A FHIR Bundle of Observations to interpret"
+          },
+          "subject": {
+            "type": "string",
+            "description": "Patient reference (e.g. 'Patient/pt-1') — interpret the tenant's stored Observations for this subject"
+          }
+        },
+        "required": []
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "openWorldHint": false
+      }
+    },
+    {
+      "name": "care_gaps",
+      "title": "Preventive Care Gaps",
+      "description": "Check which preventive-care screenings/immunizations a patient may be due for (blood pressure, cholesterol, colorectal/cervical/breast cancer screening, flu, diabetes A1c), from their own connected records. Decision support based on USPSTF/ACIP/ADA guidelines — not a diagnosis or directive. Response includes _meta.ui.resourceUri pointing to an embeddable review UI.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "subject": {
+            "type": "string",
+            "description": "Patient reference (e.g. 'Patient/pt-1')"
+          }
+        },
+        "required": []
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "openWorldHint": false
+      }
+    },
+    {
+      "name": "guardrail_conformance",
+      "title": "Guardrail Conformance Scorecard",
+      "description": "Run the guardrail conformance self-test on the connected HealthClaw deployment and return the graded scorecard across seven guardrail properties: PHI redaction, immutable audit, step-up auth, human-in-the-loop, tenant isolation, medical disclaimers, and error fidelity. Uses synthetic data only. Set fresh=true to force a new run instead of the cached result.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "fresh": {
+            "type": "boolean",
+            "description": "Force a fresh probe run instead of the cached (<=10 min old) result"
+          }
+        },
+        "required": []
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "openWorldHint": false
+      }
+    },
+    {
+      "name": "fhir_lastn",
+      "title": "Latest Observations",
+      "description": "Get the last N observations per code. Standard FHIR $lastn (since R4). Returns most recent observations by storage order.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string",
+            "description": "LOINC code filter"
+          },
+          "patient": {
+            "type": "string",
+            "description": "Patient reference filter"
+          },
+          "max": {
+            "type": "integer",
+            "description": "Max observations per code (default 1)",
+            "default": 1
+          }
+        },
+        "required": []
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "openWorldHint": false
+      }
+    },
+    {
+      "name": "fhir_permission_evaluate",
+      "title": "Evaluate Access Permission",
+      "description": "Evaluate R6 Permission resources for access control decisions. Returns permit/deny based on stored Permission rules. Separates access control (Permission) from consent records (Consent).",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "subject": {
+            "type": "string",
+            "description": "Subject reference (e.g., 'Practitioner/dr-1')"
+          },
+          "action": {
+            "type": "string",
+            "enum": [
+              "read",
+              "write",
+              "delete"
+            ],
+            "description": "Action to evaluate"
+          },
+          "resource": {
+            "type": "string",
+            "description": "Resource reference to evaluate access for"
+          }
+        },
+        "required": [
+          "action"
+        ]
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "openWorldHint": false
+      }
+    },
+    {
+      "name": "fhir_subscription_topics",
+      "title": "List Subscription Topics",
+      "description": "List available SubscriptionTopics for event-driven subscriptions. R6 moves topic-based subscriptions toward Normative. Agents discover what events they can subscribe to.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "openWorldHint": false
+      }
+    },
+    {
+      "name": "wearables_sync_status",
+      "title": "Wearables Sync Status",
+      "description": "List wearable connections (Garmin, Oura, Polar, Suunto, Whoop, Fitbit, Strava, Ultrahuman) for a tenant, with last sync time, observation count, and status. Use this to tell a patient what's connected, when data last arrived, and surface a connection-management UI (via _meta.ui.resourceUri) so they can connect more providers. Data flows into HealthClaw as FHIR Observations with LOINC codes — agents read it via fhir_search like any other Observation.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "tenant_id": {
+            "type": "string",
+            "description": "Tenant to inspect. Defaults to the incoming X-Tenant-Id header."
+          }
+        },
+        "required": []
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "openWorldHint": false
+      }
+    },
+    {
+      "name": "sources_check",
+      "title": "Check Data Sources",
+      "description": "Survey ALL connected health data sources (Fasten, HealthEx, Health Bank One, MEDENT, Flexpa, Epic/Health Skillz, wearables) at once — returns each source's connection status and the patient's record counts by type. Use when the patient asks what's connected or to check for data across services.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "openWorldHint": false
+      }
+    },
+    {
+      "name": "fhir_compiled_truth",
+      "title": "Compiled Truth Timeline",
+      "description": "Return the current best understanding of a FHIR resource plus the append-only evidence trail (Provenance entries) of how it got there. Use this before presenting resource-specific facts to a patient — surfaces curation_state and quality_score so the agent can say not just WHAT the record says but WHY it says it. Redacted, audited. Response includes _meta.ui.resourceUri pointing to an embeddable review UI.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "resource_type": {
+            "type": "string",
+            "description": "FHIR resource type (e.g. 'Condition', 'AllergyIntolerance')"
+          },
+          "resource_id": {
+            "type": "string",
+            "description": "ID of the resource"
+          }
+        },
+        "required": [
+          "resource_type",
+          "resource_id"
+        ]
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "openWorldHint": false
+      }
+    },
+    {
+      "name": "curatr_evaluate",
+      "title": "Evaluate Data Quality",
+      "description": "Evaluate a FHIR resource for data quality issues. Checks coding elements against public terminology services (tx.fhir.org for SNOMED/LOINC, NLM for ICD-10-CM, RXNAV for RxNorm) and structural rules. Returns issues in plain language with patient-facing impact descriptions and resolution suggestions. Read-only — no step-up required.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "resource_type": {
+            "type": "string",
+            "description": "FHIR resource type to evaluate (e.g. 'Condition')"
+          },
+          "resource_id": {
+            "type": "string",
+            "description": "ID of the resource to evaluate"
+          }
+        },
+        "required": [
+          "resource_type",
+          "resource_id"
+        ]
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "openWorldHint": true
+      }
+    },
+    {
+      "name": "curatr_apply_fix",
+      "title": "Propose Data Quality Fix",
+      "description": "Propose data quality fixes to a FHIR resource as a 'curatr-fix' action on the action rail. Nothing changes when this is called: it returns a draft (action id) the patient must submit with action_commit and then approve out of band on their own review page; only that approval carries the fix out, once, with a linked Provenance record. The proposal is pinned to the record's current meta.versionId — pass record_version from the record you read, or omit it and the tool reads it for you — and is refused at execution if the record has changed since. Only fields the Curatr evaluator can propose are accepted.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "resource_type": {
+            "type": "string",
+            "description": "FHIR resource type to fix (e.g. 'Condition')"
+          },
+          "resource_id": {
+            "type": "string",
+            "description": "ID of the resource to fix"
+          },
+          "fixes": {
+            "type": "array",
+            "description": "List of field fixes to apply. Each fix has 'field_path' (dot-notation, e.g. 'Condition.code.coding[0].system') and 'new_value' (the corrected value).",
+            "items": {
+              "type": "object",
+              "properties": {
+                "field_path": {
+                  "type": "string"
+                },
+                "new_value": {}
+              },
+              "required": [
+                "field_path",
+                "new_value"
+              ]
+            }
+          },
+          "patient_intent": {
+            "type": "string",
+            "description": "Plain-language reason for the fix, provided by the patient (recorded in Provenance)."
+          },
+          "record_version": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "The record's meta.versionId as you read it. Omit to have the tool read the current version before proposing."
+          },
+          "reason": {
+            "type": "string",
+            "description": "What the fix does, in words the patient will read on the approval page. Defaults to a description built from the field paths."
+          }
+        },
+        "required": [
+          "resource_type",
+          "resource_id",
+          "fixes",
+          "patient_intent"
+        ]
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "openWorldHint": false
+      }
+    },
+    {
+      "name": "fhir_get_token",
+      "title": "Mint Step-Up Token",
+      "description": "Get a fresh step-up authorization token for write operations. Tokens expire after 5 minutes. OPERATOR TOOL: this is withheld from hosted deployments (PRIVILEGED_TOOL_NAMES), and the token it returns travels as the X-Step-Up-Token header set by the caller — it is never an argument to another tool.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "tenant_id": {
+            "type": "string",
+            "description": "Tenant ID to scope the token to"
+          }
+        },
+        "required": [
+          "tenant_id"
+        ]
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "openWorldHint": false
+      }
+    },
+    {
+      "name": "fhir_seed",
+      "title": "Seed Demo Data",
+      "description": "Seed a tenant with a realistic Patient + Observations + Condition bundle for live testing. Use this at the start of a demo session to populate data. Returns created resource IDs and a ready-to-use step_up_token.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "tenant_id": {
+            "type": "string",
+            "description": "Tenant to seed (default: desktop-demo)"
+          }
+        },
+        "required": []
+      },
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "openWorldHint": false
+      }
+    },
+    {
+      "name": "action_propose",
+      "title": "Propose Real-World Action",
+      "description": "Propose a real-world action (phone call or SMS) on the patient's behalf. Returns a draft (id + script) the patient MUST review before submitting via action_commit. Does not execute anything.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "kind": {
+            "type": "string",
+            "enum": [
+              "phone-call",
+              "sms",
+              "insurance-call"
+            ],
+            "description": "Action type"
+          },
+          "payload": {
+            "type": "object",
+            "description": "Action content: { to: recipient label, phone: number to dial/text, body: call script or message text }"
+          }
+        },
+        "required": [
+          "kind",
+          "payload"
+        ]
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "openWorldHint": true
+      }
+    },
+    {
+      "name": "rx_transfer_request",
+      "title": "Request Prescription Transfer",
+      "description": "Draft a prescription-transfer request: assembles the patient's active medications and stages a phone call to the RECEIVING pharmacy asking it to pull the prescriptions from the current pharmacy (how US transfers actually work). Schedule II medications are refused (never transferable — new prescription required). Returns a draft the patient MUST review; submit with action_commit for the patient's own out-of-band confirmation after they explicitly agree — action_commit does not execute the call itself.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "to_pharmacy_name": {
+            "type": "string",
+            "description": "Receiving pharmacy name"
+          },
+          "to_pharmacy_phone": {
+            "type": "string",
+            "description": "Receiving pharmacy phone number"
+          },
+          "from_pharmacy_name": {
+            "type": "string",
+            "description": "Current pharmacy name (optional)"
+          },
+          "from_pharmacy_phone": {
+            "type": "string",
+            "description": "Current pharmacy phone (optional)"
+          },
+          "medication_names": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Limit to these medication names (default: all active orders)"
+          }
+        },
+        "required": [
+          "to_pharmacy_name",
+          "to_pharmacy_phone"
+        ]
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "openWorldHint": true
+      }
+    },
+    {
+      "name": "action_commit",
+      "title": "Submit Real-World Action for Confirmation",
+      "description": "Submit a previously proposed action for the patient's OWN out-of-band confirmation (their dashboard or Telegram) AFTER they've reviewed and verbally/textually agreed to the draft. Requires step-up authorization, supplied by the deployment as an X-Step-Up-Token header; you cannot obtain or pass it yourself. This call does NOT execute anything and never accepts or sends any 'human confirmed' flag — only the patient tapping Approve in their own out-of-band channel can trigger execution. Returns status 'awaiting_confirmation' and is terminal for your turn: do not call action_commit again for the same action_id. Use action_status to check whether the patient has approved yet.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "action_id": {
+            "type": "string",
+            "description": "ID returned by action_propose"
+          }
+        },
+        "required": [
+          "action_id"
+        ]
+      },
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "openWorldHint": true
+      }
+    },
+    {
+      "name": "action_status",
+      "title": "Action Status",
+      "description": "Check the status and outcome of an action (proposed/awaiting_confirmation/executing/completed/failed/needs_review/unknown/expired/declined). declined means the patient read the proposal and said no - never re-propose the same action unasked. needs_review means it ran but the outcome could not be confirmed - show the patient the evidence. unknown means the provider MAY have acted - never re-propose the same action. Use after action_commit to see whether the patient has approved yet, and to report the final result back to them.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "action_id": {
+            "type": "string",
+            "description": "ID returned by action_propose"
+          }
+        },
+        "required": [
+          "action_id"
+        ]
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "openWorldHint": false
+      }
+    },
+    {
+      "name": "shl_generate",
+      "title": "Generate SMART Health Link",
+      "description": "Generate a SMART Health Link (shlink:/ QR payload) sharing the patient's record with a clinic. Fetches the guardrailed share-bundle from HealthClaw (step-up required — supplied by the deployment as an X-Step-Up-Token header), encrypts it client-side (the SHL server never sees plaintext), uploads ciphertext, and returns the shlink URI, viewer link, and the patient's private manage link. ALWAYS get the patient's explicit consent before generating, and deliver the manage link ONLY to the patient.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "label": {
+            "type": "string",
+            "description": "Short label shown in SHL viewers (<=80 chars), e.g. 'Records for Winters Healthcare'. No PHI beyond what the patient approves."
+          },
+          "expires_in_days": {
+            "type": "number",
+            "description": "Link lifetime in days (default 7, max 90)"
+          },
+          "profile": {
+            "type": "string",
+            "enum": [
+              "intake",
+              "deidentified"
+            ],
+            "description": "intake = identified record for clinic check-in (default); deidentified = strips name/contact/institutional IDs"
+          },
+          "patient_id": {
+            "type": "string",
+            "description": "Optional patient id filter for multi-patient tenants"
+          }
+        },
+        "required": []
+      },
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "openWorldHint": true
+      }
+    },
+    {
+      "name": "search",
+      "title": "Search Health Records",
+      "description": "ChatGPT-connector-compatible search over the tenant's FHIR records. Query is a FHIR search string (e.g. 'Observation?code=4548-4' or 'Patient?name=smith'); bare resource type works too. Returns compact results: id, title, url. Reads are PHI-redacted and audit-logged server-side.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "FHIR search string: 'ResourceType?params' or just 'ResourceType'"
+          }
+        },
+        "required": [
+          "query"
+        ]
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "openWorldHint": false
+      }
+    },
+    {
+      "name": "fetch",
+      "title": "Fetch Health Record",
+      "description": "ChatGPT-connector-compatible fetch of one FHIR resource by id ('ResourceType/id', as returned by search). Returns the full document (PHI-redacted server-side) with metadata.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Resource reference: 'ResourceType/id'"
+          }
+        },
+        "required": [
+          "id"
+        ]
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "openWorldHint": false
+      }
+    }
+  ]
+}

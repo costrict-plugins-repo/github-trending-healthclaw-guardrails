@@ -1,0 +1,1341 @@
+"""The guardrail conformance harness must grade our OWN deployment honestly.
+
+This is both the unit test for r6/conformance and a standing CI baseline.  The
+same harness runs against a live partner deployment via
+scripts/guardrail_conformance.py.
+"""
+
+from r6.conformance import (
+    FlaskProbeClient, ProbeContext, run_conformance, PROPERTIES,
+)
+
+
+def _ctx(app, tenant_id, step_up_token):
+    return ProbeContext(tenant=tenant_id, step_up_token=step_up_token)
+
+
+def test_our_deployment_records_full_conformance(
+        client, tenant_id, step_up_token):
+    report = run_conformance(FlaskProbeClient(client), _ctx(None, tenant_id, step_up_token))
+
+    assert {r.key for r in report.results} == set(PROPERTIES)
+    assert report.score == (7, 7)
+    assert report.grade == "A"
+    assert report.passed is True
+    assert [r.key for r in report.results if not r.passed] == []
+
+
+def test_the_scorecard_states_what_a_hitl_pass_does_not_prove(
+        client, tenant_id, step_up_token):
+    """The probe supplies X-Human-Confirmed itself (#213).
+
+    A PASS on human-in-the-loop means the gate discriminates, not that a human
+    attested to anything — the action rail's approval endpoint is the real
+    mechanism and the header is a known gap (#214). That limit has to be on
+    the rendered scorecard, not only in the JSON.
+    """
+    report = run_conformance(FlaskProbeClient(client),
+                             _ctx(None, tenant_id, step_up_token))
+    rendered = report.render()
+    assert "the confirmation header is supplied by the probe" in rendered
+    assert "#214" in rendered
+
+
+def test_report_is_json_serializable(client, tenant_id, step_up_token):
+    report = run_conformance(FlaskProbeClient(client), _ctx(None, tenant_id, step_up_token))
+    d = report.to_dict()
+    assert d["passed"] is True
+    assert d["grade"] == "A"
+    assert len(d["properties"]) == len(PROPERTIES)
+    for prop in d["properties"]:
+        assert "checks" in prop and prop["checks"]
+
+
+def test_grade_scales_with_failures():
+    # Grading is a pure function of pass fraction — verify the boundaries.
+    from r6.conformance import _grade
+    assert _grade(6, 6) == "A"
+    assert _grade(5, 6) == "B"
+    assert _grade(4, 6) == "C"
+    assert _grade(3, 6) == "D"
+    assert _grade(2, 6) == "F"
+    assert _grade(0, 6) == "F"
+
+
+def test_report_exposes_property_grade_and_profile_coverage():
+    """A graded property remains a normal report property, but it passes only
+    at A and tells callers exactly which probe profiles were exercised."""
+    from r6.conformance import Check, ConformanceReport, ProbeResult
+
+    result = ProbeResult(
+        "error_fidelity",
+        "Error Fidelity",
+        [Check("tool error is corrective", False, "status-only error")],
+        grade="C",
+        coverage="local+mcp",
+        profiles={
+            "local": {"status": "run", "grade": "A"},
+            "mcp": {"status": "run", "grade": "C"},
+            "proxy": {"status": "not_run"},
+        },
+    )
+    report = ConformanceReport([result], base="local", tenant="t1")
+
+    body = report.to_dict()
+    prop = body["properties"][0]
+    assert prop["grade"] == "C"
+    assert prop["coverage"] == "local+mcp"
+    assert prop["profiles"]["proxy"] == {"status": "not_run"}
+    assert prop["passed"] is False
+    assert report.passed is False
+    assert "Error Fidelity — C (local+mcp)" in report.render()
+
+
+def test_report_serialization_preserves_legacy_implicit_grade():
+    from r6.conformance import Check, ConformanceReport, ProbeResult
+
+    report = ConformanceReport([
+        ProbeResult("legacy", "Legacy Property", [Check("passes", True)])
+    ])
+
+    prop = report.to_dict()["properties"][0]
+    assert prop["grade"] is None
+    assert "Legacy Property — A (full)" not in report.render()
+
+
+def test_error_fidelity_grade_uses_the_worst_executed_profile():
+    from r6.conformance import _error_fidelity_grade
+    from r6.conformance.probes import _rejection_grade
+
+    assert _error_fidelity_grade(["A"]) == "A"
+    assert _error_fidelity_grade(["A", "C"]) == "C"
+    assert _error_fidelity_grade(["C", "F", "A"]) == "F"
+    assert _error_fidelity_grade([]) == "F"
+    assert _rejection_grade(200, {}) == "F"
+    assert _rejection_grade(502, {"resourceType": "OperationOutcome"}) == "C"
+    assert _rejection_grade(400, {"resourceType": "OperationOutcome"}) == "C"
+
+
+def test_local_contract_rejects_false_a_evidence():
+    from r6.conformance.probes import (
+        _bundle_matches_subject,
+        _corrective_outcome,
+        _has_outcome_warning,
+        _outcome_names_parameter_and_supported_set,
+        _outcome_names_unsupported_modifier,
+        _self_link_omits,
+    )
+
+    unsupported_only = {
+        "resourceType": "OperationOutcome",
+        "issue": [{
+            "severity": "error",
+            "code": "invalid",
+            "details": {"text": "datetime is unsupported."},
+        }],
+    }
+    assert not _outcome_names_parameter_and_supported_set(
+        unsupported_only, "datetime")
+    for negated in (
+        "Unsupported parameters: datetime, patient, code.",
+        "The unsupported parameter datetime conflicts with patient and code.",
+        "datetime is not a supported parameter; patient and code are examples.",
+        "Supported parameters: patient, datetime, code.",
+        "datetime is not invalid. Supported parameters: patient, code, status.",
+        "datetime is not unsupported. Supported parameters: patient, code, status.",
+        "datetime was not rejected. Supported parameters: patient, code, status.",
+        "There are no unknown problems with datetime. Supported parameters: "
+        "patient, code, status.",
+        "datetime is unsupported. Use _lastUpdated instead. Supported parameters: "
+        "patient, code, status, _lastUpdated, _count, _sort, _summary, context-id.",
+    ):
+        body = {
+            "resourceType": "OperationOutcome",
+            "issue": [{
+                "severity": "error",
+                "code": "invalid",
+                "details": {"text": negated},
+            }],
+        }
+        assert not _outcome_names_parameter_and_supported_set(body, "datetime")
+
+    # Three rows left this list in #525, and they are pinned as A in
+    # test_a_supported_set_that_is_not_ours_is_still_corrective below:
+    # "patiently, barcode", "status-code, patientish", and our own eight plus
+    # "invented-filter". Every one of them failed here for a single reason —
+    # the declared set was not byte-for-byte ours — which is the defect #525
+    # is about, not a property. What remains above is resemblance-independent.
+
+    unrelated_warning = {
+        "resourceType": "Bundle",
+        "entry": [{
+            "search": {"mode": "outcome"},
+            "resource": {
+                "resourceType": "OperationOutcome",
+                "issue": [{"severity": "banana", "code": "invalid"}],
+            },
+        }],
+    }
+    assert not _has_outcome_warning(unrelated_warning, "datetime")
+    bad_category_warning = {
+        "resourceType": "Bundle",
+        "entry": [{
+            "search": {"mode": "outcome"},
+            "resource": {
+                "resourceType": "OperationOutcome",
+                "issue": [{
+                    "severity": "warning",
+                    "code": "banana",
+                    "details": {"text": (
+                        "datetime ignored. Supported parameters: "
+                        "patient, code, status."
+                    )},
+                }],
+            },
+        }],
+    }
+    assert not _has_outcome_warning(bad_category_warning, "datetime")
+
+    safe_warning = {
+        "search": {"mode": "outcome"},
+        "resource": {
+            "resourceType": "OperationOutcome",
+            "issue": [{
+                "severity": "warning",
+                "code": "not-supported",
+                "details": {"text": (
+                    "datetime ignored. Supported parameters: patient, code."
+                )},
+            }],
+        },
+    }
+    # #525: this warning names the ignored parameter and declares the set the
+    # server supports, so it IS corrective. It used to fail here for one
+    # reason — {patient, code} is not our eight — which measured resemblance,
+    # not conformance. The hostile-sibling case below is the property this
+    # fixture was really guarding, and it still holds.
+    assert _has_outcome_warning({
+        "resourceType": "Bundle",
+        "entry": [safe_warning],
+    }, "datetime")
+
+    generic_modifier = {
+        "resourceType": "OperationOutcome",
+        "issue": [{
+            "severity": "error",
+            "code": "not-supported",
+            "details": {"text": "The requested modifier is not supported."},
+        }],
+    }
+    named_modifier = {
+        "resourceType": "OperationOutcome",
+        "issue": [{
+            "severity": "error",
+            "code": "not-supported",
+            "details": {"text": "Modifier code:exact is not supported."},
+        }],
+    }
+    assert not _outcome_names_unsupported_modifier(
+        generic_modifier, "code:exact")
+    assert _outcome_names_unsupported_modifier(named_modifier, "code:exact")
+
+    hostile_extra_warning = {
+        "search": {"mode": "outcome"},
+        "resource": {
+            "resourceType": "OperationOutcome",
+            "issue": [{
+                "severity": "warning",
+                "code": "not-supported",
+                "details": {"text": "Patient Quintavious Zzyzxbarton"},
+            }],
+        },
+    }
+    assert not _has_outcome_warning({
+        "resourceType": "Bundle",
+        "entry": [safe_warning, hostile_extra_warning],
+    }, "datetime")
+
+    encoded_ignored_key = {
+        "resourceType": "Bundle",
+        "link": [{
+            "relation": "self",
+            "url": "https://example.test/Observation?%64atetime=x",
+        }],
+    }
+    assert not _self_link_omits(encoded_ignored_key, "datetime")
+
+    foreign_match = {
+        "resourceType": "Bundle",
+        "entry": [{
+            "search": {"mode": "match"},
+            "resource": {
+                "resourceType": "Observation",
+                "subject": {"reference": "Patient/real-patient"},
+            },
+        }],
+    }
+    assert not _bundle_matches_subject(
+        foreign_match, "Patient/conformance-synthetic")
+
+    corrective_plus_hostile = {
+        "resourceType": "OperationOutcome",
+        "issue": [
+            {
+                "severity": "error",
+                "code": "invalid",
+                "details": {"text": "The request was invalid."},
+            },
+            {
+                "severity": "error",
+                "code": "invalid",
+                "diagnostics": "Patient Alice at https://db.internal/secret",
+            },
+        ],
+    }
+    assert not _corrective_outcome(corrective_plus_hostile, {"invalid"})
+
+
+def test_corrective_outcome_rejects_unsafe_sibling_issue():
+    from r6.conformance.probes import (
+        _outcome_names_parameter_and_supported_set,
+    )
+
+    outcome = {
+        "resourceType": "OperationOutcome",
+        "issue": [
+            {
+                "severity": "error",
+                "code": "invalid",
+                "details": {"text": (
+                    "Unsupported parameter: datetime. Supported parameters: "
+                    "patient, code, status, _lastUpdated, _count, _sort, "
+                    "_summary, context-id."
+                )},
+            },
+            {
+                "severity": "error",
+                "code": "invalid",
+                "details": {"text": (
+                    "Use _lastUpdated instead of datetime for time filtering."
+                )},
+            },
+        ],
+    }
+
+    assert not _outcome_names_parameter_and_supported_set(outcome, "datetime")
+    outcome["issue"][1]["details"]["text"] = (
+        "Supported parameters: use _lastUpdated instead of datetime"
+    )
+    assert not _outcome_names_parameter_and_supported_set(outcome, "datetime")
+
+
+def test_lenient_warning_rejects_unsafe_sibling_outcome_entry():
+    from r6.conformance.probes import _has_outcome_warning
+
+    def outcome_entry(text):
+        return {
+            "search": {"mode": "outcome"},
+            "resource": {
+                "resourceType": "OperationOutcome",
+                "issue": [{
+                    "severity": "warning",
+                    "code": "not-supported",
+                    "details": {"text": text},
+                }],
+            },
+        }
+
+    bundle = {
+        "resourceType": "Bundle",
+        "entry": [
+            outcome_entry(
+                "Unsupported parameter: datetime. Supported parameters: "
+                "patient, code, status, _lastUpdated, _count, _sort, "
+                "_summary, context-id."
+            ),
+            outcome_entry(
+                "Use _lastUpdated instead of datetime for time filtering."
+            ),
+        ],
+    }
+
+    assert not _has_outcome_warning(bundle, "datetime")
+    bundle["entry"][1] = outcome_entry(
+        "Supported parameters: use _lastUpdated instead of datetime"
+    )
+    assert not _has_outcome_warning(bundle, "datetime")
+
+
+def test_lenient_audit_requires_ignored_parameter_evidence():
+    from r6.conformance.probes import _new_audit_warning_grade
+
+    def bundle(event_id, detail=None):
+        outcome = {"code": {"code": "0"}}
+        if detail is not None:
+            outcome["detail"] = [{"text": detail}]
+        return {
+            "resourceType": "Bundle",
+            "entry": [{"resource": {
+                "resourceType": "AuditEvent",
+                "id": event_id,
+                "outcome": outcome,
+            }}],
+        }
+
+    before = {"resourceType": "Bundle", "entry": []}
+    assert _new_audit_warning_grade(before, bundle("missing"), "datetime") == "C"
+    assert _new_audit_warning_grade(
+        before, bundle("honest", "ignored parameter: datetime"), "datetime") == "A"
+    assert _new_audit_warning_grade(
+        before, bundle("lie", "applied filter: datetime"), "datetime") == "C"
+    assert _new_audit_warning_grade(
+        before,
+        bundle("contradiction", "ignored parameter: datetime; then applied filter datetime"),
+        "datetime",
+    ) == "C"
+    assert _new_audit_warning_grade(
+        before, bundle("echo", "ignored parameter: datetime=x"), "datetime") == "F"
+
+
+def test_local_error_fidelity_records_grade_a(client, tenant_id,
+                                              step_up_token):
+    report = run_conformance(
+        FlaskProbeClient(client), _ctx(None, tenant_id, step_up_token))
+
+    result = next(r for r in report.results if r.key == "error_fidelity")
+    assert result.grade == "A"
+    assert result.coverage == "local-fhir-only"
+    assert result.profiles == {
+        "local": {
+            "status": "run",
+            "grade": "A",
+            "checks": [
+                "strict unknown parameter is rejected",
+                "strict rejection is audited as a failure",
+                    "lenient unknown parameter carries an outcome warning",
+                    "lenient warning is audited truthfully",
+                    "unsupported modifier is rejected",
+                    "unsupported modifier rejections are audited as failures",
+            ],
+        },
+        "mcp": {"status": "not_run", "checks": []},
+        "proxy": {"status": "not_run", "checks": []},
+    }
+    assert {check.name for check in result.checks} == {
+        "strict unknown parameter is rejected",
+        "strict rejection is audited as a failure",
+        "lenient unknown parameter carries an outcome warning",
+        "lenient warning is audited truthfully",
+        "unsupported modifier is rejected",
+        "unsupported modifier rejections are audited as failures",
+    }
+    assert report.score == (7, 7)
+    assert report.grade == "A"
+    assert report.passed is True
+
+
+def test_optional_mcp_profile_records_status_only_errors_as_c(client, tenant_id,
+                                                              step_up_token):
+    class StatusOnlyMCPClient:
+        def call_tool(self, name, arguments):
+            assert name == "fhir_search"
+            assert arguments["resource_type"] == "WidgetQuintaviousZzyzxbarton"
+            return {
+                "content": [{
+                    "type": "text",
+                    "text": '{"error":"Search failed with status 400"}',
+                }],
+            }
+
+    report = run_conformance(
+        FlaskProbeClient(client), _ctx(None, tenant_id, step_up_token),
+        mcp_client=StatusOnlyMCPClient())
+
+    result = next(r for r in report.results if r.key == "error_fidelity")
+    assert result.grade == "C"  # MCP C is weaker than local A
+    assert result.coverage == "local+mcp"
+    assert result.profiles["mcp"] == {
+        "status": "run", "grade": "C",
+        "checks": ["MCP tool failure is corrective and flagged"],
+    }
+    assert any(c.name == "MCP tool failure is corrective and flagged"
+               for c in result.checks)
+
+
+def test_optional_mcp_profile_accepts_flagged_operation_outcome(
+        client, tenant_id, step_up_token):
+    class CorrectiveMCPClient:
+        def call_tool(self, name, arguments):
+            return {
+                "isError": True,
+                "content": [{
+                    "type": "text",
+                    "text": json.dumps({
+                        "resourceType": "OperationOutcome",
+                        "issue": [{
+                            "severity": "error",
+                            "code": "not-supported",
+                            "details": {"text": "Resource type is not supported."},
+                        }],
+                    }),
+                }],
+            }
+
+    import json
+
+    report = run_conformance(
+        FlaskProbeClient(client), _ctx(None, tenant_id, step_up_token),
+        mcp_client=CorrectiveMCPClient())
+
+    result = next(r for r in report.results if r.key == "error_fidelity")
+    assert result.profiles["mcp"] == {
+        "status": "run", "grade": "A",
+        "checks": ["MCP tool failure is corrective and flagged"],
+    }
+
+
+def test_optional_mcp_profile_rejects_unsanitized_operation_outcome(
+        client, tenant_id, step_up_token):
+    class UnsafeMCPClient:
+        def call_tool(self, name, arguments):
+            return {
+                "isError": True,
+                "content": [{
+                    "type": "text",
+                    "text": json.dumps({
+                        "resourceType": "OperationOutcome",
+                        "issue": [{
+                            "severity": "error",
+                            "code": "not-supported",
+                            "details": {"text": "Patient Quintavious Zzyzxbarton"},
+                            "diagnostics": "https://db.internal.example/secret",
+                        }],
+                    }),
+                }],
+            }
+
+    import json
+
+    report = run_conformance(
+        FlaskProbeClient(client), _ctx(None, tenant_id, step_up_token),
+        mcp_client=UnsafeMCPClient())
+
+    result = next(r for r in report.results if r.key == "error_fidelity")
+    assert result.profiles["mcp"]["grade"] != "A"
+
+
+def test_malformed_mcp_result_remains_an_executed_profile(
+        client, tenant_id, step_up_token):
+    class MalformedMCPClient:
+        def call_tool(self, name, arguments):
+            return {"isError": True, "content": None}
+
+    report = run_conformance(
+        FlaskProbeClient(client), _ctx(None, tenant_id, step_up_token),
+        mcp_client=MalformedMCPClient())
+
+    result = next(r for r in report.results if r.key == "error_fidelity")
+    assert result.profiles["mcp"]["status"] == "run"
+    assert result.profiles["mcp"]["grade"] == "C"
+    assert result.coverage == "local+mcp"
+
+
+def test_mcp_safe_outcome_plus_malformed_content_is_not_a():
+    import json
+
+    from r6.conformance.probes import _mcp_profile_grade
+
+    class MixedMCPClient:
+        def call_tool(self, name, arguments):
+            outcome = {
+                "resourceType": "OperationOutcome",
+                "issue": [{
+                    "severity": "error",
+                    "code": "not-supported",
+                    "details": {"text": "Resource type is not supported."},
+                }],
+            }
+            return {
+                "isError": True,
+                "content": [
+                    {"type": "text", "text": json.dumps(outcome)},
+                    {},
+                ],
+            }
+
+    assert _mcp_profile_grade(MixedMCPClient()) == "C"
+
+
+def test_mcp_safe_outcome_in_non_text_content_block_is_not_a():
+    import json
+
+    from r6.conformance.probes import _mcp_profile_grade
+
+    outcome = {
+        "resourceType": "OperationOutcome",
+        "issue": [{
+            "severity": "error",
+            "code": "not-supported",
+            "details": {"text": "Resource type is not supported."},
+        }],
+    }
+
+    class MalformedBlockMCPClient:
+        def __init__(self, block):
+            self.block = block
+
+        def call_tool(self, name, arguments):
+            return {"isError": True, "content": [self.block]}
+
+    encoded = json.dumps(outcome)
+    assert _mcp_profile_grade(MalformedBlockMCPClient(
+        {"type": "image", "text": encoded})) == "C"
+    assert _mcp_profile_grade(MalformedBlockMCPClient(
+        {"text": encoded})) == "C"
+
+
+def test_audit_correlation_uses_new_event_ids_not_only_latest_entry():
+    from r6.conformance.probes import (
+        _new_audit_outcome_codes,
+        _new_audit_outcome_grade,
+    )
+
+    def bundle(*events):
+        return {
+            "resourceType": "Bundle",
+            "entry": [
+                {"resource": {
+                    "resourceType": "AuditEvent",
+                    "id": event_id,
+                    "outcome": {"code": {"code": outcome}},
+                }}
+                for event_id, outcome in events
+            ],
+        }
+
+    before = bundle(("old", "0"))
+    after = bundle(("probe", "8"), ("old", "0"))
+    ambiguous = bundle(("concurrent", "0"), ("probe", "8"), ("old", "0"))
+
+    assert _new_audit_outcome_grade(before, after) == "A"
+    assert _new_audit_outcome_grade(before, ambiguous) == "C"
+    assert _new_audit_outcome_codes(before, ambiguous) == ["0", "8"]
+
+
+def test_proxy_a_requires_a_corrective_operation_outcome():
+    from r6.conformance.probes import _corrective_outcome
+
+    assert not _corrective_outcome(
+        {"resourceType": "OperationOutcome"}, {"invalid"})
+    assert not _corrective_outcome({
+        "resourceType": "OperationOutcome",
+        "issue": [{"severity": "error", "code": "security"}],
+    }, {"invalid"})
+    assert _corrective_outcome({
+        "resourceType": "OperationOutcome",
+        "issue": [{
+            "severity": "error",
+            "code": "invalid",
+            "details": {"text": "The request was invalid."},
+        }],
+    }, {"invalid"})
+
+
+def test_hostile_value_check_considers_parsed_body_and_raw_text():
+    from r6.conformance.probes import _response_omits_hostile_values
+
+    assert not _response_omits_hostile_values(
+        {"detail": "Quintavious"}, '{"detail":"safe"}')
+    assert not _response_omits_hostile_values(
+        {"detail": "safe"}, '{"detail":"ZzYzXbArToN"}')
+
+
+def test_proxy_profile_does_not_echo_malformed_audit_codes():
+    import json
+
+    from r6.conformance.probes import _proxy_profile
+
+    hostile = "https://db.internal.example/audit-secret"
+
+    def outcome(code):
+        return {
+            "resourceType": "OperationOutcome",
+            "issue": [{
+                "severity": "error",
+                "code": code,
+                "details": {"text": "Synthetic corrective message."},
+            }],
+        }
+
+    def audit(event_id=None, code=None):
+        entries = []
+        if event_id is not None:
+            entries.append({"resource": {
+                "resourceType": "AuditEvent",
+                "id": event_id,
+                "outcome": {"code": {"code": code}},
+            }})
+        return {"resourceType": "Bundle", "entry": entries}
+
+    responses = iter([
+        (200, audit(), ""),
+        (400, outcome("invalid"), ""),
+        (502, outcome("security"), ""),
+        (502, outcome("transient"), ""),
+        (502, outcome("transient"), ""),
+        (200, audit("hostile", hostile), ""),
+    ])
+
+    class Client:
+        def request(self, *args, **kwargs):
+            return next(responses)
+
+    _, checks = _proxy_profile(Client(), ProbeContext("tenant", "token"))
+    # Both halves, not the derived `detail`. `detail` returns only `observed`
+    # on a passing check, so scanning it alone would let a hostile token sit
+    # unnoticed in `on_failure` for as long as that check kept passing — and
+    # the leak would surface on the day it started failing.
+    assert hostile not in json.dumps(
+        [[check.observed, check.on_failure] for check in checks])
+
+
+def test_error_fidelity_crash_still_runs_configured_optional_profiles():
+    class BrokenLocalClient:
+        base = "broken"
+
+        def request(self, *args, **kwargs):
+            raise RuntimeError("synthetic failure")
+
+    report = run_conformance(
+        BrokenLocalClient(), ProbeContext("tenant", "token"),
+        mcp_client=object(), proxy_client=object())
+
+    result = next(r for r in report.results if r.key == "error_fidelity")
+    assert result.coverage == "full"
+    assert result.profiles["mcp"] == {
+        "status": "run", "grade": "C",
+        "checks": ["MCP tool failure is corrective and flagged"],
+    }
+    assert result.profiles["proxy"] == {
+        "status": "run", "grade": "F",
+        "checks": ["proxy profile executed"],
+    }
+
+
+def test_live_mcp_probe_client_initializes_then_calls_tool():
+    from r6.conformance import LiveMCPProbeClient
+
+    class Response:
+        def __init__(self, body, headers=None):
+            self._body = body
+            self.headers = headers or {}
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self._body
+
+    class Session:
+        def __init__(self):
+            self.calls = []
+            self.responses = [
+                Response({"id": 1, "result": {"protocolVersion": "2025-06-18"}},
+                         {"Mcp-Session-Id": "session-1"}),
+                Response({}),
+                Response({"id": 2, "result": {
+                    "content": [{"type": "text", "text": "{}"}],
+                    "isError": True,
+                }}),
+            ]
+
+        def post(self, url, **kwargs):
+            self.calls.append((url, kwargs))
+            return self.responses.pop(0)
+
+    session = Session()
+    client = LiveMCPProbeClient(
+        "https://mcp.example.test/mcp",
+        session=session,
+        tenant="tenant-a",
+        step_up_token="synthetic-token",
+        mcp_auth_token="synthetic-mcp-transport-token",
+    )
+    result = client.call_tool("fhir_search", {"resource_type": "Widget"})
+
+    assert result["isError"] is True
+    assert len(session.calls) == 3
+    assert session.calls[1][1]["json"]["method"] == "notifications/initialized"
+    assert session.calls[2][1]["headers"]["Mcp-Session-Id"] == "session-1"
+    assert session.calls[2][1]["headers"]["X-Tenant-Id"] == "tenant-a"
+    assert session.calls[2][1]["headers"]["X-Step-Up-Token"] == "synthetic-token"
+    assert all(
+        call[1]["headers"]["Authorization"]
+        == "Bearer synthetic-mcp-transport-token"
+        for call in session.calls
+    )
+    assert session.calls[2][1]["json"]["method"] == "tools/call"
+
+
+def test_live_mcp_probe_client_accepts_stateless_json_transport():
+    from r6.conformance import LiveMCPProbeClient
+
+    class Response:
+        headers = {"Content-Type": "application/json"}
+
+        def __init__(self, body):
+            self._body = body
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self._body
+
+    class Session:
+        def __init__(self):
+            self.responses = [
+                Response({"id": 1, "result": {"protocolVersion": "2025-06-18"}}),
+                Response({}),
+                Response({"id": 2, "result": {"isError": True, "content": []}}),
+            ]
+
+        def post(self, url, **kwargs):
+            return self.responses.pop(0)
+
+    result = LiveMCPProbeClient(
+        "https://mcp.example.test/mcp", session=Session()).call_tool(
+            "fhir_search", {"resource_type": "Widget"})
+    assert result["isError"] is True
+
+
+def test_live_mcp_probe_client_decodes_sse_responses():
+    from r6.conformance.probes import _mcp_response_json
+
+    class Response:
+        headers = {"Content-Type": "text/event-stream"}
+        text = (
+            "event: message\n"
+            "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\"}\n\n"
+            "event: message\n"
+            "data: {\"jsonrpc\":\"2.0\",\"id\":1,"
+            "\"result\":{\"content\":[]}}\n\n"
+        )
+
+    assert _mcp_response_json(
+        Response(), expected_id=1)["result"] == {"content": []}
+
+
+def test_local_error_probes_always_bound_searches_to_a_synthetic_subject():
+    from r6.conformance.probes import probe_error_fidelity
+
+    class RecordingClient:
+        base = "recording"
+
+        def __init__(self):
+            self.calls = []
+
+        def request(self, method, path, headers=None, json_body=None):
+            self.calls.append((path, (headers or {}).get("Prefer")))
+            if path.startswith("/AuditEvent"):
+                return 200, {"resourceType": "Bundle", "entry": []}, ""
+            return 200, {
+                "resourceType": "Bundle",
+                "link": [{"relation": "self", "url": path}],
+                "entry": [],
+            }, ""
+
+    client = RecordingClient()
+    probe_error_fidelity(client, ProbeContext("tenant", "token"))
+
+    observation_paths = [
+        path for path, _ in client.calls if path.startswith("/Observation?")]
+    assert observation_paths
+    assert all("patient=" in path for path in observation_paths)
+    modifier_preferences = [
+        prefer for path, prefer in client.calls if "code%3Aexact" in path]
+    assert modifier_preferences == [None, "handling=strict", "handling=lenient"]
+
+
+def test_scripted_local_contract_can_reach_a_without_reading_real_data():
+    from urllib.parse import parse_qs, urlencode, urlsplit
+
+    from r6.conformance.probes import probe_error_fidelity
+
+    corrective_text = (
+        "datetime is not implemented. Supported parameters: patient, code, status, "
+        "_lastUpdated, _count, _sort, _summary, context-id."
+    )
+
+    def audit_event(event_id, code, detail=None):
+        outcome = {"code": {"code": code}}
+        if detail is not None:
+            outcome["detail"] = [{"text": detail}]
+        return {
+            "resourceType": "AuditEvent",
+            "id": event_id,
+            "outcome": outcome,
+        }
+
+    def audit_bundle(*events):
+        return {
+            "resourceType": "Bundle",
+            "entry": [{"resource": event} for event in events],
+        }
+
+    class LocalAClient:
+        base = "scripted-local-a"
+
+        def __init__(self):
+            self.audit_call = 0
+            self.observation_call = 0
+
+        def request(self, method, path, headers=None, json_body=None):
+            if path.startswith("/AuditEvent"):
+                self.audit_call += 1
+                old = audit_event("old", "0")
+                strict = audit_event("strict", "8")
+                lenient = audit_event(
+                    "lenient", "0", "ignored parameter: datetime")
+                if self.audit_call == 1:
+                    body = audit_bundle(old)
+                elif self.audit_call in (2, 3):
+                    body = audit_bundle(strict, old)
+                elif self.audit_call in (4, 5):
+                    body = audit_bundle(lenient, strict, old)
+                else:
+                    body = audit_bundle(
+                        audit_event("modifier-default", "8"),
+                        audit_event("modifier-strict", "8"),
+                        audit_event("modifier-lenient", "8"),
+                        lenient, strict, old)
+                return 200, body, ""
+
+            self.observation_call += 1
+            query = parse_qs(urlsplit(path).query)
+            subject = query["patient"][0]
+            if self.observation_call == 1:
+                body = {
+                    "resourceType": "OperationOutcome",
+                    "issue": [{
+                        "severity": "error",
+                        "code": "not-supported",
+                        "details": {"text": corrective_text},
+                    }],
+                }
+                return 400, body, ""
+            if self.observation_call == 2:
+                self_url = "/Observation?" + urlencode({"patient": subject})
+                body = {
+                    "resourceType": "Bundle",
+                    "link": [{"relation": "self", "url": self_url}],
+                    "entry": [{
+                        "search": {"mode": "outcome"},
+                        "resource": {
+                            "resourceType": "OperationOutcome",
+                            "issue": [{
+                                "severity": "warning",
+                                "code": "not-supported",
+                                "details": {"text": corrective_text},
+                            }],
+                        },
+                    }],
+                }
+                return 200, body, ""
+            body = {
+                "resourceType": "OperationOutcome",
+                "issue": [{
+                    "severity": "error",
+                    "code": "not-supported",
+                    "details": {"text": "Modifier code:exact is not supported."},
+                }],
+            }
+            return 400, body, ""
+
+    result = probe_error_fidelity(
+        LocalAClient(), ProbeContext("tenant", "token"))
+    assert result.grade == "A"
+    assert result.passed is True
+    assert any(
+        check.name == "unsupported modifier rejections are audited as failures"
+        and check.passed
+        for check in result.checks
+    )
+
+
+def test_injected_mock_proxy_profile_passes_the_full_error_contract(
+        client, tenant_id, step_up_token, caplog):
+    import httpx
+    import json
+    from unittest.mock import MagicMock, patch
+
+    from r6.fhir_proxy import FHIRUpstreamProxy
+
+    hostile_name = "Quintavious Zzyzxbarton"
+    hostile_url = "https://db.internal.example/patient/secret"
+
+    def response(status, body):
+        resp = MagicMock()
+        resp.status_code = status
+        resp.content = json.dumps(body).encode()
+        resp.json.return_value = body
+        return resp
+
+    rejected = response(400, {
+        "resourceType": "OperationOutcome",
+        "issue": [{
+            "severity": "error", "code": "invalid",
+            "details": {"text": f"Patient {hostile_name} rejected"},
+            "diagnostics": hostile_url,
+        }],
+    })
+    unauthorized = response(401, {
+        "resourceType": "OperationOutcome",
+        "issue": [{"severity": "error", "code": "login",
+                   "diagnostics": "expired proxy credential"}],
+    })
+    server_error = response(500, {
+        "resourceType": "OperationOutcome",
+        "issue": [{"severity": "error", "code": "exception",
+                   "diagnostics": hostile_url}],
+    })
+
+    proxy = FHIRUpstreamProxy("https://mock-fhir.example")
+    proxy._client.get = MagicMock(
+        side_effect=[
+            rejected,
+            unauthorized,
+            server_error,
+            httpx.ReadTimeout(hostile_url),
+        ])
+    local_client = FlaskProbeClient(client)
+
+    class InjectedProxyClient:
+        def request(self, *args, **kwargs):
+            with patch("r6.routes.get_proxy_for_request", return_value=proxy):
+                return local_client.request(*args, **kwargs)
+
+    try:
+        report = run_conformance(
+            local_client, _ctx(None, tenant_id, step_up_token),
+            proxy_client=InjectedProxyClient())
+    finally:
+        proxy.close()
+
+    result = next(r for r in report.results if r.key == "error_fidelity")
+    assert result.grade == "A"  # local A and proxy A agree
+    assert result.coverage == "local+proxy"
+    assert result.profiles["proxy"] == {
+        "status": "run", "grade": "A",
+        "checks": [
+            "proxy rejection preserves sanitized outcome",
+            "proxy auth failure is not not-found",
+            "proxy server failure is truthful",
+            "proxy timeout is truthful",
+            "proxy failure audit is truthful",
+        ],
+    }
+    proxy_checks = [c for c in result.checks if c.name.startswith("proxy ")]
+    assert proxy_checks and all(c.passed for c in proxy_checks)
+    assert hostile_name not in json.dumps(result.profiles)
+    assert hostile_url not in report.render()
+    assert hostile_name not in caplog.text
+    assert hostile_url not in caplog.text
+    from r6.models import AuditEventRecord
+    details = [
+        event.detail or ""
+        for event in AuditEventRecord.query.filter_by(tenant_id=tenant_id).all()
+    ]
+    assert all(hostile_name not in detail for detail in details)
+    assert all(hostile_url not in detail for detail in details)
+
+
+# --- #213: a guardrail that is OFF must not be able to score A ---------------
+#
+# Every check in this harness except two was an ABSENCE assertion, and a broken
+# guardrail passes those HARDER — it shrinks the response. The RxNorm lookup
+# returned None for its entire life (#376) while the grade held A. The tests
+# below turn one guardrail off at a time and show the grade follow.
+#
+# Mutations are applied at the HTTP boundary because that is the only surface
+# the harness grades: whatever a deployment does internally, this is what a
+# partner running the harness against it can see.
+
+
+class _MutatedDeployment:
+    """The real app with one response rewritten."""
+
+    def __init__(self, inner, mutate):
+        self._inner = inner
+        self._mutate = mutate
+        self.base = getattr(inner, "base", "")
+
+    def request(self, method, path, headers=None, json_body=None):
+        return self._mutate(
+            method, path, headers,
+            self._inner.request(method, path, headers, json_body))
+
+
+def _failed(report, key):
+    result = next(r for r in report.results if r.key == key)
+    return [c.name for c in result.checks if not c.passed]
+
+
+def test_a_search_that_returns_nothing_no_longer_scores_a(
+        client, tenant_id, step_up_token):
+    """Search stops returning records; every PHI absence check passes harder.
+
+    This is #376's shape exactly — a lookup silently answering with nothing —
+    on the path that builds an agent's context.
+    """
+    empty = {"resourceType": "Bundle", "type": "searchset", "total": 0,
+             "entry": []}
+
+    def mutate(method, path, headers, out):
+        if method == "GET" and path.startswith("/Patient?"):
+            return 200, empty, ""
+        return out
+
+    report = run_conformance(
+        _MutatedDeployment(FlaskProbeClient(client), mutate),
+        _ctx(None, tenant_id, step_up_token))
+
+    assert report.grade != "A", "an empty search path still scored A"
+    assert _failed(report, "phi_redaction") == [
+        "the search returns the resource it was asked for"]
+
+
+def test_step_up_validation_turned_off_no_longer_scores_a(
+        client, tenant_id, step_up_token, monkeypatch):
+    """The guardrail itself, switched off in the app.
+
+    With signature validation stubbed out, any string in X-Step-Up-Token
+    authorizes a write. The missing-header 401 still fires, so the old harness
+    saw nothing wrong.
+    """
+    # r6.stepup only, and the migration is why.
+    #
+    # r6/routes.py used to do `from r6.stepup import validate_step_up_token`,
+    # binding the name at import time, so this patched both modules while
+    # call sites there still called it directly. The kernel resolves the
+    # validator as a MODULE ATTRIBUTE on r6.stepup — deliberately, so that
+    # monkeypatching by module path keeps working (r6/access.py §1.0).
+    #
+    # Patching only r6.routes stopped switching the guardrail off when the
+    # slice 6 gates moved: the writes were still refused, the grade stayed A,
+    # and this test failed. It failed rather than passing vacuously, which is
+    # the right way round — but a test that cannot break the thing it is
+    # trying to break proves nothing about the harness. The last consumer of
+    # the r6.routes binding, $extract, moved in #655 and the import went
+    # with it, so r6.stepup is now the one name to patch.
+    import r6.stepup
+    monkeypatch.setattr(r6.stepup, "validate_step_up_token",
+                        lambda *a, **k: (True, ""))
+
+    report = run_conformance(FlaskProbeClient(client),
+                             _ctx(None, tenant_id, step_up_token))
+
+    assert report.grade != "A", "forged tokens were accepted and the grade held"
+    assert _failed(report, "step_up_enforcement") == [
+        "write with a forged step-up token is rejected (401)"]
+
+
+def test_a_deployment_that_lets_an_audit_event_be_deleted_is_not_immutable(
+        client, tenant_id, step_up_token):
+    """"Immutable Audit Trail" used to be a name no check could fail.
+
+    The real app refuses the probe's PUT (403) and DELETE (405) at more than
+    one layer, so removing one guard in-process leaves the probe green — it
+    measures the property, not a particular guard. This proves the probe can
+    go red: a deployment that accepts the DELETE and drops the event.
+    """
+    deleted = set()
+
+    def mutate(method, path, headers, out):
+        if method == "DELETE" and path.startswith("/AuditEvent/"):
+            deleted.add(path.rsplit("/", 1)[1])
+            return 204, None, ""
+        if method == "GET" and path.startswith("/AuditEvent?") and deleted:
+            status, body, text = out
+            body = dict(body, entry=[
+                e for e in body.get("entry") or []
+                if (e.get("resource") or {}).get("id") not in deleted])
+            return status, body, ""
+        return out
+
+    report = run_conformance(
+        _MutatedDeployment(FlaskProbeClient(client), mutate),
+        _ctx(None, tenant_id, step_up_token))
+
+    assert report.grade != "A", "a deletable audit trail still scored A"
+    assert _failed(report, "audit_trail") == [
+        "an attempt to delete an AuditEvent is refused",
+        "the AuditEvent reads back unchanged"]
+
+
+def test_a_deployment_that_refuses_everyone_no_longer_isolates(
+        tenant_id, step_up_token):
+    """Blanket 404 isolates perfectly and serves nobody."""
+    from r6.conformance.probes import probe_tenant_isolation
+
+    class _RefusesEveryRead:
+        base = "scripted-blanket-404"
+
+        def request(self, method, path, headers=None, json_body=None):
+            if method == "POST":
+                return 201, {"resourceType": "Patient", "id": "p1"}, ""
+            return 404, {"resourceType": "OperationOutcome"}, ""
+
+    result = probe_tenant_isolation(_RefusesEveryRead(),
+                                    ProbeContext(tenant_id, step_up_token))
+    assert result.passed is False
+    assert [c.name for c in result.checks if not c.passed] == [
+        "resource IS readable from its own tenant"]
+
+
+def test_a_gate_that_blocks_confirmed_writes_too_is_not_a_gate(
+        tenant_id, step_up_token):
+    """Blanket 428 on every clinical write gates nothing."""
+    from r6.conformance.probes import probe_human_in_the_loop
+
+    class _Blocks:
+        base = "scripted-blanket-428"
+
+        def request(self, method, path, headers=None, json_body=None):
+            return 428, {"resourceType": "OperationOutcome"}, ""
+
+    result = probe_human_in_the_loop(_Blocks(),
+                                     ProbeContext(tenant_id, step_up_token))
+    assert result.passed is False
+    assert [c.name for c in result.checks if not c.passed] == [
+        "confirmed clinical write is accepted"]
+    assert "#214" in result.note, "the report must say what this does not grade"
+
+
+def test_the_word_disclaimer_in_an_error_is_not_a_disclaimer(
+        tenant_id, step_up_token):
+    """The disclaimer has to be attached to the data it disclaims."""
+    from r6.conformance.probes import probe_medical_disclaimer
+
+    class _ErrorsWithTheWord:
+        base = "scripted-disclaimer-in-error"
+
+        def request(self, method, path, headers=None, json_body=None):
+            if method == "POST":
+                return 201, {"resourceType": "Observation", "id": "o1"}, ""
+            return 500, {"resourceType": "OperationOutcome", "issue": [
+                {"severity": "error", "code": "exception",
+                 "details": {"text": "disclaimer service unavailable"}}]}, ""
+
+    result = probe_medical_disclaimer(_ErrorsWithTheWord(),
+                                      ProbeContext(tenant_id, step_up_token))
+    assert result.passed is False
+    assert [c.name for c in result.checks if not c.passed] == [
+        "the disclaimer accompanies the clinical record, not an error"]
+
+
+def test_a_deployment_that_answers_nothing_scores_f(tenant_id, step_up_token):
+    """Refuse or empty everything and the two gate properties still passed.
+
+    Measured against the previous harness this deployment scored 2/7, and the
+    two it passed were step_up_enforcement and human_in_the_loop — the guardrail
+    properties, certified by a deployment that does nothing. Now it passes none.
+    """
+    class _AnswersNothing:
+        base = "scripted-guardrails-off"
+
+        def request(self, method, path, headers=None, json_body=None):
+            if method == "POST" and path.startswith("/Observation"):
+                return 428, {"resourceType": "OperationOutcome"}, ""
+            if method == "POST":
+                return 401, {"resourceType": "OperationOutcome"}, ""
+            if "?" in path:
+                return 200, {"resourceType": "Bundle", "type": "searchset",
+                             "total": 0, "entry": []}, ""
+            return 404, {"resourceType": "OperationOutcome"}, ""
+
+    report = run_conformance(_AnswersNothing(),
+                             _ctx(None, tenant_id, step_up_token))
+    assert report.grade == "F"
+    assert [r.key for r in report.results if r.passed] == []
+
+
+def test_a_supported_set_that_is_not_ours_is_still_corrective():
+    """#525. The property is that the refusal NAMES the supported parameters.
+
+    Which parameters those are is the implementing server's business. Until
+    this landed, `_outcome_names_parameter_and_supported_set` demanded the
+    declared set EQUAL ours — `context-id` included, which no other FHIR
+    server has — so no external implementation could score A on error
+    fidelity, and the grade measured resemblance to our implementation rather
+    than conformance to a contract.
+
+    These three are the cases that flipped. Each one is a server refusing
+    `datetime` correctively and declaring a set we do not share.
+    """
+    from r6.conformance.probes import (
+        _outcome_names_parameter_and_supported_set,
+    )
+
+    for corrective in (
+        # Names we cannot tell from real ones. We should not try: `context-id`
+        # looks invented from anyone else's side too.
+        "datetime rejected. Supported parameters: patiently, barcode.",
+        "datetime rejected. Supported parameters: status-code, patientish.",
+        # Our own eight plus one more. A superset used to fail.
+        "datetime is unsupported. Supported parameters: patient, code, status, "
+        "_lastUpdated, _count, _sort, _summary, context-id, invented-filter.",
+    ):
+        body = {
+            "resourceType": "OperationOutcome",
+            "issue": [{
+                "severity": "error",
+                "code": "invalid",
+                "details": {"text": corrective},
+            }],
+        }
+        assert _outcome_names_parameter_and_supported_set(body, "datetime"), (
+            "a server that names the bad parameter and declares its own "
+            "supported set is corrective: %s" % corrective)
+
+
+def test_a_declaration_must_be_a_list_not_a_suggestion():
+    """The second #525 mechanism, and the one the issue did not name.
+
+    `_outcome_has_unsafe_last_updated_suggestion` strips the declared-set
+    sentence before scanning for `_lastUpdated`, because listing it among
+    what you support is a fact rather than a suggestion. That strip used to
+    apply only when the set was exactly ours — so every other server that
+    truthfully listed `_lastUpdated` tripped the heuristic on its own
+    legitimate sentence and was forced to C by a second, independent path.
+
+    Generalising the strip must not swallow the thing it exists to catch:
+    prose in the declaration position is a suggestion wearing a
+    declaration's clothes.
+    """
+    from r6.conformance.probes import (
+        _outcome_has_unsafe_last_updated_suggestion,
+    )
+
+    def outcome(text):
+        return {
+            "resourceType": "OperationOutcome",
+            "issue": [{
+                "severity": "error",
+                "code": "invalid",
+                "details": {"text": text},
+            }],
+        }
+
+    # A list, from a server that is not us. Factual, so it does not trip.
+    assert not _outcome_has_unsafe_last_updated_suggestion(outcome(
+        "datetime rejected. Supported parameters: subject, _lastUpdated, "
+        "onset-date."))
+
+    # Prose in the same position, offering _lastUpdated as a substitute for a
+    # clinical date. Must still trip, and it is why the shape is checked.
+    assert _outcome_has_unsafe_last_updated_suggestion(outcome(
+        "Supported parameters: use _lastUpdated instead of datetime"))
+    assert _outcome_has_unsafe_last_updated_suggestion(outcome(
+        "datetime is unsupported. Use _lastUpdated instead. Supported "
+        "parameters: subject, _lastUpdated."))

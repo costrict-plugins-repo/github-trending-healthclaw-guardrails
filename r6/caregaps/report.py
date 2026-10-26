@@ -1,0 +1,346 @@
+# r6/caregaps/report.py
+"""Report builders for preventive-care gaps — pure (no Flask/DB).
+
+build_caregaps_summary() is the clinician view (counts + the list of due
+rules). build_consumer_summary() is the plain-language, outcomes-oriented
+consumer view. Neither summary may be placed in audit detail (PHI).
+"""
+
+from r6.voice import PATIENT, SAMPLE
+
+_CONSUMER_NOTE = (
+    "These are general preventive-care reminders based on published "
+    "guidelines — not personalized medical advice. Your connected "
+    "records may be incomplete, so confirm anything here with your "
+    "clinician.")
+
+# Why part or all of the consumer list is missing, in the person's own words.
+# The reason itself travels as `unevaluated` so a caller can branch on it
+# without matching prose.
+#
+# CALLER reasons — the caller knows the rules never got a record to read, and
+# the engine cannot see that. Nothing here describes the person's data,
+# because nothing of their data was looked at. Fixed prose: there is no
+# finding to report.
+_NOT_EVALUATED_NOTES = {
+    "no-patient": (
+        "There is no patient record connected here yet, so this check had "
+        "nothing to read. Nothing was examined, and that is not a finding "
+        "that you have no screenings outstanding."),
+    "ambiguous-patient": (
+        "More than one patient record is connected here, so this check could "
+        "not tell whose preventive care to look at. Nothing was examined, "
+        "and that is not a finding that you have no screenings outstanding."),
+    "check-incomplete": (
+        "This check could not be completed for your record right now, so "
+        "nothing here was decided either way. That is a limit on the check "
+        "and not something found in your record, and it is not a finding "
+        "that you have no screenings outstanding."),
+}
+
+# ENGINE reasons — the rules did read a record and could not decide. Only
+# valid on that path, and the clause names ONLY what was missing from it. One
+# `demographics-unavailable` covering every case told a person whose birthDate
+# was on file that it was not; a sharper reason on a record we never opened is
+# the same false statement with better aim (#417).
+_DEMOGRAPHIC_REASONS = {
+    frozenset({"birth-date-unknown"}): (
+        "birth-date-unavailable",
+        "your date of birth was not available to this check"),
+    frozenset({"sex-unknown"}): (
+        "sex-unavailable",
+        "your sex was not recorded in the records this check can read"),
+}
+# Both missing, or a cause the engine did not record. Claims more than either
+# of the above, so it is the fallback and never the common path.
+_UNKNOWN_DEMOGRAPHICS = (
+    "demographics-unavailable",
+    "your date of birth and sex were not available to this check")
+
+# The same notes and causes about a made-up sample person (r6/voice.py), keyed
+# alike, so a reason never changes with the voice: only its words do.
+_SAMPLE_NOT_EVALUATED_NOTES = {
+    "no-patient": (
+        "There is no patient record in these made-up records, so this check "
+        "had nothing to read. Nothing was examined, and that is not a finding "
+        "that the sample person has no screenings outstanding."),
+    "ambiguous-patient": (
+        "More than one patient record is in these made-up records, so this "
+        "check could not tell whose preventive care to look at. Nothing was "
+        "examined, and that is not a finding that the sample person has no "
+        "screenings outstanding."),
+    "check-incomplete": (
+        "This check could not be completed for the sample person's record "
+        "right now, so nothing here was decided either way. That is a limit "
+        "on the check and not something found in the record, and it is not a "
+        "finding that the sample person has no screenings outstanding."),
+}
+_SAMPLE_DEMOGRAPHIC_CAUSES = {
+    "birth-date-unavailable":
+        "the sample person's date of birth was not available to this check",
+    "sex-unavailable":
+        "the sample person's sex was not recorded in the records this check "
+        "can read",
+    "demographics-unavailable":
+        "the sample person's date of birth and sex were not available to "
+        "this check",
+}
+
+
+def caller_reasons():
+    """The `unevaluated` values that mean the rules never read a record.
+
+    For a caller that must branch on the family rather than the reason. The
+    MCP App page draws these with no counts and no cards, because every
+    number on this path is an artefact of the call (#538) — and it must not
+    keep its own copy of the list, or the engine adds a reason and the page
+    goes back to drawing "0 Due" for it. Sorted so the injected list is
+    stable.
+    """
+    return sorted(_NOT_EVALUATED_NOTES)
+
+
+def build_caregaps_summary(results):
+    buckets = {"due": 0, "up_to_date": 0, "not_applicable": 0, "indeterminate": 0}
+    gaps = []
+    for r in results:
+        status = r.get("status")
+        if status in buckets:
+            buckets[status] += 1
+        if status == "due":
+            gaps.append({"rule_id": r.get("rule_id"), "title": r.get("title"),
+                        "note": r.get("note")})
+    return {**buckets, "total": len(results), "gaps": gaps}
+
+
+def _sentence(note):
+    """The rule's note as a sentence of its own. Notes are written to follow
+    a dash elsewhere, so they start lowercase; after ". " that read as a
+    typo (#877)."""
+    note = note or ""
+    return note[:1].upper() + note[1:]
+
+
+#: The word a person uses for a test a title names in brackets.
+_DETAIL_WORDS = {"Pap": "Pap test"}
+
+
+def _screening_phrase(title, cadence):
+    """"a cervical cancer screening (Pap test, every 3 years)" from the
+    rule's title and cadence (#884 G7). One shape for every screening line:
+    an article, the name in lowercase, and what the title names in brackets
+    beside how often."""
+    title = title or "screening"
+    name, detail = title, ""
+    if title.endswith(")") and " (" in title:
+        name, detail = title[:-1].split(" (", 1)
+        detail = _DETAIL_WORDS.get(detail, detail)
+    name = name[:1].lower() + name[1:]
+    inside = ", ".join(p for p in (detail, cadence) if p)
+    article = "" if name.endswith("monitoring") else (
+        "an " if name[:1] in "aeiou" else "a ")
+    return f"{article}{name}" + (f" ({inside})" if inside else "")
+
+
+def _sample_line(r, phrase):
+    """`_consumer_line`'s message about the sample person. The rule's own
+    note is left out: it is written to "you"."""
+    title, status = r.get("title"), r.get("status")
+    if status == "due":
+        return (f"The sample person may be due for {phrase}. Nothing in these "
+                f"made-up records shows one.")
+    if status == "up_to_date":
+        return (f"The sample person's {title.lower()} is up to date on timing "
+                f"(last on {r.get('last_done')}). This checks when it was "
+                f"done, not what it showed or whether anything has changed "
+                f"since.")
+    unread = r.get("unread_evidence")
+    return (f"We could not check whether the sample person is due for "
+            f"{phrase}." + (f" This check does not read {unread} yet."
+                            if unread else ""))
+
+
+def _consumer_line(r, voice=PATIENT):
+    """One plain-language line per screening, or None. Which screenings get
+    a line is decided by today's wording alone; the sample voice
+    (r6/voice.py) only rewords the message."""
+    line = _consumer_line_today(r)
+    if line and voice == SAMPLE:
+        line["message"] = _sample_line(
+            r, _screening_phrase(r.get("title"), r.get("cadence")))
+    return line
+
+
+def _consumer_line_today(r):
+    title, cadence = r.get("title"), r.get("cadence")
+    note = _sentence(r.get("note"))
+    phrase = _screening_phrase(title, cadence)
+    status = r.get("status")
+    # `status` travels with the line so a consumer can separate due from
+    # up-to-date without re-deriving it from the prose. The brief's care-gaps
+    # section is gaps only, and parsing the message to work that out would be
+    # a second copy of a fact this module already owns (#387).
+    if status == "due":
+        return {"rule_id": r.get("rule_id"), "title": title, "status": status,
+                "message": f"You may be due for {phrase}. {note}".strip()}
+    if status == "up_to_date":
+        # "Up to date" is a statement about WHEN, and it was being read as a
+        # statement about WHAT. A recorded demo had the assistant tell a
+        # patient their blood pressure monitoring "looks up to date" while
+        # every reading on file was stage 2 — true about cadence, taken as
+        # reassurance about control. The line now says which of the two it
+        # is, in the sentence itself rather than a footnote nobody reads.
+        return {"rule_id": r.get("rule_id"), "title": title, "status": status,
+                "message": (f"Your {title.lower()} is up to date on timing "
+                            f"(last on {r.get('last_done')}). This checks when "
+                            f"it was done, not what it showed or whether "
+                            f"anything has changed since.")}
+    # An undecided screening the person is ELIGIBLE for (#436). #428 made
+    # colorectal screening indeterminate rather than let it claim a gap it had
+    # not checked for, and its PR said the prompt to act survived the status
+    # change. It did not: lines were built for `due` and `up_to_date` only, so
+    # the note written for the patient reached the clinician-facing `detail`
+    # and stopped there. The person saw the screening named in
+    # `unevaluated_note` and nothing about what to do.
+    #
+    # `applicable is True` and not merely `indeterminate`: a rule that could
+    # not decide whether it applies AT ALL (sex or date of birth missing) has
+    # nothing to tell this person yet, and a line for it would put a screening
+    # in front of someone who may not need one. Those stay named in the marker,
+    # which claims no eligibility. The two causes are kept apart here for the
+    # same reason `_coverage_marker` keeps them apart below.
+    if status == "indeterminate" and r.get("applicable") is True:
+        return {"rule_id": r.get("rule_id"), "title": title, "status": status,
+                # The engine's own status travels, so `lines`, `detail` and
+                # `summary` never disagree about one screening. The label is
+                # the word for it a patient can read: the MCP App page renders
+                # a status by swapping underscores for spaces, which gives
+                # "due" and "up to date" and would give "indeterminate".
+                "status_label": "could not check",
+                "message": (f"We could not check whether you are due for "
+                            f"{phrase}. {note}").strip()}
+    return None
+
+
+def _name_all(titles):
+    if len(titles) == 1:
+        return titles[0]
+    return f"{', '.join(titles[:-1])} and {titles[-1]}"
+
+
+def _demographics_marker(undecided, titles, voice=PATIENT):
+    """Reason + prose for rules that DID read a record and could not decide."""
+    causes = frozenset(
+        r.get("indeterminate_reason") for r in undecided) - {None}
+    reason, cause = _DEMOGRAPHIC_REASONS.get(causes, _UNKNOWN_DEMOGRAPHICS)
+    if voice == SAMPLE:
+        cause = _SAMPLE_DEMOGRAPHIC_CAUSES[reason]
+    n = len(undecided)
+    noun, pronoun = ("screening", "it is") if n == 1 else ("screenings", "they are")
+    named = f": {_name_all(titles)}" if titles else ""
+    return reason, (
+        f"{n} {noun} could not be checked because {cause}{named}. That is not "
+        f"a finding that {pronoun} up to date.")
+
+
+#: A rule that could not decide because WE do not read all the evidence that
+#: satisfies it — not because the record was missing anything (#425). Kept
+#: apart from the demographic causes on purpose: "your sex was not recorded"
+#: is a statement about the person, and applying it to a screening that failed
+#: for our own reason is the #417 defect with a different subject.
+_COVERAGE_CAUSE = "evidence-not-read"
+
+
+def _coverage_marker(undecided, titles):
+    """Reason + prose for rules this check knowingly cannot fully read."""
+    evidence = sorted({r["unread_evidence"] for r in undecided
+                       if r.get("unread_evidence")})
+    n = len(undecided)
+    noun, pronoun = ("screening", "it is") if n == 1 else ("screenings", "they are")
+    named = f": {_name_all(titles)}" if titles else ""
+    what = _name_all(evidence) if evidence else "every test that can satisfy them"
+    return _COVERAGE_CAUSE, (
+        f"{n} {noun} could not be checked because this check does not yet read "
+        f"{what}{named}. That is a limit on the check and not a finding that "
+        f"{pronoun} up to date.")
+
+
+def _unevaluated_marker(results, not_evaluated, voice=PATIENT):
+    """What was not evaluated and why, or None when the answer is whole.
+
+    An empty list is ambiguous by construction: "we looked and nothing is
+    outstanding" and "we never got far enough to look" render identically,
+    and the second was reaching patients as the first (#389, after #379 and
+    #381). Same posture as r6/labs/interpret.py `_indeterminate` — say what
+    could not be decided rather than emitting a clean result.
+
+    A PARTIAL list is that same defect one size down, and the marker used to
+    be attached only when `lines` came back entirely empty. A Patient with a
+    birthDate and no gender — routine in real feeds — showed four screenings
+    with the two sex-gated ones dropped in silence (#417). All-or-nothing is
+    the wrong granularity for a completeness marker, so it rides on any
+    undecided rule and says how many and which.
+
+    A caller reason OUTRANKS the rules' own causes, and that ordering is the
+    whole point. When no record reached the engine, every rule reports the
+    date of birth as unknown — an artefact of the call, not a fact about the
+    person. Quoting it back produced "Your date of birth and sex were not
+    available to this check" for records holding both (#417). While we are not
+    looking at someone's demographics, no reason we give about their
+    demographics can be true, however precisely aimed.
+    """
+    undecided = [r for r in results if r.get("status") == "indeterminate"]
+    if not not_evaluated and not undecided:
+        return None
+    titles = [r["title"] for r in undecided if r.get("title")]
+    if not_evaluated:
+        reason, note = not_evaluated, (
+            _SAMPLE_NOT_EVALUATED_NOTES if voice == SAMPLE
+            else _NOT_EVALUATED_NOTES)[not_evaluated]
+    else:
+        # Two kinds of undecided, and they must not borrow each other's
+        # reason. The record failed to say something, or this check failed to
+        # read something. Reporting a coverage gap as "your sex was not
+        # recorded" would be false about the person; reporting a demographic
+        # gap as a coverage limit would excuse us from a real one.
+        coverage = [r for r in undecided
+                    if r.get("indeterminate_reason") == _COVERAGE_CAUSE]
+        record = [r for r in undecided if r not in coverage]
+        if coverage and record:
+            _, record_note = _demographics_marker(
+                record, [r["title"] for r in record if r.get("title")], voice)
+            _, coverage_note = _coverage_marker(
+                coverage, [r["title"] for r in coverage if r.get("title")])
+            reason = "partly-unchecked"
+            note = f"{record_note} {coverage_note}"
+        elif coverage:
+            reason, note = _coverage_marker(coverage, titles)
+        else:
+            reason, note = _demographics_marker(record, titles, voice)
+    return {"unevaluated": reason, "unevaluated_count": len(undecided),
+            "unevaluated_titles": titles, "unevaluated_note": note}
+
+
+def build_consumer_summary(results, not_evaluated=None, voice=PATIENT):
+    """`not_evaluated` is the caller's reason the rules never got a record to
+    read — no patient, an ambiguous one, or a resolved one the route did not
+    hand over. The caller knows all three and the engine can see none of them,
+    since an unidentifiable patient produces exactly the rule results a
+    healthy one does.
+
+    `voice="sample"` (r6/voice.py) words the lines and the marker about "the
+    sample person". Which lines there are, and every reason, stay the same."""
+    # Which statuses earn a line is `_consumer_line`'s decision alone. The
+    # status check used to be made here as well, so the rule lived in two
+    # places and the copies had to be changed together — the generator behind
+    # #387/#435 (docs/2026-08-06-two-generators-three-laws.md, Law 2).
+    lines = []
+    for r in results:
+        line = _consumer_line(r, voice)
+        if line:
+            lines.append(line)
+    out = {"lines": lines, "note": _CONSUMER_NOTE}
+    marker = _unevaluated_marker(results, not_evaluated, voice)
+    if marker:
+        out.update(marker)
+    return out

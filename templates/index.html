@@ -1,0 +1,584 @@
+{#
+  healthclaw.io — the project site.
+
+  Presentation lives in static/css/healthclaw.css. This file carries content
+  and structure only. The previous version held ~200 inline `style=`
+  attributes and inline `onmouseover` handlers, which meant no visual fact had
+  a single owner and every section re-invented its own card. If you find
+  yourself adding a `style=` here, add a component there instead.
+
+  Class names that look historical are load-bearing — e2e/tests/landing.spec.ts
+  locates `#main-nav`, `h1.hero-title`, `.phi-compare` and `.pipeline-label`,
+  and tests/test_site_version_sync.py greps for `data-target="29"`. Renaming
+  one silently turns a Playwright assertion into a timeout.
+#}<!DOCTYPE html>
+<html lang="en" class="surface-paper">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>HealthClaw Guardrails — the safety layer between AI agents and your health data</title>
+  <meta name="description" content="HealthClaw is an open-source guardrail layer between AI agents and FHIR health data — redaction, audit, and human sign-off enforced server-side. See it working in CareAgents: connect your records and spin up a health agent that reads them safely.">
+  <link rel="canonical" href="https://healthclaw.io/">
+  <meta name="robots" content="index, follow">
+  {% if google_verification %}<meta name="google-site-verification" content="{{ google_verification }}">{% endif %}
+  <!-- Open Graph / LinkedIn -->
+  <meta property="og:type" content="website">
+  <meta property="og:site_name" content="HealthClaw Guardrails">
+  <meta property="og:url" content="https://healthclaw.io/">
+  <meta property="og:title" content="The guardrail layer between AI agents and clinical data">
+  <meta property="og:description" content="Open-source safety layer for AI + FHIR health data. Redaction, audit, and human sign-off enforced server-side. Try CareAgents — connect your records, spin up a guarded health agent.">
+  <!-- Twitter -->
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="The guardrail layer between AI agents and clinical data">
+  <meta name="twitter:description" content="Open-source safety layer for AI + FHIR health data. Try CareAgents — connect your records, spin up a guarded health agent.">
+  <meta name="theme-color" content="#FAF9F5">
+  {# Self-hosted. No page on either surface calls a third party on load —
+     see scripts/vendor_frontend_assets.py and the CSP in app.py. #}
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/fonts.css') }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/healthclaw.css') }}">
+</head>
+<body>
+
+<a href="#main" class="visually-hidden">Skip to content</a>
+
+<!-- ═══ MASTHEAD ═══ -->
+<nav id="main-nav" class="hc-nav">
+  <div class="hc-nav__inner">
+    <a href="{{ url_for('index') }}" class="hc-nav__brand">
+      <span class="hc-nav__mark">HealthClaw</span>
+      <span class="hc-nav__ver">v{{ health_context.version }}</span>
+    </a>
+    <div class="hc-nav__links">
+      <a href="{{ url_for('index') }}" class="hc-nav__link" aria-current="page">Home</a>
+      <a href="{{ url_for('r6_dashboard') }}" class="hc-nav__link">Conformance</a>
+      <a href="{{ url_for('skills_index') }}" class="hc-nav__link">Skills</a>
+      <a href="{{ url_for('wiki') }}" class="hc-nav__link">Docs</a>
+      <a href="{{ url_for('faq') }}" class="hc-nav__link">FAQ</a>
+      <a href="https://github.com/aks129/HealthClawGuardrails" target="_blank" rel="noopener" class="hc-nav__link">GitHub</a>
+    </div>
+  </div>
+</nav>
+
+<main id="main">
+
+<!-- ═══ HERO ═══ -->
+<section class="wrap hero">
+  <p class="hero__eyebrow">Open reference implementation · MIT License · Community project</p>
+  <h1 class="hero-title">The guardrail layer between <em>AI agents</em> and clinical data</h1>
+  <p class="hero__lede">
+    FHIR standardised health data. MCP standardised how AI connects to tools.
+    Nobody standardised the guardrails in between — so we built a shared, open
+    reference for that layer. See it working in <strong>CareAgents</strong>:
+    sign in with your face, connect your records, and spin up a health agent
+    that reads them, with redaction, audit, and human sign-off enforced
+    server-side.
+  </p>
+  <div class="hero__ctas">
+    <a href="https://careagents.cloud" target="_blank" rel="noopener" class="btn btn--primary">Try CareAgents →</a>
+    <a href="{{ url_for('r6_dashboard') }}" class="btn btn--ghost">Explore the live dashboard</a>
+  </div>
+  <p class="hero__fine">
+    Building on it? It is MIT-licensed —
+    <a href="https://github.com/aks129/HealthClawGuardrails/blob/main/CONTRIBUTING.md" target="_blank" rel="noopener">use it, fork it, send a PR</a>.
+  </p>
+  <p class="hero__fine"><a href="#demo">Watch the 90-second demo</a></p>
+</section>
+
+<!-- ═══ SPEC STRIP ═══ -->
+<div class="wrap">
+  <div class="spec-strip">
+    <div class="spec">
+      <span class="spec__num" data-target="29">0</span>
+      <div class="spec__label">MCP tools</div>
+    </div>
+    <div class="spec">
+      <span class="spec__num" data-target="39">0</span>
+      <div class="spec__label">FHIR resource types</div>
+    </div>
+    <div class="spec">
+      <span class="spec__num" data-target="8000">0</span>
+      <div class="spec__label">Tests passing</div>
+    </div>
+    <div class="spec">
+      <span class="spec__num" data-target="6">0</span>
+      <div class="spec__label">Guardrail layers</div>
+    </div>
+  </div>
+</div>
+
+<!-- ═══ GUARDRAIL PIPELINE ═══ -->
+<section class="wrap section" id="pipeline">
+  <div class="section-head rise">
+    <span class="eyebrow">How it works</span>
+    <h2 class="section-title">Every request passes through six layers</h2>
+    <p class="section-lede">When an AI agent reaches clinical data through HealthClaw, each request is validated, redacted, authorised, and recorded before anything touches the FHIR server.</p>
+  </div>
+  <div class="grid grid--3 seq rise">
+    <div class="seq__item">
+      <span class="seq__n">01</span>
+      <div class="pipeline-label">PHI Redacted</div>
+      <p class="seq__note">Names, addresses and dates of birth stripped before the agent sees data.</p>
+    </div>
+    <div class="seq__item">
+      <span class="seq__n">02</span>
+      <div class="pipeline-label">$validate Gate</div>
+      <p class="seq__note">Structural validation before any write proposal.</p>
+    </div>
+    <div class="seq__item">
+      <span class="seq__n">03</span>
+      <div class="pipeline-label">Permission Eval</div>
+      <p class="seq__note">R6 Permission $evaluate, denying by default.</p>
+    </div>
+    <div class="seq__item">
+      <span class="seq__n">04</span>
+      <div class="pipeline-label">HMAC Step-up</div>
+      <p class="seq__note">Signed token with a 128-bit nonce and a five-minute TTL.</p>
+    </div>
+    <div class="seq__item">
+      <span class="seq__n">05</span>
+      <div class="pipeline-label">Human Gate</div>
+      <p class="seq__note">Clinical writes stay blocked until a person confirms.</p>
+    </div>
+    <div class="seq__item">
+      <span class="seq__n">06</span>
+      <div class="pipeline-label">Audit Trail</div>
+      <p class="seq__note">An immutable, append-only record of every action.</p>
+    </div>
+  </div>
+</section>
+
+<!-- ═══ PHI REDACTION ═══ -->
+<section class="section section--sunk" id="redaction">
+  <div class="wrap">
+    <div class="section-head rise">
+      <span class="eyebrow">PHI redaction</span>
+      <h2 class="section-title">The agent never sees raw patient data</h2>
+      <p class="section-lede">Applied on every read path: direct reads, search results, upstream proxy responses, and context envelopes. Agents work with de-identified data by default.</p>
+    </div>
+    <div class="phi-compare rise">
+      <div class="phi-pane">
+        <div class="phi-pane__head">Stored in FHIR server</div>
+        <div class="phi-row"><span class="k">name    </span>Maria Elena Rivera</div>
+        <div class="phi-row"><span class="k">mrn     </span>MRN-2026-4471</div>
+        <div class="phi-row"><span class="k">phone   </span>617-555-0198</div>
+        <div class="phi-row"><span class="k">address </span>123 Clinical Ave, Boston MA 02101</div>
+        <div class="phi-row"><span class="k">dob     </span>1985-03-15</div>
+      </div>
+      <div class="phi-compare__arrow" aria-hidden="true">→</div>
+      <div class="phi-pane phi-pane--out">
+        <div class="phi-pane__head">Delivered to the AI agent</div>
+        <div class="phi-row"><span class="k">name    </span><span class="redacted">M. E. Rivera</span></div>
+        <div class="phi-row"><span class="k">mrn     </span><span class="redacted">***4471</span></div>
+        <div class="phi-row"><span class="k">phone   </span><span class="redacted">[Redacted]</span></div>
+        <div class="phi-row"><span class="k">address </span><span class="redacted">Boston, MA</span></div>
+        <div class="phi-row"><span class="k">dob     </span><span class="redacted">1985</span></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ═══ VIDEO WALKTHROUGHS ═══ -->
+<section class="wrap section" id="videos">
+  <div class="section-head rise">
+    <span class="eyebrow">See it in action</span>
+    <h2 class="section-title">Watch HealthClaw 2.0 in ninety seconds</h2>
+    <p class="section-lede">Ninety seconds on what HealthClaw 2.0 promises, and the real output that shows each promise holding.</p>
+  </div>
+  <div class="figure rise">
+    <video id="demo" controls preload="none" playsinline
+           poster="{{ url_for('static', filename='videos/healthclaw-2.0-demo-poster.jpg') }}">
+      <source src="{{ url_for('static', filename='videos/healthclaw-2.0-demo.mp4') }}" type="video/mp4">
+      <track kind="captions" srclang="en" label="English"
+             src="{{ url_for('static', filename='videos/healthclaw-2.0-demo.vtt') }}">
+      Your browser does not support the video tag.
+      <a href="{{ url_for('static', filename='videos/healthclaw-2.0-demo.mp4') }}">Download the MP4</a>.
+    </video>
+    <div class="figure__cap">
+      <div class="card__kicker">HealthClaw 2.0 · 88-second demo</div>
+      <div class="card__title">Three promises, shown on real output</div>
+      <p class="card__body">The AI gets health facts, not contact details. Every read is written to the audit log, and a read fails if the log cannot be written. A form goes out only after a person taps Approve.</p>
+      <p class="card__body">All records are synthetic. The chat ran on a third-party model, best of four takes. No clinician has signed off yet. <a href="https://github.com/aks129/HealthClawGuardrails/blob/main/docs/video/2.0-demo/disclosures.md" target="_blank" rel="noopener">How it was made</a>.</p>
+    </div>
+  </div>
+</section>
+
+<!-- ═══ WHERE TO USE IT ═══ -->
+<section class="wrap section" id="gateways">
+  <div class="section-head rise">
+    <span class="eyebrow">Where to use it</span>
+    <h2 class="section-title">Pick your chat surface. HealthClaw is the same underneath.</h2>
+    <p class="section-lede">HealthClaw is the data and guardrail layer. Three gateways are wired in today; all three call the same MCP server, get the same redacted responses, and emit the same audit trail. <a href="{{ url_for('wiki') }}#gateways">Compare them on the wiki</a>.</p>
+  </div>
+
+  <div class="grid grid--3 rise">
+    <a href="https://app.promptopinion.ai/marketplace/agent/019e183d-c819-733f-9a91-6cf6756d4bed" target="_blank" rel="noopener noreferrer" class="card">
+      <div class="card__kicker">
+        <span>PromptOpinion Marketplace</span>
+        <span class="chip chip--pass">Open access</span>
+      </div>
+      <div class="card__title">HealthClaw on PromptOpinion</div>
+      <p class="card__body">Published as both a Superpower (MCP server, 16 tools) and an Agent (Clinical Reviewer). Add it to a workspace, pick a model, and start chatting in the browser — synthetic Grover Keeling demo data preloaded.</p>
+      <ul class="card__list">
+        <li>Devpost: Agents Assemble</li>
+        <li>SHARP-on-MCP</li>
+      </ul>
+      <div class="card__more">Open the agent listing →</div>
+    </a>
+
+    <a href="{{ url_for('wiki') }}#hermes-quickstart" class="card">
+      <div class="card__kicker">
+        <span>Hermes (Nous Research)</span>
+        <span class="chip chip--signal">Self-improving</span>
+      </div>
+      <div class="card__title">Multi-gateway chat that learns</div>
+      <p class="card__body">Telegram, Discord, Slack, WhatsApp, Signal, CLI and HTTP. A native MCP client. Skills get better as you use them; the ten HealthClaw skills ship as starting points.</p>
+      <ul class="card__list">
+        <li><code>./hermes/install.sh</code></li>
+        <li>agentskills.io</li>
+      </ul>
+      <div class="card__more">Hermes quick start →</div>
+    </a>
+
+    <a href="{{ url_for('wiki') }}#gateway-openclaw" class="card">
+      <div class="card__kicker">
+        <span>OpenClaw</span>
+        <span class="chip">Telegram</span>
+      </div>
+      <div class="card__title">One bot, fixed commands, zero ambiguity</div>
+      <p class="card__body">The original integration. A Telegram bot with slash commands (<code>/conditions</code>, <code>/labs</code>, <code>/curatr</code>; <code>/approve</code> works in the demo environment only). Best when you want exactly one chat channel and predictable behaviour.</p>
+      <ul class="card__list">
+        <li><code>docker-compose --profile openclaw up</code></li>
+      </ul>
+      <div class="card__more">OpenClaw setup →</div>
+    </a>
+  </div>
+
+  <p class="fine measure push-5">
+    Need raw MCP — Claude Desktop, MCP Inspector, or your own client? Point it at
+    <code>https://mcp-demo-production-ee2c.up.railway.app/mcp</code>. No credential needed,
+    and it is pinned server-side to the synthetic <code>desktop-demo</code> tenant, so it
+    only ever serves fake data.
+  </p>
+</section>
+
+<!-- ═══ COMPILED TRUTH ═══ -->
+<section class="section section--sunk" id="compiled-truth">
+  <div class="wrap">
+    <div class="section-head rise">
+      <span class="eyebrow">Compiled truth</span>
+      <h2 class="section-title">See what your record says now, and why it says that.</h2>
+      <p class="section-lede">Every other health tool shows you data. HealthClaw shows you the trail. One FHIR operation, one MCP tool, one review surface — built on the primitive every PHR is missing: current state plus append-only evidence.</p>
+    </div>
+
+    <div class="grid grid--3 rise">
+      <div class="card">
+        <div class="card__kicker">One primitive</div>
+        <div class="card__title"><code>GET /$compiled-truth</code></div>
+        <p class="card__body">Returns a FHIR Parameters bundle: the redacted current resource, its curation state, quality score, and the full Provenance timeline, newest first. Nothing hidden.</p>
+      </div>
+      <div class="card">
+        <div class="card__kicker">One MCP tool</div>
+        <div class="card__title"><code>fhir_compiled_truth</code></div>
+        <p class="card__body">Agents call this before making resource-specific claims. Responses carry <code>_meta.ui.resourceUri</code>, an embeddable review surface, instead of a wall of chat-text fine print.</p>
+      </div>
+      <div class="card">
+        <div class="card__kicker">One review surface</div>
+        <div class="card__title">MCP App · native HTML</div>
+        <p class="card__body">The same evidence rendered for a person: what changed, who proposed it, what you approved, and when. Backed by R6 Provenance.</p>
+      </div>
+    </div>
+
+    <div class="code-block rise push-5">
+      <pre class="code"><span class="c"># agent reads the compiled truth before answering</span>
+<span class="p">curl</span> -H <span class="v">"X-Tenant-Id: your-tenant"</span> \
+     <span class="v">https://healthclaw.io/r6/fhir/Condition/&lt;id&gt;/$compiled-truth</span>
+
+<span class="c"># or via MCP from Claude Desktop</span>
+&gt; <span class="v">fhir_compiled_truth(resource_type="Condition", resource_id="&lt;id&gt;")</span></pre>
+    </div>
+  </div>
+</section>
+
+<!-- ═══ AUDIENCE CARDS ═══ -->
+<section class="wrap section" id="audiences">
+  <div class="section-head rise">
+    <span class="eyebrow">Built for</span>
+    <h2 class="section-title">Three paths, one guardrail stack</h2>
+    <p class="section-lede">Whether you are building an AI health agent, managing your own health data, or evaluating compliance infrastructure, HealthClaw meets you where you are.</p>
+  </div>
+
+  <div class="grid grid--3 rise">
+    <a href="{{ url_for('wiki') }}" class="card">
+      <div class="card__kicker"><span class="seq__n">01</span></div>
+      <div class="card__title">AI Agent Developer</div>
+      <p class="card__body">Put guardrails between your agent and a FHIR server in minutes.</p>
+      <ul class="card__list">
+        <li>29 MCP tools — drop into Claude Desktop, or any framework via the OpenAI and Gemini adapters</li>
+        <li>Fill and extract forms the standard way, with HL7 SDC <code>$populate</code> and <code>$extract</code></li>
+        <li>One-line Claude Code install</li>
+        <li>Sits in front of Aidbox, HAPI, Medplum, or another FHIR server through the generic connector</li>
+        <li>PHI redaction, audit and step-up auth on by default; you set one secret</li>
+      </ul>
+      <div class="card__more">Quick start →</div>
+    </a>
+
+    <a href="{{ url_for('r6_dashboard') }}" class="card">
+      <div class="card__kicker"><span class="seq__n">02</span></div>
+      <div class="card__title">Patient / Consumer</div>
+      <p class="card__body">See what is wrong with your health data, and fix it.</p>
+      <ul class="card__list">
+        <li>Curatr checks records against live medical code databases</li>
+        <li>Plain-language explanations of coding errors and their impact</li>
+        <li>Proposed fixes wait for your approval on the action rail, which is not yet on in production</li>
+        <li>Real records through Fasten Connect, invite-only in the hosted beta</li>
+        <li>Wearable data (Garmin, Oura, Polar, Whoop, Fitbit) via Open Wearables</li>
+      </ul>
+      <div class="card__more">Try Curatr →</div>
+    </a>
+
+    <a href="{{ url_for('security') }}" class="card">
+      <div class="card__kicker"><span class="seq__n">03</span></div>
+      <div class="card__title">Health System / Payer</div>
+      <p class="card__body">Evaluate the guardrails before an agent goes near patient or member data.</p>
+      <ul class="card__list">
+        <li>Vendor-neutral proxy that works with your existing FHIR stack</li>
+        <li>Tenant isolation, append-only audit, tenant-bound credentials and HMAC step-up tokens</li>
+        <li>Calls, texts and forms run only after a human approves them out of band, on the action rail</li>
+        <li>Care-gap evaluation that shows its reasoning and records who approved it</li>
+        <li>The gaps are published too: no SOC 2, no BAA, and redaction is not an Expert Determination</li>
+      </ul>
+      <div class="card__more">Read the security posture →</div>
+    </a>
+  </div>
+</section>
+
+<!-- ═══ CLAUDE CODE PLUGIN MARKETPLACE ═══ -->
+<section class="wrap section" id="plugin">
+  <div class="section-head rise">
+    <span class="eyebrow">Claude Code plugin</span>
+    <h2 class="section-title">Install HealthClaw skills into Claude Code in one line</h2>
+    <p class="section-lede">The <code>healthclaw-marketplace</code> hosts two plugins that ship as auto-discoverable Claude Code skills. Add the marketplace once, install either plugin, and Claude invokes the right skill whenever your prompt matches its triggers — no manual tool wiring.</p>
+  </div>
+
+  <div class="code-block rise">
+    <pre class="code"><span class="c">// add the marketplace (once)</span>
+<span class="p">$</span> claude plugin marketplace add <span class="v">aks129/HealthClawGuardrails</span>
+
+<span class="c">// install the guardrail plugin (FHIR + MCP + Curatr + Fasten Connect)</span>
+<span class="p">$</span> claude plugin install <span class="v">healthclaw-guardrails@healthclaw-marketplace</span>
+
+<span class="c">// or skip the install — hosted consumer app</span>
+<span class="p">$</span> open <span class="v">https://careagents.cloud</span></pre>
+  </div>
+
+  <div class="grid grid--2 rise push-5">
+    <div class="card">
+      <div class="card__kicker">Plugin</div>
+      <div class="card__title">healthclaw-guardrails</div>
+      <p class="card__body">FHIR agent guardrails and EHR integration.</p>
+      <ul class="card__list">
+        <li><strong>fhir-r6-guardrails</strong> — 29 MCP tools, PHI redaction, step-up auth, audit</li>
+        <li><strong>curatr</strong> — data-quality evaluation and proposed fixes</li>
+        <li><strong>fasten-connect</strong> — EHR and TEFCA ingestion</li>
+        <li><strong>phi-redaction</strong> — conservative de-identification preview</li>
+        <li><strong>fhir-upstream-proxy</strong> — Aidbox, HAPI, Medplum</li>
+        <li><strong>healthex-export</strong> — portable FHIR bundle export</li>
+      </ul>
+    </div>
+
+    <a href="https://careagents.cloud" target="_blank" rel="noopener" class="card">
+      <div class="card__kicker">Hosted app</div>
+      <div class="card__title">careagents</div>
+      <p class="card__body">Hosted personal health agents, with advisors built in.</p>
+      <ul class="card__list">
+        <li><strong>healthy-habits</strong> — vitals, sleep and activity trends</li>
+        <li><strong>care-completion</strong> — preventive care-gap follow-through</li>
+        <li><strong>medication-refills</strong> — refill windows and projections</li>
+        <li><strong>diet-exercise</strong> — activity and nutrition coaching</li>
+        <li>Passkey sign-in, on the web &mdash; and iMessage where it&rsquo;s offered</li>
+        <li>Every answer through the guardrail layer, with no PHI stored</li>
+      </ul>
+      <div class="card__more">Open CareAgents →</div>
+    </a>
+  </div>
+
+  <p class="fine measure push-5">
+    Marketplace manifest:
+    <a href="https://github.com/aks129/HealthClawGuardrails/blob/main/.claude-plugin/marketplace.json" target="_blank" rel="noopener">.claude-plugin/marketplace.json</a>
+    · Skills authored against
+    <a href="https://resources.anthropic.com/hubfs/The-Complete-Guide-to-Building-Skill-for-Claude.pdf" target="_blank" rel="noopener">Anthropic's Skill Authoring Guide</a>.
+  </p>
+</section>
+
+<!-- ═══ CURATR ═══ -->
+<section class="section section--sunk" id="curatr">
+  <div class="wrap">
+    <div class="section-head rise">
+      <span class="eyebrow">Curatr — patient data quality</span>
+      <h2 class="section-title">Your health data is full of errors. Now you can fix them.</h2>
+      <p class="section-lede">Curatr evaluates FHIR resources against live public terminology services, explains issues in plain language, and proposes fixes. Applying one takes your approval on the action rail, which is not yet on in production.</p>
+    </div>
+
+    <div class="matrix-scroll rise">
+      <table class="matrix">
+        <caption class="visually-hidden">Issue classes Curatr detects and the source it checks against</caption>
+        <thead>
+          <tr><th scope="col">Severity</th><th scope="col">Issue</th><th scope="col">Checked against</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><span class="chip chip--fail">critical</span></td><th scope="row">Deprecated ICD-9</th><td>Local lookup</td></tr>
+          <tr><td><span class="chip chip--warn">warning</span></td><th scope="row">Invalid ICD-10-CM</th><td>NLM Clinical Tables</td></tr>
+          <tr><td><span class="chip chip--warn">warning</span></td><th scope="row">Unknown SNOMED CT</th><td>tx.fhir.org</td></tr>
+          <tr><td><span class="chip chip--warn">warning</span></td><th scope="row">Missing RxNorm</th><td>RxNav API</td></tr>
+          <tr><td><span class="chip">info</span></td><th scope="row">Display mismatch</th><td>Cross-check</td></tr>
+          <tr><td><span class="chip chip--warn">warning</span></td><th scope="row">Missing fields</th><td>Structural</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p class="fine measure rise push-5">
+      Every approved fix creates a linked <code>Provenance</code> resource recording patient
+      intent, field changes, and agent attribution, written to the immutable audit trail.
+      No black-box corrections.
+    </p>
+  </div>
+</section>
+
+<!-- ═══ COMPARISON ═══ -->
+<section class="wrap section" id="comparison">
+  <div class="section-head rise">
+    <span class="eyebrow">Comparison</span>
+    <h2 class="section-title">Vendor-neutral by design</h2>
+    <p class="section-lede">HealthClaw works with any FHIR server. The guardrails are the product, not the data layer.</p>
+  </div>
+  <div class="matrix-scroll rise">
+    <table class="matrix">
+      <caption class="visually-hidden">HealthClaw compared with AWS HealthLake, Medplum MCP and raw FHIR</caption>
+      <thead>
+        <tr>
+          <th scope="col"><span class="visually-hidden">Capability</span></th>
+          <th scope="col">HealthClaw</th>
+          <th scope="col">AWS HealthLake</th>
+          <th scope="col">Medplum MCP</th>
+          <th scope="col">Raw FHIR</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr><th scope="row">Any FHIR server</th><td class="y">yes</td><td class="n">no</td><td class="n">no</td><td class="n">—</td></tr>
+        <tr><th scope="row">PHI redaction on reads</th><td class="y">yes</td><td class="n">no</td><td class="n">no</td><td class="n">no</td></tr>
+        <tr><th scope="row">Immutable audit trail</th><td class="y">yes</td><td class="n">separate</td><td class="n">partial</td><td class="n">no</td></tr>
+        <tr><th scope="row">Step-up auth for writes</th><td class="y">yes</td><td class="n">separate</td><td class="n">built-in</td><td class="n">no</td></tr>
+        <tr><th scope="row">Human-in-the-loop</th><td class="y">yes</td><td class="n">no</td><td class="n">no</td><td class="n">no</td></tr>
+        <tr><th scope="row">R6 Permission $evaluate</th><td class="y">yes</td><td class="n">no</td><td class="n">no</td><td class="n">no</td></tr>
+        <tr><th scope="row">Setup time</th><td class="y">10 sec</td><td class="n">30+ min</td><td class="n">15+ min</td><td class="n">varies</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<!-- ═══ QUICK START ═══ -->
+<section class="wrap section" id="quickstart">
+  <div class="section-head rise">
+    <span class="eyebrow">Get started</span>
+    <h2 class="section-title">Running in ten seconds</h2>
+    <p class="section-lede">No accounts. No API keys. No cloud setup. Clone, install, run.</p>
+  </div>
+  <div class="code-block rise">
+    <pre class="code" id="quickstart-code"><span class="c"># install + run in 10 seconds</span>
+<span class="p">uv</span> sync
+<span class="p">STEP_UP_SECRET</span>=your-secret python main.py
+
+<span class="c"># or with Docker</span>
+<span class="p">docker-compose</span> up -d --build
+
+<span class="c"># connect to your FHIR server</span>
+<span class="p">FHIR_UPSTREAM_URL</span>=https://hapi.fhir.org/baseR4 python main.py</pre>
+    <button type="button" class="code-block__copy" id="copy-btn">Copy</button>
+  </div>
+</section>
+
+<!-- ═══ FROM THE BUILDER ═══ -->
+<section class="wrap section" id="writing">
+  <div class="section-head rise">
+    <span class="eyebrow">From the builder</span>
+    <h2 class="section-title">The why behind this</h2>
+  </div>
+  <div class="grid grid--2 rise">
+    <a href="https://evestel.substack.com/p/building-a-new-empowered-health-system" target="_blank" rel="noopener" class="card">
+      <div class="card__kicker">Essay</div>
+      <div class="card__title">Building a New, Empowered Health System</div>
+      <p class="card__body">The current health data system was built around institutions, not patients. What happens when we flip that?</p>
+      <div class="card__more">Read on Substack →</div>
+    </a>
+    <a href="https://evestel.substack.com/p/how-i-build-my-personal-openclaw" target="_blank" rel="noopener" class="card">
+      <div class="card__kicker">Essay</div>
+      <div class="card__title">How I Build My Personal OpenClaw</div>
+      <p class="card__body">A walkthrough of building an AI health agent using OpenClaw skills and HealthClaw Guardrails with real health data.</p>
+      <div class="card__more">Read on Substack →</div>
+    </a>
+  </div>
+</section>
+
+<!-- ═══ SUBSCRIBE ═══ -->
+<section class="section section--sunk" id="subscribe">
+  <div class="wrap">
+    <div class="section-head rise">
+      <span class="eyebrow">Stay in the loop</span>
+      <h2 class="section-title">Get release notes and new guardrail patterns</h2>
+      <p class="section-lede">A short email when we ship a new MCP tool, redaction rule, or upstream-server integration. No marketing, just what has actually changed in the repo.</p>
+    </div>
+    <form id="subscribe-form" class="subscribe__form rise" novalidate>
+      <label for="subscribe-input" class="visually-hidden">Email address</label>
+      <input type="email" name="email" id="subscribe-input" class="field"
+             placeholder="you@example.com" autocomplete="email" required>
+      <button type="submit" id="subscribe-btn" class="btn btn--primary">Subscribe</button>
+    </form>
+    <div id="subscribe-msg" class="form-msg" aria-live="polite"></div>
+    <p class="fine measure push-4">
+      Subscribers get the quickstart guide PDF as a thank-you. Or grab it now:
+      <a href="{{ url_for('static', filename='healthclaw-quickstart.pdf') }}" download>healthclaw-quickstart.pdf</a>
+      · explore the <a href="{{ url_for('skills_index') }}">skill catalogue</a>.
+    </p>
+    <p class="fine measure push-2">
+      We use <a href="https://resend.com" target="_blank" rel="noopener">Resend</a> to deliver
+      mail from <code>updates@healthclaw.io</code>. One-click unsubscribe in every email.
+    </p>
+  </div>
+</section>
+
+</main>
+
+<!-- ═══ FOOTER ═══ -->
+<footer class="hc-foot">
+  <div class="hc-foot__inner">
+    <div>
+      <div class="hc-foot__mark">HealthClaw Guardrails</div>
+      <div>FHIR R4 US Core v9 + R6 · MCP · MIT License</div>
+      <div>Built by <a href="{{ url_for('about') }}">Vestel AI LLC</a></div>
+    </div>
+    <div class="hc-foot__col">
+      <div class="hc-foot__h">Project</div>
+      <a href="{{ url_for('about') }}">About</a>
+      <a href="{{ url_for('security') }}">Security posture</a>
+      <a href="https://github.com/aks129/HealthClawGuardrails" target="_blank" rel="noopener">GitHub</a>
+      <a href="{{ url_for('skills_index') }}">Skills</a>
+      <a href="{{ url_for('r6_dashboard') }}">Dashboard</a>
+      <a href="{{ url_for('privacy') }}">Privacy</a>
+      <a href="{{ url_for('terms') }}">Terms</a>
+    </div>
+    {# Discovery links — kept for e2e tests and developer discovery.
+       landing.spec.ts asserts the first two are visible. #}
+    <div class="hc-foot__col">
+      <div class="hc-foot__h">Endpoints</div>
+      <a class="hc-foot__ep" href="/r6/fhir/metadata" target="_blank">/r6/fhir/metadata</a>
+      <a class="hc-foot__ep" href="/r6/fhir/health" target="_blank">/r6/fhir/health</a>
+      <a class="hc-foot__ep" href="/r6/fhir/.well-known/smart-configuration" target="_blank">SMART configuration</a>
+      <a class="hc-foot__ep" href="/fasten/jobs" target="_blank">/fasten/jobs</a>
+    </div>
+  </div>
+</footer>
+
+<script src="{{ url_for('static', filename='js/landing.js') }}" defer></script>
+
+</body>
+</html>

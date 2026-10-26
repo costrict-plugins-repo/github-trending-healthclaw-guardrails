@@ -1,0 +1,325 @@
+services:
+  fhir-mcp-guardrails:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "127.0.0.1:${HOST_PORT:-5000}:5000"
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      - FLASK_ENV=development
+      - SQLALCHEMY_DATABASE_URI=sqlite:///mcp_server.db
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - FHIR_VALIDATOR_URL=${FHIR_VALIDATOR_URL:-http://localhost:8080}
+      - REDIS_URL=redis://redis:6379/0
+      - STEP_UP_SECRET=${STEP_UP_SECRET:-dev-step-up-secret-change-in-production}
+      - INTERNAL_TOKEN_MINT_SECRET=${INTERNAL_TOKEN_MINT_SECRET:-dev-internal-secret-change-in-production}
+      - AGENT_RUN_RECONCILE_SECRET=${AGENT_RUN_RECONCILE_SECRET:-dev-reconcile-secret-change-in-production}
+      # Read authorization (hardening): when enabled, non-public tenants
+      # require a tenant-bound step-up token / OAuth read scope on reads.
+      # PUBLIC_TENANTS is the explicit allowlist that may be read anonymously.
+      - READ_AUTH_ENABLED=${READ_AUTH_ENABLED:-}
+      - PUBLIC_TENANTS=${PUBLIC_TENANTS:-desktop-demo}
+      # SMART OAuth token signing (hardening). Falls back to STEP_UP_SECRET
+      # when unset so local tokens still validate.
+      - OAUTH_SECRET=${OAUTH_SECRET:-}
+      - OAUTH_ISSUER=${OAUTH_ISSUER:-}
+      # Upstream FHIR server proxy (set to connect to real data)
+      # Examples: https://hapi.fhir.org/baseR4, https://r4.smarthealthit.org
+      - FHIR_UPSTREAM_URL=${FHIR_UPSTREAM_URL:-}
+      - FHIR_UPSTREAM_TIMEOUT=${FHIR_UPSTREAM_TIMEOUT:-15}
+      - FHIR_LOCAL_BASE_URL=http://localhost:5000/r6/fhir
+      # Base URL for links handed to humans (form-fill delivery links, action
+      # webhook callbacks). The form-fill rail fails loud without it — give
+      # the local stack a working default; real deployments set their host.
+      - PUBLIC_BASE_URL=${PUBLIC_BASE_URL:-http://127.0.0.1:${HOST_PORT:-5000}}
+      # Fasten Connect (https://docs.connect.fastenhealth.com)
+      - FASTEN_PUBLIC_KEY=${FASTEN_PUBLIC_KEY:-}
+      - FASTEN_PRIVATE_KEY=${FASTEN_PRIVATE_KEY:-}
+      - FASTEN_WEBHOOK_SECRET=${FASTEN_WEBHOOK_SECRET:-}
+      # Set to "true" to run Curatr quality scan after each import
+      - FASTEN_CURATR_SCAN=${FASTEN_CURATR_SCAN:-false}
+      # Medplum upstream (optional — uncomment MEDPLUM_* vars in .env to use)
+      - MEDPLUM_BASE_URL=${MEDPLUM_BASE_URL:-}
+      - MEDPLUM_CLIENT_ID=${MEDPLUM_CLIENT_ID:-}
+      - MEDPLUM_CLIENT_SECRET=${MEDPLUM_CLIENT_SECRET:-}
+      # Telegram bot token (used by openclaw service)
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
+      # Wearables integration (optional — set to enable the poller)
+      - OPEN_WEARABLES_URL=${OPEN_WEARABLES_URL:-}
+      - OPEN_WEARABLES_API_KEY=${OPEN_WEARABLES_API_KEY:-}
+      - WEARABLES_POLL_INTERVAL=${WEARABLES_POLL_INTERVAL:-900}
+    depends_on:
+      redis:
+        condition: service_started
+      migrate:
+        condition: service_completed_successfully
+      seed-demo:
+        condition: service_completed_successfully
+    volumes:
+      - ./instance:/app/instance
+    networks:
+      - fhir-net
+
+  # Operator-controlled schema lifecycle. This one-shot container must finish
+  # before the web process starts; WSGI import never mutates the database.
+  migrate:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["flask", "--app", "main", "init-db"]
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      - FLASK_ENV=development
+      - SQLALCHEMY_DATABASE_URI=sqlite:///mcp_server.db
+      - REDIS_URL=redis://redis:6379/0
+      - STEP_UP_SECRET=${STEP_UP_SECRET:-dev-step-up-secret-change-in-production}
+    volumes:
+      - ./instance:/app/instance
+    networks:
+      - fhir-net
+
+  # Seeding remains separate from schema migration. It is idempotent and is
+  # appropriate only for this local synthetic desktop-demo stack.
+  seed-demo:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["flask", "--app", "main", "seed-demo", "--tenant-id", "desktop-demo"]
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      - FLASK_ENV=development
+      - SQLALCHEMY_DATABASE_URI=sqlite:///mcp_server.db
+      - REDIS_URL=redis://redis:6379/0
+      - STEP_UP_SECRET=${STEP_UP_SECRET:-dev-step-up-secret-change-in-production}
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    volumes:
+      - ./instance:/app/instance
+    networks:
+      - fhir-net
+
+  redis:
+    image: redis:7-alpine
+    command: redis-server --maxmemory 128mb --maxmemory-policy allkeys-lru
+    networks:
+      - fhir-net
+
+  careagents:
+    build:
+      context: .
+      dockerfile: deploy/careagents/Dockerfile
+    ports:
+      - "127.0.0.1:${CAREAGENTS_PORT:-8600}:8600"
+    environment:
+      - CARE_ROLE=web
+      - CARE_ENV=development
+      - CARE_DATABASE_URL=sqlite:////data/careagents.db
+      - HEALTHCLAW_BASE=http://fhir-mcp-guardrails:5000
+      - HEALTHCLAW_MINT_SECRET=${INTERNAL_TOKEN_MINT_SECRET:-dev-internal-secret-change-in-production}
+      - CARE_ORIGIN=http://localhost:${CAREAGENTS_PORT:-8600}
+      - CARE_RP_ID=localhost
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - CARE_RUN_WORKER_STALE_SECONDS=${CARE_RUN_WORKER_STALE_SECONDS:-30}
+    depends_on:
+      fhir-mcp-guardrails:
+        condition: service_started
+    volumes:
+      - careagents-data:/data
+    networks:
+      - fhir-net
+    profiles:
+      - careagents
+
+  careagents-worker:
+    build:
+      context: .
+      dockerfile: deploy/careagents/Dockerfile
+    # No `command:` — CARE_ROLE picks the process through the image's own CMD
+    # dispatch, exactly as production does (#276).
+    environment:
+      - CARE_ROLE=worker
+      - CARE_ENV=development
+      - CARE_DATABASE_URL=sqlite:////data/careagents.db
+      - HEALTHCLAW_BASE=http://fhir-mcp-guardrails:5000
+      - HEALTHCLAW_MINT_SECRET=${INTERNAL_TOKEN_MINT_SECRET:-dev-internal-secret-change-in-production}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - CARE_RUN_WORKERS=${CARE_RUN_WORKERS:-2}
+      - CARE_RUN_WORKER_STALE_SECONDS=${CARE_RUN_WORKER_STALE_SECONDS:-30}
+    depends_on:
+      fhir-mcp-guardrails:
+        condition: service_started
+      careagents:
+        condition: service_started
+    volumes:
+      - careagents-data:/data
+    networks:
+      - fhir-net
+    profiles:
+      - careagents
+
+  agent-orchestrator:
+    build:
+      context: ./services/agent-orchestrator
+      dockerfile: Dockerfile
+    ports:
+      - "127.0.0.1:3001:3001"
+    environment:
+      - NODE_ENV=production
+      - MCP_AUTH_TOKEN=${MCP_AUTH_TOKEN:?MCP_AUTH_TOKEN is required}
+      - MCP_PORT=3001
+      - FHIR_BASE_URL=http://fhir-mcp-guardrails:5000/r6/fhir
+      - TENANT_ID=${TENANT_ID:-desktop-demo}
+      - ALLOWED_ORIGINS=${ALLOWED_ORIGINS:-}
+      - RATE_LIMIT_MAX=${RATE_LIMIT_MAX:-120}
+    depends_on:
+      - fhir-mcp-guardrails
+    # node:20-slim ships no curl, so the probe uses node's global fetch.
+    # /health stays public even when MCP transports require bearer auth.
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:3001/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      start_period: 15s
+      retries: 3
+    networks:
+      - fhir-net
+
+  # Openclaw Telegram bot (requires TELEGRAM_BOT_TOKEN in .env)
+  openclaw:
+    build:
+      context: ./openclaw
+      dockerfile: Dockerfile
+    environment:
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - MCP_BASE_URL=http://agent-orchestrator:3001
+      - MCP_AUTH_TOKEN=${MCP_AUTH_TOKEN:?MCP_AUTH_TOKEN is required}
+      - FHIR_BASE_URL=http://fhir-mcp-guardrails:5000/r6/fhir
+      - REDIS_URL=redis://redis:6379/0
+      - STEP_UP_SECRET=${STEP_UP_SECRET}
+      - TENANT_ID=${TENANT_ID:-desktop-demo}
+    depends_on:
+      - agent-orchestrator
+      - redis
+    networks:
+      - fhir-net
+    profiles:
+      - openclaw
+
+  # HL7 FHIR Validator Wrapper (optional - for full $validate support)
+  # Uncomment when validator-wrapper Docker image is available
+  # validator:
+  #   image: hl7-org/fhir-validator-wrapper:latest
+  #   ports:
+  #     - "8080:8080"
+  #   environment:
+  #     - JAVA_OPTS=-Xmx512m
+  #   networks:
+  #     - fhir-net
+
+  # ─── Wearables integration (opt-in via `--profile wearables`) ───
+  # Runs the Open Wearables sidecar (https://github.com/the-momentum/open-wearables)
+  # alongside HealthClaw. HealthClaw's OPEN_WEARABLES_URL must be set to
+  # http://open-wearables:8000 in .env for the poller to activate.
+  open-wearables-db:
+    image: postgres:16-alpine
+    environment:
+      - POSTGRES_DB=openwearables
+      - POSTGRES_USER=openwearables
+      - POSTGRES_PASSWORD=${OPEN_WEARABLES_DB_PASSWORD:-openwearables-dev}
+    volumes:
+      - wearables-pg-data:/var/lib/postgresql/data
+    networks:
+      - fhir-net
+    profiles:
+      - wearables
+
+  open-wearables:
+    image: ghcr.io/the-momentum/open-wearables:latest
+    ports:
+      - "${OPEN_WEARABLES_PORT:-8000}:8000"
+    environment:
+      - DATABASE_URL=postgresql://openwearables:${OPEN_WEARABLES_DB_PASSWORD:-openwearables-dev}@open-wearables-db:5432/openwearables
+      - REDIS_URL=redis://redis:6379/1
+      - API_KEY=${OPEN_WEARABLES_API_KEY:-}
+      # Per-provider OAuth app creds — see https://github.com/the-momentum/open-wearables
+      - GARMIN_CLIENT_ID=${GARMIN_CLIENT_ID:-}
+      - GARMIN_CLIENT_SECRET=${GARMIN_CLIENT_SECRET:-}
+      - OURA_CLIENT_ID=${OURA_CLIENT_ID:-}
+      - OURA_CLIENT_SECRET=${OURA_CLIENT_SECRET:-}
+      - POLAR_CLIENT_ID=${POLAR_CLIENT_ID:-}
+      - POLAR_CLIENT_SECRET=${POLAR_CLIENT_SECRET:-}
+      - SUUNTO_CLIENT_ID=${SUUNTO_CLIENT_ID:-}
+      - SUUNTO_CLIENT_SECRET=${SUUNTO_CLIENT_SECRET:-}
+      - WHOOP_CLIENT_ID=${WHOOP_CLIENT_ID:-}
+      - WHOOP_CLIENT_SECRET=${WHOOP_CLIENT_SECRET:-}
+      - FITBIT_CLIENT_ID=${FITBIT_CLIENT_ID:-}
+      - FITBIT_CLIENT_SECRET=${FITBIT_CLIENT_SECRET:-}
+      - STRAVA_CLIENT_ID=${STRAVA_CLIENT_ID:-}
+      - STRAVA_CLIENT_SECRET=${STRAVA_CLIENT_SECRET:-}
+    depends_on:
+      - open-wearables-db
+      - redis
+    networks:
+      - fhir-net
+    profiles:
+      - wearables
+
+  open-wearables-worker:
+    image: ghcr.io/the-momentum/open-wearables:latest
+    command: celery -A app.worker worker --loglevel=info
+    environment:
+      - DATABASE_URL=postgresql://openwearables:${OPEN_WEARABLES_DB_PASSWORD:-openwearables-dev}@open-wearables-db:5432/openwearables
+      - REDIS_URL=redis://redis:6379/1
+      - API_KEY=${OPEN_WEARABLES_API_KEY:-}
+    depends_on:
+      - open-wearables
+    networks:
+      - fhir-net
+    profiles:
+      - wearables
+
+  # ─── SMART Health Links storage server (opt-in via `--profile shl`) ───
+  # jmandel/kill-the-clipboard-skill (MIT, pinned fa0020d).
+  # Zero-knowledge: the server stores only ciphertext + sha256(auth) — it
+  # cannot read PHI. MCP does client-side AES-256-GCM before uploading.
+  shl-server:
+    build:
+      context: ./services/shl-server
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      - BASE_URL=${SHL_PUBLIC_URL:-http://localhost:8000}
+      - DB_PATH=/data/db.sqlite
+    volumes:
+      - shl-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 5s
+      start_period: 15s
+      retries: 3
+    networks:
+      - fhir-net
+    profiles:
+      - shl
+
+networks:
+  fhir-net:
+    driver: bridge
+
+volumes:
+  wearables-pg-data:
+  shl-data:
+  careagents-data:

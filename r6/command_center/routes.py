@@ -1,0 +1,705 @@
+"""
+Flask Blueprint for the command center.
+
+Routes:
+    GET  /command-center                                  — HTML dashboard page
+    GET  /command-center?t=<signed-token>                 — signed-link login
+    GET  /command-center/login                            — link-required page
+    GET  /command-center/api/overview?tenant=<id>         — hero stats
+    GET  /command-center/api/readiness?tenant=<id>        — 5-stage pipeline
+    GET  /command-center/api/actions?tenant=<id>          — audit event stream
+    GET  /command-center/api/sources?tenant=<id>          — data sources
+    GET  /command-center/api/sources-summary?tenant=<id>  — all 7 sources + per-type counts
+    GET  /command-center/api/skills?tenant=<id>           — skills status
+    GET  /command-center/api/agents?tenant=<id>           — agent personas + stats
+    GET  /command-center/api/conversations?tenant=<id>    — recent chat turns
+    GET  /command-center/api/tasks?tenant=<id>            — pending tasks
+    GET  /command-center/api/insights?tenant=<id>         — derived insights
+    GET  /command-center/api/system                       — Flask/MCP/gateway/redis probes
+                                                            (operator-only: X-Internal-Secret)
+    GET  /command-center/api/openclaw/sessions            — gateway-wide chat sessions
+                                                            (operator-only: X-Internal-Secret)
+    POST /command-center/api/conversations                — log a chat turn
+    POST /command-center/api/tasks                        — create a task
+    PATCH /command-center/api/tasks/<id>                  — update status
+    POST /command-center/api/generate-link                — mint a signed dashboard URL
+    POST /command-center/logout                           — clear session tenant
+"""
+
+from __future__ import annotations
+
+import logging
+import re
+from datetime import datetime, timezone
+
+from flask import (
+    Blueprint, jsonify, redirect, render_template, request, session, url_for
+)
+from sqlalchemy.exc import IntegrityError
+
+from models import db
+from r6.command_center import projector, access, gateway
+from r6.audit import add_audit_event
+from r6.internal_auth import internal_secret_authorized
+from r6.command_center.models import (
+    KNOWN_CHANNELS,
+    AgentTask,
+    Conversation,
+    ConversationMessage,
+    default_conversation_id,
+)
+from r6.command_center.agents import load_agents, load_agent_templates, get_agent
+from r6.access import (Scope, Tenant, TenantRejected, TenantSource,
+                       decide_grant, public_step_up_reason,
+                       tenant_from_request)
+from r6.read_auth import TENANT_SESSION_KEY, authorize_tenant_read
+
+logger = logging.getLogger(__name__)
+
+_CONVERSATION_ID = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
+_REQUEST_ID = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
+
+command_center_blueprint = Blueprint(
+    "command_center",
+    __name__,
+    url_prefix="/command-center",
+)
+
+DEFAULT_TENANT = "desktop-demo"
+SESSION_KEY = TENANT_SESSION_KEY
+
+
+def _tenant() -> str | None:
+    """
+    Resolve the active tenant for the current request. Priority:
+    1. Session (set after a signed-link login) — authoritative
+    2. Valid X-Step-Up-Token for the requested tenant — server-to-server auth
+    3. ?tenant= query param / X-Tenant-Id header — ONLY for public tenants
+    4. DEFAULT_TENANT (desktop-demo)
+
+    Non-public tenants require a matching session, step-up token, or SMART
+    OAuth bearer. An unauthorized claim returns None; callers reject it
+    without querying any tenant data.
+    """
+    # A malformed id is None, not a 400: authorize_tenant_read refuses the
+    # same pattern before it consults any credential, so it always was.
+    try:
+        candidate = tenant_from_request(
+            sources=(TenantSource.SESSION, TenantSource.QUERY,
+                     TenantSource.HEADER),
+            default=DEFAULT_TENANT, query_keys=("tenant",)).id
+    except TenantRejected:
+        return None
+    return authorize_tenant_read(
+        candidate,
+        session_tenant=session.get(SESSION_KEY),
+        always_require=True,
+    )
+
+
+def _require_session_or_public():
+    """
+    Guard for /api/* endpoints. Returns a (jsonify, code) tuple to abort with,
+    or None if the request is allowed to proceed.
+
+    Rule: the resolved tenant must either be public (desktop-demo), match
+    the authenticated session, OR the request must carry a valid step-up
+    token for that tenant (server-to-server clients — Telegram bot, Kristy
+    watcher, OpenClaw).
+    """
+    if _tenant() is not None:
+        return None
+    return jsonify({"error": "authentication required for this tenant"}), 401
+
+
+# ---------------------------------------------------------------------------
+# HTML pages
+# ---------------------------------------------------------------------------
+
+@command_center_blueprint.route("", methods=["GET"])
+@command_center_blueprint.route("/", methods=["GET"])
+def dashboard():
+    # Signed-link login — exchange `?t=<token>` for a session and redirect
+    # to a clean URL (so the token doesn't linger in browser history).
+    token = request.args.get("t")
+    if token:
+        payload = access.verify_access_token(token)
+        if payload:
+            session[SESSION_KEY] = payload["tenant_id"]
+            return redirect(
+                url_for("command_center.dashboard", tenant=payload["tenant_id"])
+            )
+        return render_template(
+            "command_center_login.html",
+            error="This link has expired or is invalid. Request a fresh one — see below.",
+        ), 401
+
+    tenant = _tenant()
+    if tenant is None:
+        requested = (
+            request.args.get("tenant")
+            or request.headers.get("X-Tenant-Id")
+            or DEFAULT_TENANT
+        )
+        return render_template(
+            "command_center_login.html",
+            error=None,
+            tenant=requested,
+        ), 401
+
+    return render_template(
+        "command_center.html",
+        tenant_id=tenant,
+        agents=load_agents(),
+    )
+
+
+@command_center_blueprint.route("/login", methods=["GET"])
+def login_page():
+    """Standalone landing for users who don't have a link yet."""
+    return render_template("command_center_login.html", error=None)
+
+
+@command_center_blueprint.route("/logout", methods=["POST", "GET"])
+def logout():
+    session.pop(SESSION_KEY, None)
+    return redirect(url_for("command_center.dashboard"))
+
+
+# ---------------------------------------------------------------------------
+# Read APIs
+# ---------------------------------------------------------------------------
+
+@command_center_blueprint.route("/api/overview", methods=["GET"])
+def api_overview():
+    if (err := _require_session_or_public()):
+        return err
+    return jsonify(projector.overview(_tenant()))
+
+
+@command_center_blueprint.route("/api/readiness", methods=["GET"])
+def api_readiness():
+    if (err := _require_session_or_public()):
+        return err
+    return jsonify(projector.readiness(_tenant()))
+
+
+@command_center_blueprint.route("/api/actions", methods=["GET"])
+def api_actions():
+    if (err := _require_session_or_public()):
+        return err
+    limit = min(int(request.args.get("limit", "20")), 100)
+    return jsonify(projector.latest_actions(_tenant(), limit=limit))
+
+
+@command_center_blueprint.route("/api/sources", methods=["GET"])
+def api_sources():
+    if (err := _require_session_or_public()):
+        return err
+    return jsonify(projector.data_sources(_tenant()))
+
+
+@command_center_blueprint.route("/api/sources-summary", methods=["GET"])
+def api_sources_summary():
+    """All 7 data sources + per-resource-type record counts in one call."""
+    if (err := _require_session_or_public()):
+        return err
+    return jsonify(projector.sources_summary(_tenant()))
+
+
+@command_center_blueprint.route("/api/skills", methods=["GET"])
+def api_skills():
+    if (err := _require_session_or_public()):
+        return err
+    return jsonify(projector.skills_status(_tenant()))
+
+
+@command_center_blueprint.route("/api/agents", methods=["GET"])
+def api_agents():
+    if (err := _require_session_or_public()):
+        return err
+    agents = projector.agents_status(_tenant())
+    # Redact telegram handles for unauthenticated (public-tenant) responses.
+    # Personal bot handles are only shown to an authenticated session.
+    if not session.get(SESSION_KEY):
+        for a in agents:
+            a.pop("telegram", None)
+    return jsonify(agents)
+
+
+@command_center_blueprint.route("/api/conversations", methods=["GET"])
+def api_conversations_list():
+    if (err := _require_session_or_public()):
+        return err
+    limit = min(int(request.args.get("limit", "15")), 100)
+    full = request.args.get("full") in ("1", "true")
+    through_message_id = request.args.get("through_message_id") or None
+    if through_message_id is not None and (
+            not isinstance(through_message_id, str)
+            or not _REQUEST_ID.fullmatch(through_message_id)):
+        return jsonify({"error": "invalid through_message_id"}), 400
+    return jsonify(projector.recent_conversations(
+        _tenant(), limit=limit, full=full,
+        conversation_id=request.args.get("conversation_id") or None,
+        agent_id=request.args.get("agent_id") or None,
+        through_message_id=through_message_id,
+    ))
+
+
+@command_center_blueprint.route("/api/tasks", methods=["GET"])
+def api_tasks_list():
+    if (err := _require_session_or_public()):
+        return err
+    limit = min(int(request.args.get("limit", "20")), 100)
+    return jsonify(projector.pending_tasks(_tenant(), limit=limit))
+
+
+@command_center_blueprint.route("/api/insights", methods=["GET"])
+def api_insights():
+    if (err := _require_session_or_public()):
+        return err
+    limit = min(int(request.args.get("limit", "10")), 50)
+    return jsonify(projector.insights(_tenant(), limit=limit))
+
+
+def _require_operator():
+    """Gateway-wide infrastructure reads are operator-only (SEC941-PRE1).
+
+    /api/system and /api/openclaw/sessions describe the whole OpenClaw
+    gateway, not one tenant: its URL and every chat session on it, with the
+    Telegram/iMessage/WhatsApp peer handles. Gateway sessions carry no
+    reliable tenant binding, so no tenant credential can scope them, and a
+    public-tenant step-up token is minted for free. Only the internal
+    secret opens them, the same tenant-blind gate as /r6/ops (#304).
+    """
+    if internal_secret_authorized():
+        return None
+    return jsonify(
+        {"error": "operator endpoint: X-Internal-Secret required"}), 403
+
+
+@command_center_blueprint.route("/api/system", methods=["GET"])
+def api_system():
+    if (err := _require_operator()):
+        return err
+    return jsonify(projector.system_status())
+
+
+@command_center_blueprint.route("/api/agent-templates", methods=["GET"])
+def api_agent_templates():
+    """Return the full agent template catalog (templates + bundles)."""
+    # Template catalog is non-sensitive (doesn't reveal the active deployment).
+    return jsonify(load_agent_templates())
+
+
+@command_center_blueprint.route("/api/openclaw/sessions", methods=["GET"])
+def api_openclaw_sessions():
+    """Live list of OpenClaw chat sessions pulled from the gateway RPC."""
+    # Gateway URL + session list reveal the Mac mini's address and every
+    # ongoing chat's peer handle — operator-only.
+    if (err := _require_operator()):
+        return err
+    return jsonify({
+        "gateway": gateway.probe().to_dict(),
+        "sessions": gateway.list_sessions(),
+    })
+
+
+# ---------------------------------------------------------------------------
+# Write APIs — used by Telegram bot + any future channel to persist activity
+# ---------------------------------------------------------------------------
+
+def _padded_token_reason(raw: str) -> str | None:
+    """Today's refusal for a whitespace-padded step-up token, or None.
+
+    The kernel strips the token before validating it (#334), so it calls a
+    whitespace-only token absent and grants a padded valid one. This site
+    never stripped: the validator saw the raw header and refused both. #655
+    moves the site onto the kernel without changing its answers, so the two
+    sentences the validator gave are kept here, exactly: no dot means
+    "Malformed step-up token" (which covers whitespace-only), and a dot
+    means the signature never matches. Dropping this is a behaviour change
+    for its own PR.
+    """
+    if raw == raw.strip():
+        return None
+    if "." not in raw:
+        return public_step_up_reason("Malformed step-up token")
+    return public_step_up_reason("Invalid token signature")
+
+
+def _authz_write(tenant_id: str) -> tuple | None:
+    """
+    Allow a write to `tenant_id` if either:
+      (a) the request carries a valid X-Step-Up-Token for that tenant
+          (server-to-server clients — Telegram bot, OpenClaw, MCP), OR
+      (b) the request has an authenticated browser session for that tenant.
+
+    Returns (jsonify, code) to abort with, or None to proceed.
+    """
+    step_up = request.headers.get("X-Step-Up-Token")
+    if step_up:
+        # #655: the kernel decides, and keeps the classified reason this
+        # site publishes. decide_grant's reason already went through
+        # public_step_up_reason, so 'Token tenant mismatch' still reaches
+        # the caller as the generic sentence (#508).
+        #
+        # The tenant is the id the caller handed this function (body or
+        # header on create, the task row on update), bound as given and NOT
+        # format-checked — as r6/agent_runs/routes.py:_tenant_authorized
+        # does. A malformed id was never a 400 here; it is a token that
+        # fails, or passes, its tenant binding, and it stays that.
+        reason = _padded_token_reason(step_up)
+        if reason is None:
+            decision = decide_grant(
+                scope=Scope.WRITE,
+                tenant=Tenant(id=tenant_id, source=TenantSource.DEFAULT))
+            if decision.granted:
+                return None
+            reason = decision.reason
+        return jsonify({"error": f"step-up token rejected: {reason}"}), 401
+    if session.get(SESSION_KEY) == tenant_id:
+        return None
+    return jsonify({
+        "error": "authentication required (session cookie or X-Step-Up-Token)"
+    }), 401
+
+
+def _create_conversation(tenant_id, conversation_id, agent_id, channel):
+    """Create the conversation row, or return the one a concurrent first
+    turn created a moment earlier.
+
+    The caller's SELECT found no row, but two first turns of the same new
+    thread (a double-tapped send, two surfaces) both get that answer. A plain
+    INSERT then made the loser fail on pk_cc_conversations, a 500 that
+    CareAgents reported as "message store unavailable".
+
+    INSERT ... ON CONFLICT DO NOTHING, then read the row back. On Postgres
+    the loser's INSERT waits for the winner's transaction and then does
+    nothing; the read that follows sees the committed row. On SQLite writers
+    are serialised, so the loser inserts after the winner commits and does
+    nothing. Not a SAVEPOINT: on pysqlite a savepoint opened here starts its
+    own transaction, and releasing it commits the row on its own, outside
+    the request's transaction (and see #859 on SAVEPOINT locking).
+    """
+    values = {"id": conversation_id, "tenant_id": tenant_id,
+              "agent_id": agent_id, "created_by_surface": channel}
+    dialect = db.session.get_bind(mapper=Conversation).dialect.name
+    if dialect == "postgresql":
+        from sqlalchemy.dialects.postgresql import insert
+    elif dialect == "sqlite":
+        from sqlalchemy.dialects.sqlite import insert
+    else:  # pragma: no cover - only Postgres and SQLite are deployed
+        conversation = Conversation(**values)
+        db.session.add(conversation)
+        return conversation
+    db.session.execute(
+        insert(Conversation).values(**values)
+        .on_conflict_do_nothing(index_elements=["tenant_id", "id"]))
+    return Conversation.query.filter_by(
+        tenant_id=tenant_id, id=conversation_id).one()
+
+
+@command_center_blueprint.route("/api/conversations", methods=["POST"])
+def api_conversations_create():
+    """
+    Log a single conversation turn. Requires either a valid step-up token
+    or a browser session for the target tenant.
+
+    Body:
+        tenant_id: str (required)
+        conversation_id: str (optional; stable tenant default when omitted)
+        agent_id: str (optional, opaque tenant-scoped identity)
+        channel/surface: str (telegram|mcp|api|web|imessage)
+        session_id: str (e.g. telegram chat_id)
+        user_id: str
+        request_id: str (optional idempotency key for an inbound user message)
+        reply_to: str (optional parent message id)
+        role: str (user|assistant|system, required)
+        text: str (required)
+        metadata: dict (optional)
+    """
+    body = request.get_json(silent=True) or {}
+
+    tenant_id = body.get("tenant_id") or request.headers.get("X-Tenant-Id")
+    role = body.get("role")
+    text = body.get("text")
+    if not tenant_id or not role or text is None:
+        return jsonify({"error": "tenant_id, role, and text are required"}), 400
+
+    if (err := _authz_write(tenant_id)):
+        return err
+
+    agent_id = body.get("agent_id")
+    if agent_id is not None and (
+            not isinstance(agent_id, str) or not 1 <= len(agent_id) <= 64):
+        return jsonify({"error": "invalid agent_id"}), 400
+    conversation_id = body.get("conversation_id") or default_conversation_id(
+        tenant_id, agent_id)
+    request_id = body.get("request_id")
+    reply_to = body.get("reply_to")
+    channel = body.get("surface") or body.get("channel", "unknown")
+
+    if not isinstance(conversation_id, str) or not _CONVERSATION_ID.fullmatch(
+            conversation_id):
+        return jsonify({"error": "invalid conversation_id"}), 400
+    if request_id is not None and (
+            not isinstance(request_id, str)
+            or not _REQUEST_ID.fullmatch(request_id)):
+        return jsonify({"error": "invalid request_id"}), 400
+    if role not in ("user", "assistant", "system"):
+        return jsonify({"error": "role must be user, assistant, or system"}), 400
+    if not isinstance(text, str):
+        return jsonify({"error": "text must be a string"}), 400
+    if not isinstance(channel, str) or channel not in KNOWN_CHANNELS:
+        # A closed list, not a length: the value is copied into audit detail.
+        # The type check comes first: `in` on a list or an object raised
+        # TypeError (unhashable), a 500 instead of this 400 (R884-2).
+        return jsonify({"error": "invalid channel/surface"}), 400
+
+    conversation = Conversation.query.filter_by(
+        tenant_id=tenant_id, id=conversation_id).first()
+    if conversation is None:
+        conversation = _create_conversation(
+            tenant_id, conversation_id, agent_id, channel)
+    if conversation.agent_id != agent_id:
+        return jsonify({"error": "conversation belongs to another agent"}), 409
+
+    if request_id:
+        prior = ConversationMessage.query.filter_by(
+            tenant_id=tenant_id,
+            conversation_id=conversation_id,
+            request_id=request_id,
+        ).first()
+        if prior is not None:
+            if (prior.role != role or prior.text != text
+                    or prior.agent_id != agent_id):
+                return jsonify({
+                    "error": "request_id was already used for another message"
+                }), 409
+            replay = prior.to_dict()
+            replay["idempotent_replay"] = True
+            return jsonify(replay), 200
+
+    if reply_to:
+        parent = ConversationMessage.query.filter_by(
+            id=reply_to,
+            tenant_id=tenant_id,
+            conversation_id=conversation_id,
+        ).first()
+        if parent is None:
+            return jsonify({"error": "reply_to is outside the conversation"}), 400
+
+    import json as _json
+    md = body.get("metadata")
+    metadata_json = _json.dumps(md) if isinstance(md, (dict, list)) else None
+
+    msg = ConversationMessage(
+        tenant_id=tenant_id,
+        conversation_id=conversation_id,
+        agent_id=agent_id,
+        channel=channel,
+        session_id=body.get("session_id"),
+        user_id=body.get("user_id"),
+        role=role,
+        text=text,
+        request_id=request_id,
+        reply_to=reply_to,
+        metadata_json=metadata_json,
+    )
+    db.session.add(msg)
+    conversation.updated_at = datetime.now(timezone.utc)
+    # add_audit_event, not record_audit_event: it flushes inside THIS
+    # transaction so the message and its audit row commit or roll back
+    # together. record_audit_event commits after the caller has already
+    # committed, which fails open on the data and closed on the response —
+    # a write persisted and unaudited. tests/test_ratchets.py enforces the
+    # choice for every new call site.
+    #
+    # The flush above assigns msg.id, so the audit can name the row it is
+    # evidence for.
+    db.session.flush()
+    # DETAIL IS PHI-FREE, and that is load-bearing here more than anywhere
+    # else in the repo: `text` is the conversation turn itself. Ids, role,
+    # channel and a length — never the message. CLAUDE.md treats chat
+    # transcripts as PHI-adjacent, and the audit trail is the one store
+    # whose whole contract is that it holds none.
+    add_audit_event(
+        "create", "ConversationMessage", msg.id,
+        agent_id=agent_id,
+        tenant_id=tenant_id,
+        detail=(f"conversation={conversation_id} role={role} "
+                f"channel={channel} chars={len(text)}"),
+    )
+    try:
+        db.session.commit()
+    except IntegrityError:
+        db.session.rollback()
+        # Two workers may claim the same inbound request concurrently. The
+        # database uniqueness constraint is authoritative; return the winner
+        # instead of leaking a 500 or running the agent twice.
+        if request_id:
+            prior = ConversationMessage.query.filter_by(
+                tenant_id=tenant_id,
+                conversation_id=conversation_id,
+                request_id=request_id,
+            ).first()
+            if prior is not None:
+                if (prior.role != role or prior.text != text
+                        or prior.agent_id != agent_id):
+                    return jsonify({
+                        "error": "request_id was already used for another message"
+                    }), 409
+                replay = prior.to_dict()
+                replay["idempotent_replay"] = True
+                return jsonify(replay), 200
+        raise
+    created = msg.to_dict()
+    created["idempotent_replay"] = False
+    return jsonify(created), 201
+
+
+@command_center_blueprint.route("/api/tasks", methods=["POST"])
+def api_tasks_create():
+    """
+    Create a new pending task.
+
+    Body:
+        tenant_id: str (required)
+        agent_id: str (required)
+        title: str (required)
+        description: str
+        priority: low|medium|high|critical
+        resource_ref: str (FHIR ref like "Condition/abc")
+        source: str (free-form, e.g. "curatr", "care-gap", "telegram")
+    """
+    body = request.get_json(silent=True) or {}
+
+    tenant_id = body.get("tenant_id") or request.headers.get("X-Tenant-Id")
+    agent_id = body.get("agent_id")
+    title = body.get("title")
+    if not tenant_id or not agent_id or not title:
+        return jsonify({"error": "tenant_id, agent_id, and title are required"}), 400
+    if not get_agent(agent_id):
+        return jsonify({"error": f"unknown agent_id: {agent_id}"}), 400
+
+    if (err := _authz_write(tenant_id)):
+        return err
+
+    task = AgentTask(
+        tenant_id=tenant_id,
+        agent_id=agent_id,
+        title=title[:256],
+        description=body.get("description"),
+        priority=body.get("priority", "medium"),
+        resource_ref=body.get("resource_ref"),
+        source=body.get("source"),
+    )
+    db.session.add(task)
+    db.session.flush()
+    # `title` is caller-supplied free text and may name a condition, so the
+    # detail carries its length rather than its content.
+    add_audit_event(
+        "create", "AgentTask", task.id,
+        agent_id=agent_id,
+        tenant_id=tenant_id,
+        detail=f"priority={task.priority} title_chars={len(title)}",
+    )
+    db.session.commit()
+    return jsonify(task.to_dict()), 201
+
+
+@command_center_blueprint.route("/api/tasks/<task_id>", methods=["PATCH"])
+def api_tasks_update(task_id: str):
+    """
+    Update a task's status. Body: {status: pending|in_progress|completed|dismissed}.
+    """
+    body = request.get_json(silent=True) or {}
+    new_status = body.get("status")
+    if new_status not in ("pending", "in_progress", "completed", "dismissed"):
+        return jsonify({"error": "status must be one of pending|in_progress|completed|dismissed"}), 400
+
+    task = AgentTask.query.filter_by(id=task_id).first()
+    if not task:
+        return jsonify({"error": "task not found"}), 404
+
+    if (err := _authz_write(task.tenant_id)):
+        return err
+
+    task.status = new_status
+    task.updated_at = datetime.now(timezone.utc)
+    add_audit_event(
+        "update", "AgentTask", task.id,
+        agent_id=task.agent_id,
+        # task.tenant_id, not a header: this handler authorizes against the
+        # row it loaded, so the audit records the tenant the write actually
+        # touched rather than one the caller asserted.
+        tenant_id=task.tenant_id,
+        detail=f"status={task.status}",
+    )
+    db.session.commit()
+    return jsonify(task.to_dict())
+
+
+# ---------------------------------------------------------------------------
+# Signed-link minting — used by the Telegram bot to send shareable URLs
+# ---------------------------------------------------------------------------
+
+@command_center_blueprint.route("/api/generate-link", methods=["POST"])
+def api_generate_link():
+    """
+    Mint a signed dashboard URL. Requires a valid step-up token (so only
+    the bot owner / authorized agents can create links).
+
+    Body:
+        tenant_id: str (required)
+        agent_id:  str (optional — informational, not enforced)
+        base_url:  str (optional — override; defaults to request.host_url)
+
+    Headers:
+        X-Step-Up-Token: valid HMAC step-up token for tenant_id
+
+    Returns:
+        {url, token, expires_in_hours, tenant_id}
+    """
+    body = request.get_json(silent=True) or {}
+    tenant_id = body.get("tenant_id")
+    if not tenant_id:
+        return jsonify({"error": "tenant_id required"}), 400
+
+    # Public tenants don't need a token — anyone can link to the demo
+    if not access.is_public(tenant_id):
+        step_up = request.headers.get("X-Step-Up-Token")
+        if not step_up:
+            return jsonify({
+                "error": "X-Step-Up-Token required for non-public tenants"
+            }), 401
+        # #655: the kernel decides, as in _authz_write above — the same
+        # padded-token answers kept, the same tenant bound as given, and
+        # the reason already classified (#508).
+        reason = _padded_token_reason(step_up)
+        if reason is None:
+            decision = decide_grant(
+                scope=Scope.WRITE,
+                tenant=Tenant(id=tenant_id, source=TenantSource.DEFAULT))
+            if not decision.granted:
+                reason = decision.reason
+        if reason is not None:
+            return jsonify({"error": f"step-up token rejected: {reason}"}), 401
+
+    import os
+    base_url = (
+        body.get("base_url")
+        or os.environ.get("DASHBOARD_BASE_URL", "").strip()
+        or request.host_url.rstrip("/")
+    )
+    agent_id = body.get("agent_id")
+    url = access.build_dashboard_url(base_url, tenant_id, agent_id=agent_id)
+    token = access.generate_access_token(tenant_id, agent_id=agent_id)
+
+    return jsonify({
+        "url": url,
+        "token": token,
+        "expires_in_hours": access.DASHBOARD_TTL_HOURS,
+        "tenant_id": tenant_id,
+    })

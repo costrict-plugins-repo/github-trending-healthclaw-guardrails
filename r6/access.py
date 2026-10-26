@@ -1,0 +1,1899 @@
+"""Access kernel — one tenant reader, one step-up gate, one audit call, one
+FHIR exit.
+
+Implements `docs/2026-08-03-access-kernel-spec.md` §1. It landed as slice 1
+adopted by nothing, and production modules have been adopting it since, one
+guard and one blueprint at a time, per
+`docs/2026-08-03-refactor-working-protocol.md`. The sites that still call
+`validate_step_up_token` directly are counted by `tests/test_ratchets.py`.
+
+Each primitive below enforces exactly ONE property, named in its docstring.
+Anything the primitive does not promise stays the caller's job — the point of
+the kernel is that a reviewer can tell those apart without reading the
+implementation.
+
+§1.0 — collaborators are resolved by MODULE ATTRIBUTE, never by
+`from r6.stepup import validate_step_up_token`. 33 tests monkeypatch
+`r6.stepup.*` by module path; a direct import binds at import time and those
+tests would keep passing while patching an object this module no longer
+consults. That is the quietest way the migration can fail.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import logging
+import os
+import re
+from dataclasses import dataclass
+from enum import Enum
+
+from flask import g, has_app_context, jsonify, request, session
+from sqlalchemy.exc import SQLAlchemyError
+
+from models import db
+from r6 import audit as _audit_mod
+from r6 import fhir_proxy as _fhir_proxy_mod
+from r6 import health_compliance as _compliance_mod
+from r6 import redaction as _redaction_mod
+from r6 import stepup as _stepup_mod
+from r6 import terminology as _terminology_mod
+from r6.safe_read import coding_system as _coding_system
+from r6.models import AuditEventRecord
+from r6.log_safety import loggable_id
+from r6.read_auth import TENANT_SESSION_KEY
+
+logger = logging.getLogger(__name__)
+
+__all__ = [
+    'TenantSource', 'Tenant', 'TenantRejected', 'tenant_from_request',
+    'Scope', 'Grant', 'StepUpDenied', 'require_grant', 'has_grant',
+    'public_step_up_reason',
+    'TenantClosed', 'require_open_tenant',
+    'register_error_handlers',
+    'audit', 'AuditAssertionError',
+    'install_audit_assertions', 'install_read_audit_assertion',
+    'Profile', 'fhir_response', 'unredacted_response', 'outcome_response',
+]
+
+# The tenant-id format enforced everywhere. Same character class as
+# r6/routes.py:239 (_TENANT_ID_PATTERN) — this module is where it becomes the
+# only one.
+_TENANT_ID_PATTERN = re.compile(r'[A-Za-z0-9_-]{1,64}')
+
+_TRUE_VALUES = frozenset({'1', 'true', 'yes'})
+
+
+# ---------------------------------------------------------------------------
+# §1.1 Tenant
+# ---------------------------------------------------------------------------
+
+class TenantSource(Enum):
+    """Where an endpoint is willing to learn its tenant from.
+
+    Not a ranking and not a security level. Naming the source is what makes
+    "this endpoint reads the tenant from the body" a reviewable fact instead
+    of a line of code someone has to find.
+    """
+
+    SESSION = 'session'   # command-center signed-link cookie (TENANT_SESSION_KEY)
+    HEADER = 'header'     # X-Tenant-Id
+    QUERY = 'query'       # ?tenant_id= / ?tenant= / ?t=
+    BODY = 'body'         # {"tenant_id": ...}
+    SHARP = 'sharp'       # synthesized from X-FHIR-Server-URL (routes.py:223-228)
+    DEFAULT = 'default'   # a literal fallback the endpoint supplies
+
+
+@dataclass(frozen=True)
+class Tenant:
+    """A tenant id that passed format validation, plus where it came from.
+
+    Carrying the source lets an audit row and a log line say which input
+    selected the tenant. It does NOT mean the caller is authorized to act on
+    that tenant — see require_grant and r6.read_auth.
+    """
+
+    id: str
+    source: TenantSource
+
+
+class TenantRejected(Exception):
+    """The request did not supply a usable tenant id.
+
+    reason: 'absent' | 'malformed'. The two map to different FHIR
+    OperationOutcome codes ('security' vs 'invalid'), both at HTTP 400,
+    matching r6/routes.py:230-247 exactly.
+    """
+
+    ABSENT = 'absent'
+    MALFORMED = 'malformed'
+
+    def __init__(self, reason: str):
+        if reason not in (self.ABSENT, self.MALFORMED):
+            raise ValueError(
+                "TenantRejected reason must be 'absent' or 'malformed'")
+        super().__init__(reason)
+        self.reason = reason
+
+
+def _session_tenant() -> str | None:
+    return session.get(TENANT_SESSION_KEY)
+
+
+def _sharp_tenant() -> str | None:
+    """Synthesize the SHARP tenant, exactly as r6/routes.py:223-228 does.
+
+    Gated on is_sharp_context_active(), which is the SSRF guard: an
+    unvalidated upstream URL must never mint a tenant.
+    """
+    if not _fhir_proxy_mod.is_sharp_context_active():
+        return None
+    raw = request.headers.get(_fhir_proxy_mod.SHARP_SERVER_URL_HEADER) or ''
+    digest = hashlib.sha256(raw.strip().encode('utf-8')).hexdigest()[:16]
+    return f'sharp-{digest}'
+
+
+def tenant_from_request(
+    *,
+    sources: tuple[TenantSource, ...] = (TenantSource.HEADER,),
+    default: str | None = None,
+    query_keys: tuple[str, ...] = ('tenant_id',),
+    body_key: str = 'tenant_id',
+) -> Tenant:
+    """Return the tenant this request names, in the caller's declared order.
+
+    THE ONE PROPERTY: the returned id matched ``[A-Za-z0-9_-]{1,64}`` and
+    came from a source this endpoint declared it accepts. Nothing else.
+
+    ``sources`` is an ORDERED tuple, not a set. The first source in the tuple
+    that yields a non-empty value wins. A set would force the kernel to
+    invent a precedence, and the invented one differs from
+    r6/command_center/routes.py:76-82 (session, then query, then header) —
+    adopting it would silently change which tenant that page renders when a
+    caller sends both. Ordering is per endpoint because today it already is.
+
+    Raises TenantRejected('absent') when no declared source yields a value
+    and ``default`` is None. Raises TenantRejected('malformed') when a source
+    yields a value that fails the pattern — including a value that came from
+    ``default``, so a typo'd literal fails loudly rather than at query time.
+
+    TenantSource.DEFAULT is only consulted when ``default`` is not None, and
+    it is always last regardless of its position in ``sources``.
+    """
+    for source in sources:
+        if source is TenantSource.DEFAULT:
+            # Always last, regardless of its position in `sources`.
+            continue
+        value = _read_source(source, query_keys=query_keys, body_key=body_key)
+        if value:
+            return _validated(value, source)
+
+    if default is not None:
+        return _validated(default, TenantSource.DEFAULT)
+
+    raise TenantRejected(TenantRejected.ABSENT)
+
+
+def _read_source(source: TenantSource, *, query_keys: tuple[str, ...],
+                 body_key: str) -> str | None:
+    """Return the raw, unvalidated value one declared source offers."""
+    if source is TenantSource.SESSION:
+        return _session_tenant()
+    if source is TenantSource.HEADER:
+        return request.headers.get('X-Tenant-Id')
+    if source is TenantSource.QUERY:
+        for key in query_keys:
+            value = request.args.get(key)
+            if value:
+                return value
+        return None
+    if source is TenantSource.BODY:
+        body = request.get_json(silent=True)
+        if not isinstance(body, dict):
+            return None
+        value = body.get(body_key)
+        return value if isinstance(value, str) else None
+    if source is TenantSource.SHARP:
+        return _sharp_tenant()
+    raise ValueError(f'unhandled tenant source: {source!r}')
+
+
+def _validated(value: str, source: TenantSource) -> Tenant:
+    # Deliberately NOT stripped. r6/routes.py:239 matches the raw header, so a
+    # leading space is malformed there and must stay malformed here; trimming
+    # would widen the accepted set during migration.
+    if not isinstance(value, str) or not _TENANT_ID_PATTERN.fullmatch(value):
+        raise TenantRejected(TenantRejected.MALFORMED)
+    return Tenant(id=value, source=source)
+
+
+# ---------------------------------------------------------------------------
+# §1.2 Scope, Grant, require_grant
+# ---------------------------------------------------------------------------
+
+class Scope(Enum):
+    """What a step-up token must be able to authorize.
+
+    TENANT_BOUND maps to validate_step_up_token(require_scope=None) and
+    accepts a read-scoped token. WRITE maps to require_scope='write' and
+    accepts only a scope in r6.stepup.WRITE_SCOPES, so it rejects a
+    read-scoped token and any scope it does not know (FHI-57). The names say what the check does, not what the caller
+    wishes it did — the exact mistake behind _RESOURCE_ID_PATTERN.
+    """
+
+    TENANT_BOUND = 'tenant-bound'   # r6/read_auth.py:88-93 needs this
+    WRITE = 'write'                 # every write gate today
+
+
+#: Scope -> the `require_scope` argument validate_step_up_token expects.
+_SCOPE_REQUIREMENT: dict[Scope, str | None] = {
+    Scope.TENANT_BOUND: None,
+    Scope.WRITE: 'write',
+}
+
+
+@dataclass(frozen=True)
+class Grant:
+    """Proof that a step-up token authorized THIS tenant for THIS scope.
+
+    Frozen and carrying tenant_id so a handler scopes its query to
+    grant.tenant_id rather than re-reading a header. It does not make the
+    handler do that — see the spec §3(e).
+    """
+
+    tenant_id: str
+    scope: Scope
+    audience: str | None
+    operation: str | None
+    nonce_consumed: bool
+
+
+class StepUpDenied(Exception):
+    """A step-up check ran and refused. Rendered by the app errorhandler.
+
+    THE ONE PROPERTY: ``checked is True`` means require_grant decided this,
+    on the single line in this module that passes that flag. Any other
+    StepUpDenied — raised by a helper, a test double, a copy-paste, or a
+    future bug — carries checked=False, and the errorhandler RE-RAISES it so
+    it surfaces as a 500.
+
+    Without that flag the errorhandler is a hazard: it would convert an
+    unexpected raise from anywhere in the request into a clean 401, which
+    reads to a client exactly like a working guard. That is the retro's
+    defect shape with an HTTP status on it.
+
+    Subclasses Exception, NOT BaseException: Flask calls handle_user_exception
+    from inside `except Exception` in full_dispatch_request, so a
+    BaseException subclass would bypass the errorhandler entirely and reach
+    the WSGI server.
+
+    ``tenant_id`` and ``absent`` travel with the refusal so the errorhandler
+    can audit it (#648) without re-reading a request header: the tenant is
+    the one require_grant was handed, already through tenant_from_request.
+
+    ``denied_message``, when set, is what the caller is shown in place of
+    ``reason``; ``reason`` is still what the audit row records.
+    """
+
+    def __init__(self, reason: str, *, http_status: int, checked: bool = False,
+                 tenant_id: str | None = None, absent: bool = False,
+                 denied_message: str | None = None):
+        super().__init__(reason)
+        self.reason = reason
+        self.http_status = http_status
+        self.checked = checked
+        self.tenant_id = tenant_id
+        self.absent = absent
+        self.denied_message = denied_message
+
+
+_DENIED_ABSENT = 'Step-up token required'
+_DENIED_REJECTED = 'Invalid step-up token'
+
+#: Refusal reasons a caller is told verbatim.
+#:
+#: OWNER RULING, 2026-08-10: "always tell why". This module previously
+#: collapsed all eleven of the validator's reasons into 'Invalid step-up
+#: token' and logged the real one server-side, so a caller holding an expired
+#: token, a read-scoped token, or a token for the wrong operation got the same
+#: four words and no way to tell which. That is unhelpful, and it is the same
+#: failure this codebase keeps finding elsewhere: a refusal that does not
+#: distinguish its causes cannot be acted on.
+#:
+#: The ruling is implemented with ONE carve-out, and the line is not "how
+#: sensitive does this feel" — it is whether the reason describes the caller's
+#: own credential or someone else's. Every reason below is about the token the
+#: caller is already holding: they learn nothing they could not learn by
+#: decoding it. 'Token tenant mismatch' is different in kind. It tells a
+#: caller who presents a token they should not have that the token is
+#: otherwise VALID, just issued to another tenant — which separates "a real
+#: credential I have stolen or guessed" from "junk", and is exactly the
+#: distinction a prober is trying to make. r6/read_auth.py:262 withholds it
+#: for the same reason.
+#:
+#: Membership is an allowlist, not a denylist, so a reason added to
+#: r6/stepup.py stays private until someone decides otherwise.
+#: tests/test_step_up_states_why.py fails when stepup.py grows a reason that
+#: appears in neither this set nor _WITHHELD_REASONS — a new reason cannot
+#: become public by accident, and cannot stay silent by accident either.
+_PUBLIC_REASONS = frozenset({
+    'Server step-up validation not configured',
+    'Malformed step-up token',
+    'Malformed token payload',
+    'Invalid token signature',
+    'Step-up token expired',
+    'Read-scoped token cannot authorize this operation',
+    'Token scope cannot authorize this operation',
+    'Token audience mismatch',
+    'Token operation mismatch',
+    'Token already used (replay)',
+})
+
+#: Withheld deliberately, with the reason recorded. Being on this list is a
+#: decision; being on neither list is a bug the test catches.
+_WITHHELD_REASONS = {
+    'Token tenant mismatch':
+        'confirms the token is valid for a different tenant, which is the '
+        'one thing a caller probing with a token they should not have is '
+        'trying to establish',
+}
+
+
+def public_step_up_reason(error: str) -> str:
+    """The sentence the caller gets for a validator refusal.
+
+    Default-deny: anything not explicitly published collapses to the generic
+    text. The failure mode of the opposite default is a new reason leaking on
+    the day it is written, when nobody is looking at this file.
+
+    PUBLIC (was `_public_reason`), because the owner's ruling is not a
+    property of `require_grant`. Two sites cannot use the kernel's gate and
+    still have to obey the ruling: `r6/command_center/routes.py` answers a
+    refusal in its own JSON shape, so it built the sentence itself and shipped
+    the raw reason — #478's leak, in a place #478's fix never reached (#508).
+
+    A site that publishes a refusal reason without going through this function
+    is publishing an unclassified string. That is the whole hazard, and it is
+    why this is a named export rather than something each caller can
+    reimplement with a set literal.
+    """
+    return error if error in _PUBLIC_REASONS else _DENIED_REJECTED
+
+
+def _step_up_token(*, also_bearer: bool, also_body_field: str | None) -> str:
+    """Return the step-up token this request presents, in the fixed order.
+
+    X-Step-Up-Token, then Authorization: Bearer when the endpoint opted in,
+    then the named body field when the endpoint opted in. Each later source
+    is opt-in for the same reason TenantSource is: a reader must be able to
+    see which inputs an endpoint trusts without reading this helper.
+    """
+    # Stripped uniformly at every source: a padded valid token is valid (#334).
+    token = (request.headers.get('X-Step-Up-Token') or '').strip()
+    if token:
+        return token
+
+    if also_bearer:
+        auth = (request.headers.get('Authorization') or '').strip()
+        if auth.lower().startswith('bearer '):
+            token = auth[7:].strip()
+            if token:
+                return token
+
+    if also_body_field:
+        body = request.get_json(silent=True)
+        if isinstance(body, dict):
+            value = body.get(also_body_field)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+
+    return ''
+
+
+@dataclass(frozen=True)
+class StepUpDecision:
+    """What ONE step-up evaluation decided.
+
+    The shared middle of `require_grant`, `has_grant` and `decide_grant`, so
+    the three cannot drift into different answers to the same question —
+    which is the whole reason the kernel exists. It left this module in
+    #655, for the sites that put the classified refusal reason on the wire
+    and could not adopt the kernel while `has_grant` threw that reason
+    away. `reason` is already public-safe (public_step_up_reason), never
+    the validator's raw text.
+
+    It cannot be mistaken for "granted": truth-testing it raises, so the
+    tuple trap this kernel exists to delete cannot come back as an object
+    trap. Read `.granted`, or `.grant`.
+    """
+
+    grant: Grant | None
+    reason: str      # public-safe; '' when granted
+    absent: bool     # the request presented no token at all
+
+    @property
+    def granted(self) -> bool:
+        return self.grant is not None
+
+    def __bool__(self) -> bool:
+        raise TypeError(
+            'a StepUpDecision is not a boolean: read .granted (or .grant); '
+            'a refused decision is an object too, and `if decision:` would '
+            'wave it through')
+
+
+def _evaluate(
+    *,
+    scope: Scope,
+    tenant: Tenant,
+    audience: str | None,
+    operation: str | None,
+    consume_nonce: bool,
+    also_bearer: bool,
+    also_body_field: str | None,
+    caller: str,
+) -> StepUpDecision:
+    """The single step-up decision. Every public entry point routes here.
+
+    THE ONE PROPERTY: a Grant is constructed on exactly one line in this
+    repository, and only after validate_step_up_token returned True for this
+    tenant, scope, audience and operation.
+
+    Does NOT catch exceptions from the validator. A validator that cannot
+    reach its nonce store has not decided anything, and answering "no grant"
+    would file an infrastructure outage as an authorization result — which
+    reads, at every call site, exactly like a caller who presented a bad
+    token. Callers that must survive that (r6/rate_limit.py) catch it
+    themselves, visibly, at the site that has a reason to.
+    """
+    if not isinstance(tenant, Tenant):
+        # A raw string here would mean the caller skipped format validation.
+        raise TypeError(
+            f'{caller} needs a Tenant from tenant_from_request, '
+            f'not {type(tenant).__name__}')
+
+    token = _step_up_token(also_bearer=also_bearer,
+                           also_body_field=also_body_field)
+    if not token:
+        return StepUpDecision(grant=None, reason=_DENIED_ABSENT, absent=True)
+
+    # Destructure both halves. A truthiness test on the tuple is a silent
+    # auth bypass — this module exists so that idiom has one home.
+    valid, error = _stepup_mod.validate_step_up_token(
+        token,
+        tenant.id,
+        consume_nonce=consume_nonce,
+        require_scope=_SCOPE_REQUIREMENT[scope],
+        require_audience=audience,
+        require_operation=operation,
+    )
+    if valid:
+        return StepUpDecision(
+            grant=Grant(
+                tenant_id=tenant.id,
+                scope=scope,
+                audience=audience,
+                operation=operation,
+                nonce_consumed=consume_nonce,
+            ),
+            reason='',
+            absent=False,
+        )
+
+    # The log keeps the full reason whatever the caller is told, so a withheld
+    # cause is still diagnosable from this side. It fires for a REJECTED token
+    # only, never for an absent one: an anonymous request is not an event, and
+    # a predicate on a hot path (the rate limiter) would otherwise log once per
+    # request.
+    logger.info('step-up refused for tenant %s: %s', loggable_id(tenant.id),
+                error)
+    return StepUpDecision(grant=None, reason=public_step_up_reason(error),
+                          absent=False)
+
+
+def require_grant(
+    *,
+    scope: Scope,
+    tenant: Tenant,
+    audience: str | None = None,
+    operation: str | None = None,
+    consume_nonce: bool = False,
+    also_bearer: bool = False,
+    also_body_field: str | None = None,
+    absent_status: int = 401,
+    rejected_status: int = 401,
+    denied_message: str | None = None,
+) -> Grant:
+    """Require a step-up token bound to ``tenant`` and return the Grant.
+
+    THE ONE PROPERTY: a Grant exists only if validate_step_up_token returned
+    True for this tenant, scope, audience and operation. There is no tuple to
+    mis-destructure, no truthy object to test, and no status-code choice at
+    the call site.
+
+    Token sources are read in this order. First X-Step-Up-Token. Then
+    Authorization: Bearer when ``also_bearer`` (r6/read_auth.py:83-86,
+    r6/actions/routes.py:256-260). Then the named body field when
+    ``also_body_field`` (r6/routes.py:2097-2098).
+
+    ``absent_status`` / ``rejected_status`` exist because the same failure
+    answers 401 at 9 sites and 403 at 3. Normalizing them is the founder's
+    call, not this migration's; each migrated site passes the status it
+    answers TODAY.
+
+    ``denied_message`` exists for the same reason. By default a refusal
+    states its classified reason (the 2026-08-10 ruling). A site whose
+    refusal sentence is already a contract clients see passes that sentence,
+    and it is rendered for every refusal kind in place of the reason. It
+    changes the body only: the audit row still records the classified
+    reason, and the status still comes from the two parameters above.
+    $ingest-context is the one site that passes it (#648, owner ruling:
+    the move keeps that body byte-identical). The sentence must be fixed
+    wording, never request-derived.
+
+    Raises StepUpDenied with the checked flag set. Never returns None, never
+    returns False, never returns a tuple.
+    """
+    outcome = _evaluate(
+        scope=scope, tenant=tenant, audience=audience, operation=operation,
+        consume_nonce=consume_nonce, also_bearer=also_bearer,
+        also_body_field=also_body_field, caller='require_grant',
+    )
+    if outcome.grant is not None:
+        return outcome.grant
+
+    status = absent_status if outcome.absent else rejected_status
+    # The ONLY place in the repository that sets the checked flag. Pinned by
+    # test_the_checked_flag_is_set_in_exactly_one_place.
+    raise StepUpDenied(outcome.reason, http_status=status, checked=True,
+                       tenant_id=tenant.id, absent=outcome.absent,
+                       denied_message=denied_message)
+
+
+def has_grant(
+    *,
+    scope: Scope,
+    tenant: Tenant,
+    audience: str | None = None,
+    operation: str | None = None,
+    also_bearer: bool = False,
+    also_body_field: str | None = None,
+) -> Grant | None:
+    """Ask whether this request holds a step-up grant. Answer, do not refuse.
+
+    THE ONE PROPERTY: identical to require_grant's, with the refusal returned
+    instead of raised — `has_grant(...) is None` is true in exactly the cases
+    `require_grant(...)` would raise StepUpDenied.
+
+    WHY THIS EXISTS. Four step-up call sites were not authorization gates
+    and could not become one (all four have since moved to the kernel; the
+    sites named here are as they stood when it was written):
+
+      r6/rate_limit.py:161      picks a bucket key, inside a try/except that
+                                must never fail a request (adopted, kernel
+                                slice 20; the try/except stayed at the site)
+      r6/read_auth.py:77        one branch of a predicate that also accepts a
+                                session cookie and an OAuth bearer (adopted,
+                                kernel slice 19)
+      r6/agent_runs/routes.py:63  the same shape, returning bool (adopted,
+                                kernel slice 16)
+      r6/sdc/routes.py:104      refuses with a message naming `dryRun=true`
+                                (adopted decide_grant, #655; see below)
+
+    Migrating them to require_grant would make a rate limiter fail requests
+    and would rewrite three wire contracts. They kept calling
+    validate_step_up_token directly instead, which is the tuple this module
+    exists to delete. This is the missing half of the kernel, not a relaxation
+    of it.
+
+    The $extract reason no longer holds: require_grant takes a
+    ``denied_message`` (#648). The site asks decide_grant, not require_grant,
+    because require_grant audits every refusal it renders and this site
+    writes no row for one today, so the move stays a move. It answers two
+    sentences. A missing or empty header gets the dryRun one, decided at the
+    site on the raw header. Every other refusal gets "Invalid step-up token",
+    a whitespace-only header included, which the kernel strips and calls
+    absent.
+
+    Returns the Grant, or None. Not a bool: the Grant carries the tenant it
+    was proved for, so a caller scopes its next query to grant.tenant_id
+    rather than re-reading a header, and None is unambiguously falsy in a way
+    a 2-tuple never was.
+
+    NO ``consume_nonce``, deliberately. Asking is not spending. A predicate
+    that burned a single-use token as a side effect of being consulted is the
+    retro's defect shape exactly — a control that looks like one thing and
+    quietly does two. A caller that must consume wants require_grant.
+
+    NO status parameters, deliberately. This function makes no HTTP decision;
+    the caller does, which is the entire reason it is not require_grant.
+
+    Raises nothing this kernel defines. It DOES propagate an exception from
+    the validator — see _evaluate.
+
+    THE HAZARD, named so it is reviewable: `has_grant` where `require_grant`
+    was meant does not refuse. It returns None and the handler falls through
+    into the write, and the broad-except guard in
+    tests/test_access_kernel.py cannot see it because nothing was raised to
+    swallow. Two tests hold that line: the result may never be discarded, and
+    every call site is an allowlist entry added by the PR that adopts it.
+    """
+    return _evaluate(
+        scope=scope, tenant=tenant, audience=audience, operation=operation,
+        consume_nonce=False, also_bearer=also_bearer,
+        also_body_field=also_body_field, caller='has_grant',
+    ).grant
+
+
+def decide_grant(
+    *,
+    scope: Scope,
+    tenant: Tenant,
+    audience: str | None = None,
+    operation: str | None = None,
+    also_bearer: bool = False,
+    also_body_field: str | None = None,
+) -> StepUpDecision:
+    """Ask whether this request holds a step-up grant, and if not, why.
+
+    THE ONE PROPERTY: identical to has_grant's — `.grant` is the Grant
+    require_grant would return and None in exactly the cases it would raise
+    — with the refusal's classified reason kept instead of discarded.
+
+    WHY THIS EXISTS (#655). Three direct step-up sites publish the refusal
+    reason on the wire, per the 2026-08-10 ruling (#508): the command
+    centre's `_authz_write` and dashboard-link mint answer
+    `{"error": "step-up token rejected: <reason>"}`, and `$extract` answers
+    two distinct OperationOutcomes. has_grant throws the reason away and
+    require_grant renders one uniform outcome, so neither could adopt them
+    without changing three wire contracts inside move PRs. _evaluate already
+    computes the classified sentence; returning it is the missing half of an
+    existing decision, not a relaxation.
+
+    NO ``consume_nonce`` and NO status parameters, for has_grant's reasons:
+    asking is not spending, and this function makes no HTTP decision.
+    Propagates a validator exception, as _evaluate does.
+
+    THE HAZARD is has_grant's: a decision nobody acts on gates nothing. The
+    same two guards hold it — the answer may never be discarded, and every
+    call site is an allowlist entry added by the PR that adopts it — plus
+    two more: `if decision:` raises on the first request, and every call
+    must read `.granted` or `.grant` (tests/test_access_kernel.py), since
+    `.reason` and `.absent` describe a refusal without saying there was one.
+    """
+    return _evaluate(
+        scope=scope, tenant=tenant, audience=audience, operation=operation,
+        consume_nonce=False, also_bearer=also_bearer,
+        also_body_field=also_body_field, caller='decide_grant',
+    )
+
+
+def register_error_handlers(app) -> None:
+    """Register the StepUpDenied and TenantRejected renderers app-wide.
+
+    HANDLERS ONLY. This registers no before_request hook and changes no
+    blueprint's request pipeline. r6/sdc/delivery.py:8-11 is deliberately off
+    r6_blueprint because the HMAC signature in the URL is the credential and
+    the route must work with no headers. Extending the hooks would break it.
+    An errorhandler is inert until something raises.
+
+    A StepUpDenied whose checked flag is unset is re-raised here, unhandled,
+    and becomes a 500.
+    """
+    app.register_error_handler(StepUpDenied, _render_step_up_denied)
+    app.register_error_handler(TenantRejected, _render_tenant_rejected)
+    app.register_error_handler(TenantClosed, _render_tenant_closed)
+
+
+#: Refusals that write NO audit row, each with the reason. Being on this list
+#: is a decision; tests/test_kernel_audits_refusals.py pins the keys, so a new
+#: exclusion is a two-file change a reviewer sees. "Every refusal is audited"
+#: is only true of the refusals this kernel RENDERS, and these are the ones
+#: it does not, or cannot attribute (#648, Astra's "name those exclusions").
+_UNAUDITED_REFUSALS = {
+    'has_grant':
+        'a predicate, not a refusal: the caller decides what None means, and '
+        'the rate limiter asks it on every request — auditing there would '
+        'write a row per anonymous hit',
+    'decide_grant':
+        "has_grant's reason: the caller renders its own answer and owns "
+        'whatever it records',
+    'unchecked StepUpDenied':
+        'not a decision this kernel made; it is re-raised as a 500 before '
+        'the audit is reached',
+    'validator exception':
+        '_evaluate propagates it, so there is no refusal — the request fails',
+    'TenantRejected':
+        'no validated tenant exists to attribute the row to, and recording '
+        'the malformed header would persist untrusted input as identity',
+    'direct validate_step_up_token sites':
+        'not the kernel; each audits (or not) at the site until it migrates',
+    'over the refusal-audit budget':
+        'bounded per client; the refusal is still rendered, and the one row '
+        'at the budget says the rest were not stored. While Redis is down '
+        'the same budget is kept in process memory, so per worker',
+    'audit storage failure':
+        'the refusal is still rendered; the failure is logged by type name',
+}
+
+#: Rendered refusals one client may have audited per window, before the one
+#: budget row. A refusal is by definition unauthenticated, so mandatory audit
+#: is a storage write anyone can trigger; without a bound it is also an
+#: unbounded one. Reuses r6/rate_limit.check_rate_limit — Redis when
+#: REDIS_URL is set, the bounded in-memory store otherwise — rather than a
+#: second limiter. The request limiter alone does not bound it:
+#: smbp_blueprint and wearables_blueprint do not mount it. When the limiter
+#: store is down the audit still fails OPEN (a refusal is recorded, not
+#: dropped) but stays bounded: the same budget is kept in this process's
+#: memory store, so an outage costs at most one budget per client per worker.
+_REFUSAL_AUDIT_BUDGET = 120
+_REFUSAL_AUDIT_WINDOW_SECONDS = 60
+
+#: Fixed, code-owned wording. Nothing request-derived goes in the detail but
+#: the endpoint name (routing-derived, never the path, which carries
+#: caller-supplied ids) and the reason, already public-safe.
+_REFUSAL_DETAIL = 'step-up refused ({kind}) at {endpoint}: {reason}'
+_BUDGET_DETAIL = ('step-up refusal audit budget reached for this client; '
+                  'further refusals this window are logged, not stored')
+
+#: The refusal is audited as the operation it refused, so the $ingest-context
+#: row stays 'create' when that site migrates (#648 PR 2).
+_EVENT_TYPE_BY_METHOD = {
+    'GET': 'read', 'HEAD': 'read', 'POST': 'create', 'PUT': 'update',
+    'PATCH': 'update', 'DELETE': 'delete',
+}
+
+
+def _refusal_audit_allowance() -> str | None:
+    """'refusal', 'budget' (the one row at the limit), or None (over it).
+
+    Keyed by client, as the request limiter keys any request whose tenant
+    claim is unproven — and a refused step-up is unproven by definition.
+    Resolved by module attribute (§1.0); imported here because r6.rate_limit
+    imports this module.
+    """
+    from r6 import rate_limit as _rate_limit_mod
+    key = f'step-up-refusal:{_rate_limit_mod._client_ip()}'
+    budget = {'max_requests': _REFUSAL_AUDIT_BUDGET + 1,
+              'window_seconds': _REFUSAL_AUDIT_WINDOW_SECONDS}
+    try:
+        allowed, remaining, _reset = _rate_limit_mod.check_rate_limit_or_raise(
+            key, **budget)
+    except _rate_limit_mod.RateLimitUnavailable as exc:
+        # Once per occurrence, by the store exception's type name only.
+        logger.warning('step-up refusal audit budget kept in process: '
+                       'limiter store unavailable (%s)', exc)
+        allowed, remaining, _reset = (
+            _rate_limit_mod.check_rate_limit_in_process(key, **budget))
+    if not allowed:
+        return None
+    return 'budget' if remaining == 0 else 'refusal'
+
+
+def _audit_refusal(exc: StepUpDenied) -> None:
+    """Record exactly one PHI-free AuditEvent for a refusal being rendered.
+
+    Rolls back FIRST. The handler that raised may have staged work before
+    its gate; committing the audit row would commit that too, behind a
+    401. Teardown discarded it before this existed, so rolling back keeps
+    that and leaves the refusal row as the only thing this commit carries.
+
+    Never raises on a STORAGE failure (SQLAlchemyError). The fail-closed
+    state of a read is "no data", which is why a read that cannot be
+    audited propagates AuditWriteError (r6/audit.py:17-24, 112). The
+    fail-closed state of a refusal is the
+    refusal itself: turning it into a 500 would withhold nothing more, lose
+    the pinned wording, and tell a prober the audit store is down. So the
+    refusal is still rendered, the failure is logged by exception type only
+    (the record_audit_event idiom, r6/audit.py:99), and the transaction is
+    rolled back so no half-written row is left pending.
+    """
+    try:
+        db.session.rollback()
+        allowance = _refusal_audit_allowance()
+        if allowance is None:
+            logger.warning('step-up refusal not audited: refusal-audit '
+                           'budget exhausted')
+            return
+        if allowance == 'budget':
+            detail = _BUDGET_DETAIL
+        else:
+            detail = _REFUSAL_DETAIL.format(
+                kind='absent' if exc.absent else 'rejected',
+                endpoint=request.endpoint or 'unknown',
+                reason=exc.reason)
+        audit(
+            tenant=exc.tenant_id,
+            event_type=_EVENT_TYPE_BY_METHOD.get(request.method, 'read'),
+            outcome='failure',
+            detail=detail,
+        )
+        db.session.commit()
+    except SQLAlchemyError as audit_exc:
+        # Storage failure only. Anything else is a bug and propagates: the
+        # broad-except guard (tests/test_access_kernel.py) forbids swallowing
+        # around audit(), and a bug here should be as loud as anywhere else.
+        logger.error('step-up refusal audit write failed: %s',
+                     type(audit_exc).__name__)
+        try:
+            db.session.rollback()
+        except SQLAlchemyError:
+            pass  # the connection is gone; teardown discards the session
+
+
+def _render_step_up_denied(exc: StepUpDenied):
+    """Render a refusal require_grant decided, and audit it once (#648).
+
+    Every refusal rendered here writes one AuditEvent: outcome 'failure',
+    the tenant require_grant was handed, and a detail line naming the
+    endpoint and the public reason — no token, no path, no header. The
+    status and body are exactly what they were before the audit existed,
+    whatever the audit store does. _UNAUDITED_REFUSALS names what this does
+    not cover.
+    """
+    if not exc.checked:
+        # Not a decision this kernel made. Rendering it as a clean 401 would
+        # make an unrelated bug look exactly like a working guard.
+        raise exc
+    _audit_refusal(exc)
+    shown = exc.reason if exc.denied_message is None else exc.denied_message
+    return outcome_response('error', 'security', shown,
+                            status=exc.http_status)
+
+
+def _render_tenant_rejected(exc: TenantRejected):
+    if exc.reason == TenantRejected.ABSENT:
+        return outcome_response('error', 'security',
+                                'X-Tenant-Id header is required', status=400)
+    return outcome_response('error', 'invalid',
+                            'X-Tenant-Id must match [a-zA-Z0-9_-]{1,64}',
+                            status=400)
+
+
+# ---------------------------------------------------------------------------
+# Closed tenants — no new records after a disconnect or a delete
+# ---------------------------------------------------------------------------
+
+class TenantClosed(Exception):
+    """The account holder disconnected or deleted this tenant.
+
+    Raised by require_open_tenant; rendered app-wide as a 409 with one
+    PHI-free audit row.
+    """
+
+    def __init__(self, tenant_id: str):
+        super().__init__('tenant closed')
+        self.tenant_id = tenant_id
+
+
+def require_open_tenant(tenant: Tenant | str) -> None:
+    """Refuse a write that would bring records into a closed tenant.
+
+    THE ONE PROPERTY: when this returns, the tenant carries no revocation
+    tombstone (r6.fasten.models.TenantClosure, written by a
+    CareAgents Disconnect and by purge). It says nothing about who the
+    caller is: call it AFTER the route's own authorization, so an
+    unauthenticated caller cannot learn which tenants are closed.
+
+    Resolved by module attribute at call time (§1.0), and imported lazily
+    because r6.fasten imports this module.
+    """
+    from r6.fasten import models as _fasten_models_mod
+    tenant_id = tenant.id if isinstance(tenant, Tenant) else tenant
+    if _fasten_models_mod.tenant_closed(tenant_id):
+        raise TenantClosed(tenant_id)
+
+
+def _render_tenant_closed(exc: TenantClosed):
+    """409, audited once. Rolls back first, as _audit_refusal does, so
+    nothing the handler staged before the check commits with the row. The
+    caller was authorized before the check ran, so no refusal budget."""
+    try:
+        db.session.rollback()
+        audit(
+            tenant=exc.tenant_id,
+            event_type=_EVENT_TYPE_BY_METHOD.get(request.method, 'read'),
+            outcome='failure',
+            detail=(f'write refused at {request.endpoint or "unknown"}: '
+                    'tenant disconnected'),
+        )
+        db.session.commit()
+    except SQLAlchemyError as audit_exc:
+        logger.error('closed-tenant refusal audit write failed: %s',
+                     type(audit_exc).__name__)
+        try:
+            db.session.rollback()
+        except SQLAlchemyError:
+            pass  # the connection is gone; teardown discards the session
+    return outcome_response('error', 'conflict',
+                            'This connection was disconnected; no new '
+                            'records are accepted for it.', status=409)
+
+
+# ---------------------------------------------------------------------------
+# §1.3 Audit
+# ---------------------------------------------------------------------------
+
+#: flask.g attribute set when an AuditEventRecord goes through a flush, and
+#: CLEARED when the session commits or rolls back that transaction. Set means
+#: "an audit row is flushed into a transaction nobody has resolved yet" — the
+#: state install_audit_assertions refuses to let a request end in.
+#:
+#: The spec words this condition as "db.session.new or db.session.dirty is
+#: non-empty at teardown". Measured, that condition can never fire: flush()
+#: moves the AuditEvent out of session.new into the persistent identity map,
+#: so both sets are empty for exactly the request this control exists to
+#: catch. Reading session.new from inside after_flush is the same property
+#: with a signal that actually observes it. See _install_marker_listeners.
+_AUDIT_PENDING = '_hc_access_audit_pending'
+
+#: flask.g attribute recording that audit() ran at least once in this request,
+#: whatever happened to the transaction afterwards. This is what
+#: install_read_audit_assertion needs — a read that audited AND committed must
+#: pass, so it cannot share the pending marker above.
+_AUDIT_EMITTED = '_hc_access_audit_emitted'
+
+#: SQLAlchemy session listeners are process-global, so they are installed once
+#: per process rather than once per app. Registering per app would stack one
+#: listener per Flask app the test suite builds.
+_marker_listeners_installed = False
+
+
+class AuditAssertionError(AssertionError):
+    """A request-lifecycle audit assertion failed.
+
+    Testing-mode only — see install_audit_assertions and
+    install_read_audit_assertion. Not part of the spec's §1 signature list;
+    the two installers need something to raise.
+    """
+
+
+def audit(
+    *,
+    tenant: Tenant | str,
+    event_type: str,
+    resource_type: str | None = None,
+    resource_id: str | None = None,
+    agent_id: str | None = None,
+    context_id: str | None = None,
+    outcome: str = 'success',
+    detail: str | None = None,
+    outcome_detail_code: str | None = None,
+) -> None:
+    """Add and flush an AuditEvent inside the CALLER's transaction.
+
+    THE ONE PROPERTY: when this returns, an AuditEvent row is flushed in the
+    caller's unit of work, and it will be committed or rolled back with the
+    state change it describes. It never commits.
+
+    This is r6/audit.py:46-61 (add_audit_event) becoming the only pattern.
+    r6/audit.py:64-113 (record_audit_event) opens a SAVEPOINT and then calls
+    db.session.commit() — an ambient commit at 41 call sites, which means a
+    caller cannot know whether its own pending work was committed as a side
+    effect of auditing.
+
+    ``detail`` stays PHI-free. The kernel does not sanitize it, because a
+    sanitizer that silently drops PHI is worse than a reviewer who sees the
+    string. Composition of the detail line stays where the facts are.
+
+    Records that an audit was emitted on ``g`` for
+    install_read_audit_assertion. The PENDING marker install_audit_assertions
+    reads is not set here — it is set by the flush that carries the row, so a
+    call that wrote nothing leaves nothing pending (#321).
+    """
+    tenant_id = tenant.id if isinstance(tenant, Tenant) else tenant
+    _install_marker_listeners()
+    _audit_mod.add_audit_event(
+        event_type,
+        resource_type=resource_type,
+        resource_id=resource_id,
+        agent_id=agent_id,
+        context_id=context_id,
+        outcome=outcome,
+        detail=detail,
+        tenant_id=tenant_id,
+        outcome_detail_code=outcome_detail_code,
+    )
+    if has_app_context():
+        setattr(g, _AUDIT_EMITTED, True)
+
+
+def _set_pending_marker(session_, _flush_context, *_args) -> None:
+    """An AuditEventRecord is going to the database in an open transaction."""
+    if not has_app_context():
+        return
+    if any(isinstance(obj, AuditEventRecord) for obj in session_.new):
+        setattr(g, _AUDIT_PENDING, True)
+
+
+def _clear_pending_marker(*_args) -> None:
+    """The audit row's transaction was resolved — nothing is pending."""
+    if has_app_context():
+        g.pop(_AUDIT_PENDING, None)
+
+
+def _clear_on_soft_rollback(_session, previous_transaction=None) -> None:
+    """after_soft_rollback also fires for a SAVEPOINT, which resolves nothing.
+
+    A nested rollback leaves the audit row pending in the OUTER transaction, so
+    clearing on it is a false negative — and it is the exact path
+    record_audit_event takes when the audit write fails (r6/audit.py:105), the
+    function slices 12 and 13 migrate away from.
+
+    Do NOT write this as session.in_transaction(): inside after_commit the
+    session still reports a transaction, so that variant breaks the commit
+    cases. previous_transaction.nested is the discriminator.
+    """
+    if previous_transaction is not None and previous_transaction.nested:
+        return
+    _clear_pending_marker()
+
+
+def _install_marker_listeners() -> None:
+    """Attach the session listeners that set and clear the pending marker.
+
+    Set and clear run on the same mechanism on purpose. The marker follows the
+    ROW — an AuditEventRecord in a flush — not the call to audit(). Keying it
+    to the call makes a faked writer that wrote nothing fail its request, with
+    the assertion firing when its property was never violated (#321).
+
+    session.new is read inside after_flush, where SQLAlchemy still holds it in
+    its pre-flush state. At teardown it is empty for exactly the request this
+    control exists to catch, which is why the spec's original condition could
+    never fire.
+
+    Idempotent and once per process: SQLAlchemy session events are global, so
+    installing per app would stack one listener per Flask app the suite makes.
+    """
+    global _marker_listeners_installed
+    if _marker_listeners_installed:
+        return
+    from sqlalchemy import event
+    event.listen(db.session, 'after_flush', _set_pending_marker)
+    event.listen(db.session, 'after_commit', _clear_pending_marker)
+    event.listen(db.session, 'after_soft_rollback', _clear_on_soft_rollback)
+    _marker_listeners_installed = True
+
+
+def _assertions_enabled(app) -> bool:
+    if app.config.get('TESTING'):
+        return True
+    return os.environ.get('HC_ASSERT_AUDIT_COMMITTED', '').strip().lower() \
+        in _TRUE_VALUES
+
+
+def _install_marker_cleanup(app) -> None:
+    """Drop both markers at the end of every request.
+
+    flask.g is app-context scoped, and a test that pushes one app context
+    around several client calls shares g between them. Without this, request N
+    would inherit request N-1's audit markers and the assertions would be
+    reading the wrong request. Registered before either assertion so it runs
+    LAST (teardown functions run in reverse registration order).
+    """
+    if getattr(app, '_hc_access_marker_cleanup', False):
+        return
+    app._hc_access_marker_cleanup = True
+
+    @app.teardown_request
+    def _clear_audit_markers(_exc=None):
+        g.pop(_AUDIT_PENDING, None)
+        g.pop(_AUDIT_EMITTED, None)
+
+
+def install_audit_assertions(app) -> None:
+    """Testing-mode only: fail a request that flushed audit rows and never
+    resolved the transaction.
+
+    THE ONE PROPERTY: no request leaves an audit row flushed-but-uncommitted.
+
+    Installed as a teardown_request, active only when app.config['TESTING']
+    or HC_ASSERT_AUDIT_COMMITTED is set. It fires when g still carries the
+    pending marker at teardown — the signature of a handler that flushed an
+    AuditEvent and returned without commit() or rollback(). An outer rollback
+    clears the marker and passes, correctly: a refused write should carry no
+    audit row. A SAVEPOINT rollback does not clear it, because it resolves
+    nothing.
+
+    Without this, moving 41 sites from an ambient commit to a caller-owned
+    commit is 41 chances to drop an audit row behind a 201.
+
+    WHAT IT DOES NOT CATCH (see docs/2026-08-03-audit-assertion-ruling.md for
+    the full list of seven): a handler that flushes an audit row, rolls the
+    transaction back, and still answers 2xx. The marker clears and this passes,
+    though the audit row is gone from behind a success. That needs a second
+    control, not a change to this one.
+    """
+    _install_marker_cleanup(app)
+    _install_marker_listeners()
+
+    @app.teardown_request
+    def _assert_audit_committed(exc=None):
+        if exc is not None:
+            # The request is already failing. Flask-SQLAlchemy rolls back on
+            # its own teardown; masking the real error with ours helps nobody.
+            return
+        if not _assertions_enabled(app):
+            return
+        if getattr(g, _AUDIT_PENDING, False):
+            raise AuditAssertionError(
+                'audit() flushed a row and the request returned without '
+                'commit() or rollback() — the AuditEvent is pending in an '
+                'unresolved transaction')
+
+
+#: A path under this prefix whose next segment starts with an uppercase letter
+#: is a FHIR resource route. Discovery paths (metadata, health, docs,
+#: .well-known) are lowercase by construction, so this separates them without
+#: importing r6.routes' exemption list into the kernel.
+_FHIR_ROOT = '/r6/fhir/'
+
+
+def _is_fhir_resource_path(path: str) -> bool:
+    if not path.startswith(_FHIR_ROOT):
+        return False
+    rest = path[len(_FHIR_ROOT):]
+    return bool(rest) and rest[0].isupper()
+
+
+def install_read_audit_assertion(app) -> None:
+    """Testing-mode only: fail a FHIR read that returned without auditing.
+
+    THE ONE PROPERTY: a request to a /r6/fhir/ resource route that answered
+    200 or 404 flushed at least one AuditEvent.
+
+    This is the ONLY structural answer to S-9, the five unaudited 404 paths
+    (r6/routes.py:596-598, 692-694, 1268-1270, 1810-1812, 3106-3110). audit()
+    is a function you must call, so the kernel alone cannot make an early
+    ``return 404`` audit itself.
+
+    It lands in its own slice and it goes red on those five paths
+    immediately. That redness IS the S-9 pin. Do not install it in the same
+    PR as the fix — which is why slice 1 defines it and registers it nowhere.
+    """
+    _install_marker_cleanup(app)
+
+    @app.after_request
+    def _assert_read_audited(response):
+        if not _assertions_enabled(app):
+            return response
+        if request.method != 'GET':
+            return response
+        if response.status_code not in (200, 404):
+            return response
+        if not _is_fhir_resource_path(request.path):
+            return response
+        if not getattr(g, _AUDIT_EMITTED, False):
+            raise AuditAssertionError(
+                f'{request.method} {request.path} answered '
+                f'{response.status_code} without emitting an AuditEvent')
+        return response
+
+
+# ---------------------------------------------------------------------------
+# §1.4 Response shaping
+# ---------------------------------------------------------------------------
+
+class Profile(Enum):
+    """Which redaction policy produced this payload.
+
+    There is deliberately NO member meaning "no redaction". An enum member
+    for the absence of a property makes the absence look like a policy, and
+    a reviewer scanning for the risky case sees a valid-looking constant. The
+    opt-out is a different function with a different signature — see
+    unredacted_response.
+    """
+
+    STANDARD = 'standard'                      # r6/redaction.py:22 + add_disclaimer
+    PATIENT_CONTROLLED = 'patient-controlled'  # r6/redaction.py:180
+    INTAKE = 'intake'                          # r6/routes.py _intake_strip
+    CHECKIN = 'checkin'                        # _checkin_profile (FHI-53)
+    KTC = 'ktc'                                # _ktc_profile (SHL PR 1)
+
+
+_SSN_SYSTEMS = ('http://hl7.org/fhir/sid/us-ssn',
+                'urn:oid:2.16.840.1.113883.4.1')
+
+
+def _intake_profile(resource):
+    """Intake profile: identified for clinic check-in, so a Patient's name,
+    birthDate, address and telecom ship verbatim. Everything else goes
+    through apply_redaction (upstream `display`/`CodeableConcept.text` and
+    free text stripped, then relabelled by code from r6/terminology.py), and
+    top-level note, narrative, DiagnosticReport.conclusion and SSN-class
+    identifiers are removed (#282, owner ruling).
+
+    The same behavior as r6/routes.py:_intake_strip, which slice 14 deletes
+    when $share-bundle adopts fhir_response. Until then the two are pinned
+    equal by test_intake_profile_matches_the_shipped_intake_strip, so the
+    copy cannot drift while it waits.
+    """
+    res = _redaction_mod.apply_redaction(resource)
+    if resource.get('resourceType') == 'Patient':
+        for key in ('name', 'birthDate', 'address', 'telecom'):
+            if key in resource:
+                res[key] = resource[key]
+    for key in ('note', 'text', 'conclusion'):
+        res.pop(key, None)
+    idents = res.get('identifier')
+    if isinstance(idents, list):
+        kept = [i for i in idents
+                if not (isinstance(i, dict) and i.get('system') in _SSN_SYSTEMS)]
+        if kept:
+            res['identifier'] = kept
+        else:
+            res.pop('identifier', None)
+    return res
+
+
+_V2_0203 = 'http://terminology.hl7.org/CodeSystem/v2-0203'
+_COVERAGE_CLASS = 'http://terminology.hl7.org/CodeSystem/coverage-class'
+_NAIC_SYSTEM = 'urn:oid:2.16.840.1.113883.6.300'
+
+#: A payor reference the check-in keeps: an Organization, by an id the store
+#: could hold. Anything else (a RelatedPerson, a Patient, a URL) is dropped.
+_PAYOR_REF = re.compile(r'Organization/[A-Za-z0-9\-.]{1,255}')
+
+
+def _is_ssn_identifier(ident):
+    """An SSN by identifier system, either spelling, or by ANY type coding
+    whose code is `SS`, whatever system the coding names: an upstream that
+    invents its own SSN system still says what it is in the type, and the
+    v2-0203 URL itself has more than one spelling (the R3
+    http://hl7.org/fhir/v2/0203 among them). Over-matching an `SS` from some
+    other code system costs one identifier; under-matching leaks an SSN."""
+    if not isinstance(ident, dict):
+        return False
+    if ident.get('system') in _SSN_SYSTEMS:
+        return True
+    concept = ident.get('type')
+    codings = concept.get('coding') if isinstance(concept, dict) else None
+    return isinstance(codings, list) and any(
+        isinstance(c, dict) and c.get('code') == 'SS' for c in codings)
+
+
+#: The second, independent SSN check (#963 security delta D1). The first,
+#: _is_ssn_identifier, knows the two standard systems and the v2-0203 `SS`
+#: code; an upstream that labels an SSN its own way (a local system named
+#: "ssn", a `type.text`, a local code `SSN`) passes it. This one reads the
+#: labels and the value instead, and over-matches on purpose: a dropped
+#: identifier costs one identifier, a missed one leaks an SSN.
+_SSN_LABEL = re.compile(r'ssn|social.?security', re.IGNORECASE)
+# Searched, not full-matched (#963 security D2): `SSN:555-66-7777`,
+# `444 55 6666` and `444.55.6666` all carry one. The lookarounds keep a
+# longer digit run (a 10-digit member id) from matching.
+_SSN_VALUE = re.compile(r'(?<!\d)\d{3}[\s.-]?\d{2}[\s.-]?\d{4}(?!\d)')
+
+
+def _value_looks_like_ssn(value):
+    """True for a string that contains an SSN's digits or names itself one.
+    The strict screen, for Patient identifier values."""
+    if not isinstance(value, str):
+        return False
+    value = value.strip()
+    return bool(_SSN_VALUE.search(value) or _SSN_LABEL.search(value))
+
+
+#: Coverage values only (owner ruling 2026-10-14, QA #963): member, group
+#: and plan numbers are often a bare 9 digits, so a Coverage value is
+#: dropped as an SSN only when it is labelled one or written in SSN form
+#: with BOTH separators. Patient identifiers keep the strict _SSN_VALUE.
+_SSN_SEPARATED = re.compile(r'(?<!\d)\d{3}[\s.-]\d{2}[\s.-]\d{4}(?!\d)')
+
+
+def _coverage_value_looks_like_ssn(value):
+    """A Coverage subscriberId, MB/SN identifier value or class.value that
+    names itself an SSN or contains a separated SSN."""
+    if not isinstance(value, str):
+        return False
+    value = value.strip()
+    return bool(_SSN_SEPARATED.search(value) or _SSN_LABEL.search(value))
+
+
+def _coverage_identifier_is_ssn(ident):
+    """The Coverage MB/SN restore's screen: the standard SSN labels, a local
+    SSN label, or a Coverage value that looks like an SSN by the rule above.
+    """
+    return (_is_ssn_identifier(ident) or _ssn_labelled(ident)
+            or _coverage_value_looks_like_ssn(ident.get('value')))
+
+
+def _ssn_labelled(ident):
+    """True when the identifier's system, any type coding's code, or its
+    `type.text` reads as an SSN label."""
+    if not isinstance(ident, dict):
+        return False
+    labels = [ident.get('system')]
+    concept = ident.get('type')
+    if isinstance(concept, dict):
+        labels.append(concept.get('text'))
+        codings = concept.get('coding')
+        if isinstance(codings, list):
+            labels.extend(c.get('code') for c in codings
+                          if isinstance(c, dict))
+    return any(isinstance(label, str) and _SSN_LABEL.search(label)
+               for label in labels)
+
+
+def _looks_like_ssn(ident):
+    """Patient identifiers (strict): an SSN label, or an SSN anywhere in the
+    value, bare 9 digits included."""
+    if not isinstance(ident, dict):
+        return False
+    return _ssn_labelled(ident) or _value_looks_like_ssn(ident.get('value'))
+
+
+def _is_ssn_class(ident):
+    """Either check. Every SSN decision in the check-in profile asks this."""
+    return _is_ssn_identifier(ident) or _looks_like_ssn(ident)
+
+
+def _has_coding(concept, system, codes):
+    """True when CodeableConcept `concept` has a coding of `system` with a
+    code in `codes`. Read off the stored record, so every shape is checked."""
+    if not isinstance(concept, dict):
+        return False
+    codings = concept.get('coding')
+    if not isinstance(codings, list):
+        return False
+    return any(isinstance(c, dict) and c.get('system') == system
+               and c.get('code') in codes for c in codings)
+
+
+def _coding_of(concept, system, codes):
+    """The first matching coding as {system, code}: no display, no text."""
+    for c in concept.get('coding'):
+        if (isinstance(c, dict) and c.get('system') == system
+                and c.get('code') in codes):
+            return {'system': system, 'code': c['code']}
+    return None
+
+
+def _drop_related_person_refs(obj):
+    """Remove every Reference to a RelatedPerson, at any depth, in place.
+
+    A RelatedPerson is somebody else: a check-in names the patient and,
+    for Coverage, the patient's own plan, never a relative or a guarantor."""
+    if isinstance(obj, list):
+        obj[:] = [v for v in obj if not _is_related_person_ref(v)]
+        for v in obj:
+            _drop_related_person_refs(v)
+    elif isinstance(obj, dict):
+        for key in [k for k, v in obj.items() if _is_related_person_ref(v)]:
+            obj.pop(key)
+        for v in obj.values():
+            _drop_related_person_refs(v)
+
+
+def _is_related_person_ref(value):
+    return (isinstance(value, dict)
+            and isinstance(value.get('reference'), str)
+            and 'RelatedPerson/' in value['reference'])
+
+
+#: Coverage.status values (R4 FinancialResourceStatusCodes).
+_COVERAGE_STATUS = frozenset({'active', 'cancelled', 'draft',
+                              'entered-in-error'})
+
+
+#: A code we pass through: a code, not a sentence (#963 security delta).
+_CODE_SHAPE = re.compile(r'[A-Za-z0-9._-]{1,64}')
+
+
+def _codes_only(concept):
+    """A CodeableConcept reduced to its codings' system and code: no
+    display, no text, no extension. None when nothing coded is left."""
+    codings = concept.get('coding') if isinstance(concept, dict) else None
+    kept = [{'system': c['system'], 'code': c['code']}
+            for c in codings or [] if isinstance(c, dict)
+            and isinstance(c.get('system'), str)
+            and isinstance(c.get('code'), str)
+            and _CODE_SHAPE.fullmatch(c['code'])]
+    return {'coding': kept} if kept else None
+
+
+def _checkin_coverage(original, res, patient_id):
+    """Coverage under `checkin`, built from EMPTY (#963 security review F3).
+    Nothing the redacted copy happened to keep (`network`, `dependent`,
+    `costToBeneficiary`, an extension) can leave: only the keys below, each
+    read off the stored record by allow-list. The payor's NAME comes from
+    its own Organization record (the export's second lookup), never
+    `display`.
+
+    A Coverage reaches this function only when the token's `op` named
+    Coverage, which is the per-item consent; nothing here re-checks it."""
+    res = {k: res[k] for k in ('resourceType', 'id', 'meta') if k in res}
+    if original.get('status') in _COVERAGE_STATUS:
+        res['status'] = original['status']
+    for key in ('type', 'relationship'):
+        coded = _codes_only(original.get(key))
+        if coded:
+            res[key] = coded
+    period = original.get('period')
+    if isinstance(period, dict):
+        kept = {k: period[k] for k in ('start', 'end')
+                if isinstance(period.get(k), str)}
+        if kept:
+            res['period'] = kept
+
+    subscriber_id = original.get('subscriberId')
+    # Subscriber ids were historically sometimes SSNs: one with an SSN's
+    # shape is dropped, by the same value check as identifiers (#963).
+    if (isinstance(subscriber_id, str) and 0 < len(subscriber_id) <= 64
+            and not _coverage_value_looks_like_ssn(subscriber_id)):
+        res['subscriberId'] = subscriber_id
+
+    idents = []
+    for ident in original.get('identifier') or []:
+        if not isinstance(ident, dict) or _coverage_identifier_is_ssn(ident):
+            continue
+        if not _has_coding(ident.get('type'), _V2_0203, ('MB', 'SN')):
+            continue
+        system, value = ident.get('system'), ident.get('value')
+        if isinstance(value, str) and value:
+            kept = {'type': {'coding': [_coding_of(
+                ident['type'], _V2_0203, ('MB', 'SN'))]},
+                'value': value}
+            if isinstance(system, str):
+                kept['system'] = system
+            idents.append(kept)
+    res.pop('identifier', None)
+    if idents:
+        res['identifier'] = idents
+
+    classes = []
+    for cls in original.get('class') or []:
+        if not isinstance(cls, dict):
+            continue
+        if not _has_coding(cls.get('type'), _COVERAGE_CLASS,
+                           ('group', 'plan')):
+            continue
+        value = cls.get('value')
+        # A group or plan number with an SSN in it is dropped (#963 D2).
+        if (isinstance(value, str) and value
+                and not _coverage_value_looks_like_ssn(value)):
+            # class.name is dropped, not left as a truncated stub.
+            classes.append({'type': {'coding': [_coding_of(
+                cls['type'], _COVERAGE_CLASS, ('group', 'plan'))]},
+                'value': value})
+    res.pop('class', None)
+    if classes:
+        res['class'] = classes
+
+    own = f'Patient/{patient_id}'
+    for key in ('subscriber', 'policyHolder', 'beneficiary'):
+        ref = original.get(key)
+        res.pop(key, None)
+        if isinstance(ref, dict) and ref.get('reference') == own:
+            res[key] = {'reference': own}
+
+    payors = []
+    for ref in original.get('payor') or []:
+        target = ref.get('reference') if isinstance(ref, dict) else None
+        if isinstance(target, str) and _PAYOR_REF.fullmatch(target):
+            payors.append({'reference': target})
+    res.pop('payor', None)
+    if payors:
+        res['payor'] = payors
+    return res
+
+
+#: The sub-elements a check-in releases from each Patient identity field
+#: (#963 security review F5). Copying the field by key released anything
+#: nested in it: an extension's valueReference.display, an address `text`.
+_HUMAN_NAME_KEYS = ('use', 'family', 'given', 'prefix', 'suffix')
+_ADDRESS_KEYS = ('use', 'type', 'line', 'city', 'district', 'state',
+                 'postalCode', 'country')
+_CONTACT_POINT_KEYS = ('system', 'value', 'use', 'rank')
+
+
+def _element(value, keys):
+    """`value` reduced to `keys` whose values are strings, lists of
+    strings, or (for `rank`) an int. Anything else is dropped."""
+    if not isinstance(value, dict):
+        return None
+    out = {}
+    for key in keys:
+        v = value.get(key)
+        if isinstance(v, str) or (key == 'rank' and isinstance(v, int)
+                                  and not isinstance(v, bool)):
+            out[key] = v
+        elif isinstance(v, list) and v and all(isinstance(i, str) for i in v):
+            out[key] = v
+    return out or None
+
+
+def _patient_identity(original):
+    """name, birthDate, address and telecom, element by element."""
+    out = {}
+    for key, keys in (('name', _HUMAN_NAME_KEYS), ('address', _ADDRESS_KEYS),
+                      ('telecom', _CONTACT_POINT_KEYS)):
+        items = original.get(key)
+        kept = [e for e in (_element(i, keys) for i in items or []
+                            if isinstance(items, list)) if e]
+        if kept:
+            out[key] = kept
+    if isinstance(original.get('birthDate'), str):
+        out['birthDate'] = original['birthDate']
+    return out
+
+
+#: OMB race and ethnicity categories (CDC Race & Ethnicity code system) and
+#: the two null flavors US Core allows in their place, with OUR label for
+#: each: the code system's own display. It is the extension's required
+#: `text`; check-in output carries no `coding.display` (QA ruling B), and
+#: upstream `text` and `display` are never used (owner ruling 2026-10-14).
+_CDC_RACE_ETHNICITY = 'urn:oid:2.16.840.1.113883.6.238'
+_NULL_FLAVOR = 'http://terminology.hl7.org/CodeSystem/v3-NullFlavor'
+_OMB_LABELS = {
+    'race': {
+        (_CDC_RACE_ETHNICITY, '1002-5'): 'American Indian or Alaska Native',
+        (_CDC_RACE_ETHNICITY, '2028-9'): 'Asian',
+        (_CDC_RACE_ETHNICITY, '2054-5'): 'Black or African American',
+        (_CDC_RACE_ETHNICITY, '2076-8'):
+            'Native Hawaiian or Other Pacific Islander',
+        (_CDC_RACE_ETHNICITY, '2106-3'): 'White',
+        (_NULL_FLAVOR, 'UNK'): 'unknown',
+        (_NULL_FLAVOR, 'ASKU'): 'asked but unknown',
+    },
+    'ethnicity': {
+        (_CDC_RACE_ETHNICITY, '2135-2'): 'Hispanic or Latino',
+        (_CDC_RACE_ETHNICITY, '2186-5'): 'Not Hispanic or Latino',
+        (_NULL_FLAVOR, 'UNK'): 'unknown',
+        (_NULL_FLAVOR, 'ASKU'): 'asked but unknown',
+    },
+}
+_US_CORE_SD = 'http://hl7.org/fhir/us/core/StructureDefinition/us-core-'
+
+
+def _omb_extension(ext, kind):
+    """A us-core-race/-ethnicity extension rebuilt from its ombCategory
+    codings alone, each in _OMB_LABELS[kind], with `text` set from OUR
+    labels. `detailed` codes and anything unmapped are dropped; with no
+    mapped category left the extension is invalid (text is 1..1), so None.
+    """
+    labels = _OMB_LABELS[kind]
+    kept = []
+    for sub in ext.get('extension') or []:
+        coding = sub.get('valueCoding') if isinstance(sub, dict) else None
+        if (isinstance(sub, dict) and sub.get('url') == 'ombCategory'
+                and isinstance(coding, dict)):
+            key = (coding.get('system'), coding.get('code'))
+            if key in labels and key not in [k for k, _ in kept]:
+                kept.append((key, labels[key]))
+    if not kept:
+        return None
+    subs = [{'url': 'ombCategory', 'valueCoding': {
+        'system': system, 'code': code}} for (system, code), _ in kept]
+    subs.append({'url': 'text',
+                 'valueString': ', '.join(label for _, label in kept)})
+    return {'url': _US_CORE_SD + kind, 'extension': subs}
+
+
+def _patient_extensions(original):
+    """Patient.extension for a check-in: race and ethnicity only, rebuilt
+    by _omb_extension. Every other upstream extension is dropped."""
+    out = []
+    for ext in original.get('extension') or []:
+        if not isinstance(ext, dict):
+            continue
+        for kind in ('race', 'ethnicity'):
+            if ext.get('url') == _US_CORE_SD + kind:
+                rebuilt = _omb_extension(ext, kind)
+                if rebuilt:
+                    out.append(rebuilt)
+    return out
+
+
+#: Identifier.use (R4 IdentifierUse), the only values copied.
+_IDENTIFIER_USE = frozenset({'usual', 'official', 'temp', 'secondary', 'old'})
+
+
+def _patient_identifiers(original):
+    """Patient.identifier WITH values, for a check-in only (owner ruling
+    2026-10-14: the patient consented to this item). SSN-class identifiers
+    are removed by system and by any `SS` type coding. Each kept identifier
+    carries system, value, use and a code-only type; an identifier without
+    a string value is dropped rather than sent as a stub."""
+    out = []
+    for ident in original.get('identifier') or []:
+        if not isinstance(ident, dict) or _is_ssn_class(ident):
+            continue
+        value = ident.get('value')
+        if not (isinstance(value, str) and value):
+            continue
+        kept = {}
+        if ident.get('use') in _IDENTIFIER_USE:
+            kept['use'] = ident['use']
+        if isinstance(ident.get('system'), str):
+            kept['system'] = ident['system']
+        coded = _codes_only(ident.get('type'))
+        if coded:
+            kept['type'] = coded
+        kept['value'] = value
+        out.append(kept)
+    return out
+
+
+def _codes_with_our_text(obj):
+    """Check-in output only (QA recheck of #963, ruling B): no `display`
+    anywhere, and each CodeableConcept's `text` is OUR label for its first
+    recognised coding, from r6/terminology.py, or absent.
+
+    The relabel that apply_redaction runs writes our label into
+    `coding.display`, and a validator checks that against the code system's
+    own display (CVX 150, RxNorm 314076 failed). `display` is optional, so
+    it goes; the label moves to `text`, where it is ours to choose. A
+    Reference.display is upstream text and was already stripped; this
+    removes any that remain all the same.
+    """
+    if isinstance(obj, list):
+        for item in obj:
+            _codes_with_our_text(item)
+        return
+    if not isinstance(obj, dict):
+        return
+    obj.pop('display', None)
+    codings = obj.get('coding')
+    if isinstance(codings, list):
+        label = next((lbl for lbl in (
+            _terminology_mod.lookup(_coding_system(c), c.get('code'))
+            for c in codings if isinstance(c, dict)) if lbl), None)
+        if label:
+            obj['text'] = label
+        else:
+            obj.pop('text', None)
+    for value in obj.values():
+        _codes_with_our_text(value)
+
+
+def _checkin_organization(original, res):
+    """A payor Organization: its stored `name`, `active`, the NAIC
+    identifier, and nothing else a front desk does not need (no address,
+    telecom, contact)."""
+    out = {k: res[k] for k in ('resourceType', 'id', 'meta') if k in res}
+    # us-core-organization requires `active` (QA recheck of #963).
+    if isinstance(original.get('active'), bool):
+        out['active'] = original['active']
+    name = original.get('name')
+    if isinstance(name, str) and name:
+        out['name'] = name
+    naic = [{'system': _NAIC_SYSTEM, 'value': i['value']}
+            for i in original.get('identifier') or []
+            if isinstance(i, dict) and i.get('system') == _NAIC_SYSTEM
+            and isinstance(i.get('value'), str) and i['value']]
+    if naic:
+        out['identifier'] = naic
+    return out
+
+
+#: The one meta coding the check-in export carries across: HL7 v3 ActReason
+#: HTEST, "this is test data". Matched by system AND code, exactly as
+#: written: a lookalike under another system, or this system spelt another
+#: way, is some other tag and is dropped with the rest.
+_TEST_MARKER = ('http://terminology.hl7.org/CodeSystem/v3-ActReason', 'HTEST')
+
+
+def _test_markers(stored_meta):
+    """The HTEST marker in a record's meta as stored, by slot.
+
+    Returns {'tag': [coding]} and/or {'security': [coding]}, each coding
+    built from empty: our system, our code, and the display from
+    r6/terminology.py. Nothing of the stored coding is copied, so an upstream
+    `display` (or any other key) cannot ride along. A slot that carried the
+    marker gets it once, however often it was written."""
+    if not isinstance(stored_meta, dict):
+        return {}
+    system, code = _TEST_MARKER
+    out = {}
+    for slot in ('tag', 'security'):
+        codings = stored_meta.get(slot)
+        if isinstance(codings, dict):
+            codings = [codings]
+        if isinstance(codings, list) and any(
+                isinstance(c, dict) and c.get('system') == system
+                and c.get('code') == code for c in codings):
+            out[slot] = [{'system': system, 'code': code,
+                          'display': _terminology_mod.lookup(system, code)}]
+    return out
+
+
+def _checkin_profile(resource, *, patient_id, stored_meta=None):
+    """Check-in profile (FHI-53): what a clinic's check-in receives, per
+    resource, for the patient the CareAgents server named.
+
+    The intake rules first: apply_redaction (every upstream `display` and
+    `text` stripped, then relabelled by code), a Patient's name, birthDate,
+    address and telecom verbatim, top-level note/narrative/conclusion gone.
+    Then the check-in rules on top:
+
+    - SSN-class identifiers go by either system spelling AND by v2-0203
+      type `SS` under any system.
+    - Every RelatedPerson reference goes, at any depth, and `contained`
+      goes whole (a contained RelatedPerson is still somebody else).
+    - Coverage restores member and group numbers and payor references by
+      allow-list (_checkin_coverage); an Organization is reduced to the payor
+      name and NAIC id (_checkin_organization).
+    - The HTEST test-data marker goes back on `meta.tag` or `meta.security`,
+      wherever `stored_meta` carried it (_test_markers). `stored_meta` is the
+      record's meta as stored: `to_fhir_json` has already replaced `meta` on
+      `resource`. Every other tag stays dropped.
+
+    Stateless and per-resource, beside _intake_profile, so slice 14 can
+    route it through fhir_response. Which rows reach it (types in the token,
+    the one patient, rows with a claim) is the route's job.
+    """
+    res = _redaction_mod.apply_redaction(resource)
+    rtype = resource.get('resourceType')
+    if rtype == 'Patient':
+        for key in ('name', 'birthDate', 'address', 'telecom', 'identifier',
+                    'extension'):
+            res.pop(key, None)
+        res.update(_patient_identity(resource))
+        idents = _patient_identifiers(resource)
+        if idents:
+            res['identifier'] = idents
+        exts = _patient_extensions(resource)
+        if exts:
+            res['extension'] = exts
+    for key in ('note', 'text', 'conclusion', 'contained'):
+        res.pop(key, None)
+    idents = res.get('identifier')
+    if isinstance(idents, list):
+        kept = [i for i in idents if not _is_ssn_class(i)]
+        if kept:
+            res['identifier'] = kept
+        else:
+            res.pop('identifier', None)
+    if rtype == 'Coverage':
+        res = _checkin_coverage(resource, res, patient_id)
+    elif rtype == 'Organization':
+        res = _checkin_organization(resource, res)
+    _drop_related_person_refs(res)
+    # FHI-66 slot: a per-resource element allow-list belongs here, the one
+    # step both checkin and ktc (_ktc_profile) run through. Redaction above
+    # is a deny-list, so an element it does not name (a top-level
+    # `patientName`, `code.Text`) still leaves.
+    _codes_with_our_text(res)
+    # After _codes_with_our_text, which removes every display: this one is
+    # ours, and the code system's own.
+    for slot, codings in _test_markers(stored_meta).items():
+        meta = res.get('meta')
+        if not isinstance(meta, dict):
+            meta = res['meta'] = {}
+        kept = meta.get(slot)
+        kept = [c for c in kept if isinstance(c, dict) and (
+            c.get('system'), c.get('code')) != _TEST_MARKER] \
+            if isinstance(kept, list) else []
+        meta[slot] = kept + codings
+    return res
+
+
+def _ktc_profile(resource, *, patient_id, stored_meta=None):
+    """Kill the Clipboard profile: what a SMART Health Link to a clinic's
+    EHR carries, per resource. Exactly _checkin_profile (redaction, our
+    labels from r6/terminology.py, the HTEST marker kept), and then no
+    `meta.profile`: the KTC spec says senders SHOULD NOT claim profiles and
+    receivers SHALL NOT require them. Which rows reach it is the route's job
+    (r6/ktc.py), and their claims are read before this strips them."""
+    res = _checkin_profile(resource, patient_id=patient_id,
+                           stored_meta=stored_meta)
+    meta = res.get('meta')
+    if isinstance(meta, dict):
+        meta.pop('profile', None)
+    return res
+
+
+def fhir_response(payload, *, profile: Profile, status: int = 200,
+                  resource_type: str | None = None, etag: str | None = None,
+                  patient_id: str | None = None):
+    """The only exit for a FHIR payload that carries patient data.
+
+    THE ONE PROPERTY: the body was produced by the named redaction profile.
+
+    Profile.STANDARD calls apply_redaction, which strips every upstream
+    ``display`` and ``CodeableConcept.text`` and then re-applies labels from
+    r6/terminology.py keyed by code (r6/redaction.py:22-38). The kernel does
+    not reorder that. It only removes the choice of whether to call it.
+
+    ``patient_id`` is required by Profile.PATIENT_CONTROLLED and rejected by
+    the others. The spec's §1.4 signature omits it, but
+    apply_patient_controlled_redaction(resource, patient_id) cannot be called
+    without it — see the PR body.
+    """
+    if not isinstance(profile, Profile):
+        raise TypeError('fhir_response needs a Profile member')
+    if profile is Profile.PATIENT_CONTROLLED and not patient_id:
+        raise ValueError(
+            'Profile.PATIENT_CONTROLLED needs the canonical patient_id it '
+            'injects as the sole identifier')
+    if profile is not Profile.PATIENT_CONTROLLED and patient_id:
+        raise ValueError(
+            f'patient_id is meaningless for {profile.value}; it would read as '
+            'though patient-controlled redaction had run')
+
+    if profile is Profile.STANDARD:
+        body = _redaction_mod.apply_redaction(payload)
+        body = _compliance_mod.add_disclaimer(body, resource_type)
+    elif profile is Profile.PATIENT_CONTROLLED:
+        body = _redaction_mod.apply_patient_controlled_redaction(
+            payload, patient_id)
+    elif profile is Profile.INTAKE:
+        body = _intake_profile(payload)
+    else:
+        # Profile.CHECKIN and Profile.KTC are per-resource and need the
+        # exported patient; their exports call the profile themselves until
+        # slice 14 routes them here. Refused rather than falling through.
+        raise ValueError(f'fhir_response does not serve {profile.value} yet')
+
+    response = jsonify(body)
+    response.status_code = status
+    if etag:
+        response.headers['ETag'] = etag
+    return response
+
+
+#: Endpoint names permitted to answer with an unredacted payload. Adding a
+#: name here is a deliberate two-file change: this frozenset, and the literal
+#: expected set in tests/test_unredacted_exits.py.
+_UNREDACTED_EXITS: frozenset[str] = frozenset({
+    # populated slice by slice; each entry names its reason in the test
+    'r6.subscription_topics',   # SubscriptionTopic is server metadata (routes.py:1671)
+    'r6.audit_search',          # AuditEventRecord is PHI-free by construction
+    'r6.sdc_populate',          # content redacted before population (#282)
+})
+
+
+def unredacted_response(payload, *, endpoint: str, reason: str,
+                        status: int = 200):
+    """Answer with a payload no redaction profile touched.
+
+    THE ONE PROPERTY: ``endpoint`` appears in _UNREDACTED_EXITS. Raises
+    RuntimeError otherwise, at request time, in every environment.
+
+    ``reason`` is a required sentence for the reviewer and is never sent to
+    the client. A required argument nobody can leave blank is what turns
+    "this path applies no redaction" from an omission into a claim.
+
+    r6/routes.py:719-723 (update_resource returning the stored resource) is
+    NOT on the allowlist. It is S-11, a defect, and it migrates to
+    fhir_response(profile=Profile.STANDARD) with its own PR and its own pin.
+    """
+    if endpoint not in _UNREDACTED_EXITS:
+        raise RuntimeError(
+            f"'{endpoint}' is not an approved unredacted exit; add it to "
+            'r6.access._UNREDACTED_EXITS and to tests/test_unredacted_exits.py '
+            'or answer through fhir_response()')
+    if not reason or not reason.strip():
+        raise ValueError('unredacted_response requires a written reason')
+
+    response = jsonify(payload)
+    response.status_code = status
+    return response
+
+
+def outcome_response(severity: str, code: str, diagnostics: str, *,
+                     status: int):
+    """Build a FHIR OperationOutcome. This is r6/routes.py:3705-3716 with a
+    status attached.
+
+    Separate from fhir_response because an OperationOutcome carries text this
+    system authored, never stored patient data. Running it through a
+    redaction profile would be a no-op that teaches a reader the wrong thing
+    about what fhir_response protects.
+
+    ``diagnostics`` must not contain a token, an id from another tenant, or a
+    driver exception string.
+    """
+    response = jsonify({
+        'resourceType': 'OperationOutcome',
+        'issue': [
+            {
+                'severity': severity,
+                'code': code,
+                'diagnostics': diagnostics,
+            }
+        ],
+    })
+    response.status_code = status
+    return response

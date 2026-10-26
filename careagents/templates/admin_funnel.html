@@ -1,0 +1,166 @@
+{% extends "base.html" %}
+{% block title %}Funnel — CareAgents{% endblock %}
+{% block bodyclass %}page-home{% endblock %}
+{# The owner's page (careagents/funnel.py, CARE_OWNER_EMAILS). Counts,
+   account ids, and the Testers table, which shows each tester's email (owner
+   decision 2026-10-16: this page and its CSV only, never the digest or a
+   log). No message, nothing about a record. #}
+{% block content %}
+<main class="hub hub-wide">
+  <div class="hub-head">
+    <div>
+      <h1>Funnel</h1>
+      <p class="hub-sub">Counts per UTC day. Today is {{ today.day }}.</p>
+    </div>
+    <a class="pill" href="/home">Back to your hub</a>
+  </div>
+
+  {# Morning: the loop in order, then who needs a nudge today. The owner's
+     own account is not counted. The nudges are fixed words chosen by fixed
+     rules (signins.needs_you); nothing here comes from a chat. #}
+  <section class="hub-section" id="funnel-morning">
+    <div class="section-head"><h2>Morning</h2></div>
+    <p class="morning-loop">{% for step in morning_loop.chain %}<span class="morning-step"><span class="num">{{ step.count }}</span> {{ step.label }}</span>{% if not loop.last %}<span class="morning-arrow" aria-hidden="true"> → </span>{% endif %}{% endfor %}</p>
+    <p class="morning-side">{% for s in morning_loop.side %}<span class="morning-step"><span class="num">{{ s.count }}</span> {{ s.label }}</span>{% if not loop.last %}<span class="morning-arrow" aria-hidden="true"> · </span>{% endif %}{% endfor %}</p>
+    <p class="card-note">Testers, not counting you. Along the arrows, each number counts only those who also reached the steps before it. Everyone starts on made-up records, so asking and acting do not need their own records. Came back: active again on a later day than the one they joined.</p>
+    <h3 class="morning-h">Needs you today</h3>
+    {% if needs_you %}
+    <ul class="morning-needs">
+      {% for n in needs_you %}
+      <li class="morning-need">
+        <div class="morning-who"><span class="testers-email">{% if n.name %}{{ n.name }} · {% endif %}{{ n.email }}</span>
+          <span class="testers-method">{{ n.stuck_at }}{% if n.days is not none %} · {{ n.days }}d since {{ n.since }}{% endif %}</span></div>
+        <div class="morning-nudge"><span class="morning-nudge-text">{{ n.nudge }}</span>
+          <button type="button" class="pill morning-copy" data-copy="{{ n.nudge }}">Copy</button></div>
+      </li>
+      {% endfor %}
+    </ul>
+    {% else %}
+    <p class="empty">Nobody is stuck today.</p>
+    {% endif %}
+  </section>
+
+  <section class="hub-section" id="funnel-testers">
+    <div class="section-head"><h2>Testers</h2>
+      <a class="pill" href="/admin/funnel/testers.csv" download>Download CSV</a></div>
+    {% if testers %}
+    <p class="card-note">Newest first{% if testers|length >= testers_cap %}, the latest {{ testers_cap }}{% endif %}.
+      Highlighted: joined but never asked a question, or no chat turn or approval for 3 days or more. Joined is the first sign-in. Times are UTC.
+      Milestones: how many of the {{ milestones | length }} steps the tester has reached: {{ milestones | map("replace", "_", " ") | join(", ") }}.</p>
+    <div class="funnel-scroll">
+    <table class="funnel-table testers-table">
+      <thead><tr><th>Email</th><th>Stuck at</th><th>Last active</th>
+        <th>Joined</th><th>Last sign-in</th><th class="num">Sign-ins, 7 days</th>
+        <th>Milestones</th></tr></thead>
+      <tbody>
+      {% for t in testers %}
+      <tr{% if t.stuck %} class="is-stuck"{% endif %}>
+        <td class="testers-email">{{ t.email }}{% if t.is_owner %} <span class="testers-you">you</span>{% endif %}</td>
+        <td>{{ (t.furthest or "-") | replace("_", " ") }}{% if t.idle_days is not none %}<br><span class="testers-method">{{ t.idle_days }}d since {% if t.last_active %}active{% else %}joined{% endif %}</span>{% endif %}
+          {% if t.stuck %}<br><span class="testers-stuck">{{ t.stuck_reason }}</span>{% endif %}</td>
+        <td class="num">{{ t.last_active or "never" }}</td>
+        {# Joined is the first sign-in: an account is made only at one. #}
+        <td><span class="num-text">{{ t.joined }}</span><br><span class="testers-method">{{ t.joined_label }}</span>{% if t.ref and t.ref != t.inviter %}<br><span class="testers-method">ref: {{ t.ref }}</span>{% endif %}</td>
+        <td><span class="num-text">{{ t.last_sign_in or "-" }}</span>{% if t.last_method_label %}<br><span class="testers-method">{{ t.last_method_label }}</span>{% endif %}</td>
+        <td class="num">{{ t.sign_ins_7d }}</td>
+        <td>{% if t.milestones %}<details class="testers-milestones"><summary title="Steps reached, of the {{ milestones | length }}. Tap to list them.">{{ t.milestones | length }} of {{ milestones | length }}</summary>{{ t.milestones | map("replace", "_", " ") | join(", ") }}</details>{% else %}0 of {{ milestones | length }}{% endif %}</td>
+      </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    </div>
+    {% else %}
+    <p class="empty">No accounts yet.</p>
+    {% endif %}
+  </section>
+
+  <section class="hub-section" id="funnel-days">
+    <div class="section-head"><h2>Accounts reaching each step</h2></div>
+    <div class="funnel-scroll">
+    <table class="funnel-table">
+      <thead><tr><th>Step</th><th>Today</th><th>7 days</th>
+        {% for d in report.days[1:] %}<th>{{ d.day[5:] }}</th>{% endfor %}</tr></thead>
+      <tbody>
+      {% for m in milestones %}
+      {# "confirmed" alone read as an unverified email (patient walk). #}
+      <tr><th>{% if m == "confirmed" %}confirmed a beta request{% else %}{{ m | replace("_", " ") }}{% endif %}</th>
+        <td class="num">{{ today[m] }}</td>
+        <td class="num">{{ report.window[m] }}</td>
+        {% for d in report.days[1:] %}<td class="num">{{ d[m] }}</td>{% endfor %}</tr>
+      {% endfor %}
+      <tr><th>joined via invite</th>
+        <td class="num">{{ today.via_invite }}</td>
+        <td class="num">{{ report.window.via_invite }}</td>
+        {% for d in report.days[1:] %}<td class="num">{{ d.via_invite }}</td>{% endfor %}</tr>
+      </tbody>
+    </table>
+    </div>
+    <p class="card-note">Beta requests waiting to be confirmed:
+      <span class="num">{{ report.requests_waiting }}</span></p>
+  </section>
+
+  <section class="hub-section" id="funnel-conversion">
+    <div class="section-head"><h2>Conversion between steps (all time)</h2></div>
+    <div class="funnel-scroll">
+    <table class="funnel-table">
+      <thead><tr><th>From</th><th>To</th><th>Reached</th><th>Rate</th></tr></thead>
+      <tbody>
+      {% for c in report.conversion %}
+      <tr><td>{{ c["from"] | replace("_", " ") }}</td>
+        <td>{{ c["to"] | replace("_", " ") }}</td>
+        <td class="num">{{ c.to_n }} of {{ c.from_n }}</td>
+        <td class="num">{% if c.percent is none %}-{% else %}{{ c.percent }}%{% endif %}</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    </div>
+  </section>
+
+  <section class="hub-section" id="funnel-issues">
+    <div class="section-head"><h2>Issues</h2></div>
+    <div class="funnel-scroll">
+    <table class="funnel-table">
+      <thead><tr><th>Kind</th><th>Today</th><th>7 days</th></tr></thead>
+      <tbody>
+      {% for k in issue_kinds %}
+      <tr><th>{{ k | replace("_", " ") }}</th>
+        <td class="num">{{ today[k] }}</td>
+        <td class="num">{{ report.window[k] }}</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    </div>
+    <div class="funnel-scroll" id="funnel-chat-causes">
+    <table class="funnel-table">
+      <thead><tr><th>Chat error cause</th><th>Today</th><th>7 days</th></tr></thead>
+      <tbody>
+      {% for k in chat_error_causes %}
+      <tr><th>{{ k | replace("_", " ") }}</th>
+        <td class="num">{{ today[k] }}</td>
+        <td class="num">{{ report.window[k] }}</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    </div>
+  </section>
+
+  <section class="hub-section" id="funnel-inviters">
+    <div class="section-head"><h2>Invites per inviter</h2></div>
+    {% if report.per_inviter %}
+    <div class="funnel-scroll">
+    <table class="funnel-table">
+      <thead><tr><th>Inviter account</th><th>Joined</th></tr></thead>
+      <tbody>
+      {% for r in report.per_inviter %}
+      <tr><td class="num">{{ r.inviter_id }}</td><td class="num">{{ r.joined }}</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    </div>
+    {% else %}
+    <p class="empty">Nobody has joined through an invite link yet.</p>
+    {% endif %}
+  </section>
+</main>
+<script src="{{ url_for('static', filename='admin_funnel.js') }}"></script>
+{% endblock %}

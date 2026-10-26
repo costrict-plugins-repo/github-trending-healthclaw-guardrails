@@ -1,0 +1,915 @@
+"""
+Integration tests for R6 Dashboard, Health endpoint, and end-to-end workflows.
+
+Tests cover:
+- Health check endpoint
+- Internal step-up token issuance
+- Dashboard page serving
+- Full agent workflow (create → read → search → context → deidentify → audit)
+- ETag concurrency under concurrent-like updates
+- Cross-tenant isolation across all resource types
+- OAuth end-to-end with PKCE
+- Human-in-the-loop enforcement lifecycle
+- Bundle validation edge cases
+- Rate limit header presence
+- Audit trail export formats
+- Medical disclaimer propagation through search
+"""
+
+import hashlib
+import base64
+import json
+from urllib.parse import parse_qs, urlsplit
+import secrets
+
+
+# ===== Health Check =====
+
+class TestHealthEndpoint:
+    """Test /r6/fhir/health liveness/readiness probe."""
+
+    def test_health_returns_200(self, client):
+        resp = client.get('/r6/fhir/health')
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data['status'] == 'healthy'
+        assert data['checks']['database'] == 'ok'
+
+    def test_health_includes_version(self, client):
+        from r6.version import __version__
+        resp = client.get('/r6/fhir/health')
+        data = resp.get_json()
+        # Version is sourced from package metadata (r6.version), not hardcoded,
+        # so this stays correct across releases.
+        assert data['version'] == __version__
+        assert '6.0.0' in data['fhirVersion']
+
+    def test_health_no_tenant_required(self, client):
+        """Health endpoint should work without X-Tenant-Id."""
+        resp = client.get('/r6/fhir/health')
+        assert resp.status_code == 200
+
+
+# ===== Internal Step-Up Token =====
+
+class TestInternalStepUpToken:
+    """Test /r6/fhir/internal/step-up-token for dashboard."""
+
+    def test_issue_token_returns_valid_token(self, client, tenant_headers):
+        resp = client.post('/r6/fhir/internal/step-up-token',
+                          data=json.dumps({'tenant_id': 'test-tenant'}),
+                          content_type='application/json',
+                          headers=tenant_headers)
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert 'token' in data
+        assert '.' in data['token']  # HMAC format: payload.signature
+
+    def test_issued_token_is_usable(self, client, tenant_headers, sample_patient):
+        """Token from internal endpoint should work for writes."""
+        token_resp = client.post('/r6/fhir/internal/step-up-token',
+                                data=json.dumps({'tenant_id': 'test-tenant'}),
+                                content_type='application/json',
+                                headers=tenant_headers)
+        token = token_resp.get_json()['token']
+
+        resp = client.post('/r6/fhir/Patient',
+                          data=json.dumps(sample_patient),
+                          content_type='application/json',
+                          headers={**tenant_headers, 'X-Step-Up-Token': token})
+        assert resp.status_code == 201
+
+
+# ===== Dashboard Page =====
+
+class TestDashboardPage:
+    """/r6-dashboard renders the conformance measurement.
+
+    These pins were rewritten wholesale when the page was. They used to assert
+    that eleven interactive panels existed by element id. Every one of those
+    panels drove a POST to /r6/…, which the read-only host refuses with 405
+    (api/index.py) — so the suite was green on a page whose controls were dead
+    wherever the public actually met them. Asserting an element exists says
+    nothing about whether it works.
+
+    What replaced them pins the page's real contract: it shows a measurement,
+    it says where the measurement came from, and it does not assert a security
+    property that no probe checked.
+    """
+
+    def test_dashboard_returns_html(self, client):
+        resp = client.get('/r6-dashboard')
+        assert resp.status_code == 200
+        # Asserted against the <h1>, not the page text. The old pin looked for
+        # "Health Data Dashboard" anywhere in the body and was satisfied by the
+        # navigation link on every page — it would have passed against an
+        # empty <main>.
+        assert b'What the guardrails actually did' in resp.data
+
+    def test_dashboard_includes_css(self, client):
+        resp = client.get('/r6-dashboard')
+        assert b'conformance.css' in resp.data
+
+    def test_dashboard_states_where_the_measurement_came_from(self, client):
+        """A grade with no provenance is a number someone typed."""
+        html = client.get('/r6-dashboard').data.decode()
+        assert 'Measured against' in html
+        assert 'This page' in html
+        assert '/r6/fhir/$conformance' in html
+
+    def test_the_measured_host_is_never_reported_as_local(self, client):
+        """MUTATION: render report.target in the 'Measured against' cell -> red.
+
+        report.target is 'local(test-client)' because the harness drives the
+        app in-process. That is true and unusable once the report crosses a
+        host: healthclaw.io shipped "Measured against local(test-client)",
+        which names a machine the reader cannot identify. Verified against
+        production before it was changed.
+        """
+        html = client.get('/r6-dashboard').data.decode()
+        assert 'local(test-client)' not in html
+
+    def test_dashboard_carries_no_client_side_demo_script(self, client):
+        """MUTATION: re-add the r6-dashboard.js <script> tag -> red.
+
+        The page is server-rendered. r6-dashboard.js drives the old panels and
+        every write path in it 405s on the public host; shipping it again
+        would reintroduce controls that cannot work where they are served.
+        """
+        html = client.get('/r6-dashboard').data.decode()
+        assert 'r6-dashboard.js' not in html
+
+    def test_dashboard_linked_in_navbar(self, client):
+        resp = client.get('/')
+        assert b'/r6-dashboard' in resp.data
+
+
+# ===== Full Agent Workflow =====
+
+class TestFullAgentWorkflow:
+    """End-to-end agent workflow: create → read → search → context → deidentify → audit."""
+
+    def test_complete_workflow(self, client, auth_headers, tenant_headers):
+        # 1. Create patient
+        patient = {
+            'resourceType': 'Patient', 'id': 'workflow-pt',
+            'name': [{'family': 'Workflow', 'given': ['Test']}],
+            'gender': 'male', 'birthDate': '1990-01-01',
+            'identifier': [{'value': 'WF123456'}],
+            'address': [{'line': ['999 Test Ave'], 'city': 'Testville', 'state': 'TX'}]
+        }
+        create_resp = client.post('/r6/fhir/Patient',
+                                  data=json.dumps(patient),
+                                  content_type='application/json',
+                                  headers=auth_headers)
+        assert create_resp.status_code == 201
+        assert 'ETag' in create_resp.headers
+
+        # 2. Read back (should be redacted)
+        read_resp = client.get('/r6/fhir/Patient/workflow-pt',
+                              headers=tenant_headers)
+        assert read_resp.status_code == 200
+        data = read_resp.get_json()
+        assert 'value' not in data['identifier'][0]
+        assert 'line' not in data.get('address', [{}])[0]
+
+        # 3. Search
+        search_resp = client.get('/r6/fhir/Patient?_count=10',
+                                headers=tenant_headers)
+        assert search_resp.status_code == 200
+        assert search_resp.get_json()['total'] >= 1
+
+        # 4. Ingest bundle + context
+        obs = {
+            'resourceType': 'Observation', 'id': 'wf-obs-1',
+            'status': 'final',
+            'code': {'coding': [{'system': 'http://loinc.org', 'code': '2339-0'}]},
+            'subject': {'reference': 'Patient/workflow-pt'},
+            'valueQuantity': {'value': 95, 'unit': 'mg/dL'}
+        }
+        bundle = {
+            'resourceType': 'Bundle', 'type': 'collection',
+            'entry': [{'resource': patient}, {'resource': obs}]
+        }
+        ctx_resp = client.post('/r6/fhir/Bundle/$ingest-context',
+                               data=json.dumps(bundle),
+                               content_type='application/json',
+                               headers=tenant_headers)
+        assert ctx_resp.status_code == 201
+        ctx_id = ctx_resp.get_json()['context_id']
+
+        # 5. Retrieve context
+        envelope_resp = client.get(f'/r6/fhir/context/{ctx_id}',
+                                   headers=tenant_headers)
+        assert envelope_resp.status_code == 200
+        assert envelope_resp.get_json()['item_count'] == 2
+
+        # 6. De-identify
+        deid_resp = client.get('/r6/fhir/Patient/workflow-pt/$deidentify',
+                               headers=tenant_headers)
+        assert deid_resp.status_code == 200
+        deid_data = deid_resp.get_json()
+        assert 'name' not in deid_data
+        assert deid_data['id'] != 'workflow-pt'
+
+        # 7. Check audit trail has entries
+        audit_resp = client.get('/r6/fhir/AuditEvent?_count=50',
+                               headers=tenant_headers)
+        assert audit_resp.status_code == 200
+        assert audit_resp.get_json()['total'] >= 4  # create, read, search, context
+
+
+# ===== Cross-Tenant Isolation Comprehensive =====
+
+class TestCrossTenantIsolationComprehensive:
+    """Verify tenant isolation across ALL resource operations."""
+
+    def _create_patient(self, client, tenant, token):
+        """Helper to create a patient under a specific tenant."""
+        patient = {
+            'resourceType': 'Patient',
+            'id': f'iso-pt-{tenant}',
+            'name': [{'family': f'Tenant-{tenant}'}]
+        }
+        return client.post('/r6/fhir/Patient',
+                          data=json.dumps(patient),
+                          content_type='application/json',
+                          headers={'X-Tenant-Id': tenant, 'X-Step-Up-Token': token})
+
+    def test_search_tenant_isolated(self, client):
+        """Search results only include resources from the requesting tenant."""
+        from r6.stepup import generate_step_up_token
+
+        token_a = generate_step_up_token('tenant-a')
+        token_b = generate_step_up_token('tenant-b')
+
+        self._create_patient(client, 'tenant-a', token_a)
+        self._create_patient(client, 'tenant-b', token_b)
+
+        # Search as tenant-a should only see tenant-a's patient
+        resp_a = client.get('/r6/fhir/Patient', headers={'X-Tenant-Id': 'tenant-a'})
+        entries_a = resp_a.get_json().get('entry', [])
+        for e in entries_a:
+            assert 'tenant-a' in json.dumps(e)
+
+        resp_b = client.get('/r6/fhir/Patient', headers={'X-Tenant-Id': 'tenant-b'})
+        entries_b = resp_b.get_json().get('entry', [])
+        for e in entries_b:
+            assert 'tenant-b' in json.dumps(e)
+
+    def test_deidentify_tenant_isolated(self, client):
+        """De-identify fails for cross-tenant access."""
+        from r6.stepup import generate_step_up_token
+        token = generate_step_up_token('tenant-c')
+        self._create_patient(client, 'tenant-c', token)
+
+        # An authenticated different tenant still cannot deidentify tenant-c's data
+        token_d = generate_step_up_token('tenant-d')
+        resp = client.get('/r6/fhir/Patient/iso-pt-tenant-c/$deidentify',
+                          headers={'X-Tenant-Id': 'tenant-d', 'X-Step-Up-Token': token_d})
+        assert resp.status_code == 404
+
+    def test_update_tenant_isolated(self, client):
+        """Cannot update a resource owned by another tenant."""
+        from r6.stepup import generate_step_up_token
+        token_e = generate_step_up_token('tenant-e')
+        self._create_patient(client, 'tenant-e', token_e)
+
+        token_f = generate_step_up_token('tenant-f')
+        resp = client.put('/r6/fhir/Patient/iso-pt-tenant-e',
+                         data=json.dumps({'resourceType': 'Patient', 'id': 'iso-pt-tenant-e', 'gender': 'other'}),
+                         content_type='application/json',
+                         headers={'X-Tenant-Id': 'tenant-f', 'X-Step-Up-Token': token_f})
+        assert resp.status_code == 404
+
+
+# ===== ETag Lifecycle =====
+
+class TestETagLifecycle:
+    """ETag lifecycle: create → update → stale check → concurrent update."""
+
+    def test_etag_increments_on_update(self, client, sample_patient, auth_headers, tenant_headers):
+        # Create
+        r1 = client.post('/r6/fhir/Patient',
+                        data=json.dumps(sample_patient),
+                        content_type='application/json',
+                        headers=auth_headers)
+        etag1 = r1.headers.get('ETag')
+        assert etag1 is not None
+
+        # Update
+        sample_patient['gender'] = 'other'
+        r2 = client.put(f'/r6/fhir/Patient/{sample_patient["id"]}',
+                        data=json.dumps(sample_patient),
+                        content_type='application/json',
+                        headers=auth_headers)
+        etag2 = r2.headers.get('ETag')
+        assert etag2 != etag1
+
+    def test_read_returns_etag(self, client, sample_patient, auth_headers, tenant_headers):
+        client.post('/r6/fhir/Patient',
+                    data=json.dumps(sample_patient),
+                    content_type='application/json',
+                    headers=auth_headers)
+
+        resp = client.get(f'/r6/fhir/Patient/{sample_patient["id"]}',
+                         headers=tenant_headers)
+        assert 'ETag' in resp.headers
+
+
+# ===== OAuth Complete Flow =====
+
+def _code_of(resp):
+    """The code rides in the 302 to the registered redirect URI (#568)."""
+    assert resp.status_code == 302, resp.get_data(as_text=True)
+    return parse_qs(urlsplit(resp.headers['Location']).query)['code'][0]
+
+
+class TestOAuthCompleteFlow:
+    """Full OAuth 2.1 flow with error cases."""
+
+    def _register_client(self, client, tenant_headers):
+        resp = client.post('/r6/fhir/oauth/register',
+                          data=json.dumps({
+                              'client_name': 'Integration Test',
+                              'redirect_uris': ['http://localhost/cb'],
+                              'scope': 'fhir.read context.read',
+                          }),
+                          content_type='application/json',
+                          headers=tenant_headers)
+        return resp.get_json()
+
+    def _make_pkce(self):
+        verifier = secrets.token_urlsafe(32)
+        challenge = base64.urlsafe_b64encode(
+            hashlib.sha256(verifier.encode()).digest()
+        ).rstrip(b'=').decode()
+        return verifier, challenge
+
+    def test_wrong_pkce_verifier_rejected(self, client, tenant_headers):
+        """Token exchange with wrong PKCE verifier must fail."""
+        reg = self._register_client(client, tenant_headers)
+        _, challenge = self._make_pkce()
+
+        auth_resp = client.get(
+            f'/r6/fhir/oauth/authorize?client_id={reg["client_id"]}'
+            f'&redirect_uri=http://localhost/cb&scope=fhir.read'
+            f'&code_challenge={challenge}&code_challenge_method=S256',
+            headers=tenant_headers)
+        code = _code_of(auth_resp)
+
+        # Use a DIFFERENT verifier
+        token_resp = client.post('/r6/fhir/oauth/token',
+                                data=json.dumps({
+                                    'grant_type': 'authorization_code',
+                                    'code': code,
+                                    'code_verifier': 'completely-wrong-verifier',
+                                    'client_id': reg['client_id'],
+                                    'client_secret': reg['client_secret'],
+                                }),
+                                content_type='application/json',
+                                headers=tenant_headers)
+        assert token_resp.status_code == 400
+        assert 'PKCE' in token_resp.get_json().get('error_description', '')
+
+    def test_expired_code_rejected(self, client, tenant_headers):
+        """Using a code twice should fail (single-use)."""
+        reg = self._register_client(client, tenant_headers)
+        verifier, challenge = self._make_pkce()
+
+        auth_resp = client.get(
+            f'/r6/fhir/oauth/authorize?client_id={reg["client_id"]}'
+            f'&redirect_uri=http://localhost/cb&scope=fhir.read'
+            f'&code_challenge={challenge}&code_challenge_method=S256',
+            headers=tenant_headers)
+        code = _code_of(auth_resp)
+
+        # First exchange succeeds
+        client.post('/r6/fhir/oauth/token',
+                    data=json.dumps({
+                        'grant_type': 'authorization_code',
+                        'code': code,
+                        'code_verifier': verifier,
+                        'client_id': reg['client_id'],
+                        'client_secret': reg['client_secret'],
+                    }),
+                    content_type='application/json',
+                    headers=tenant_headers)
+
+        # Second exchange fails (code consumed)
+        resp2 = client.post('/r6/fhir/oauth/token',
+                            data=json.dumps({
+                                'grant_type': 'authorization_code',
+                                'code': code,
+                                'code_verifier': verifier,
+                            }),
+                            content_type='application/json',
+                            headers=tenant_headers)
+        assert resp2.status_code == 400
+
+
+# ===== Bundle Validation Edge Cases =====
+
+class TestBundleEdgeCases:
+    """Edge cases for Bundle ingestion."""
+
+    def test_bundle_missing_resource_type(self, client, tenant_headers):
+        resp = client.post('/r6/fhir/Bundle/$ingest-context',
+                          data=json.dumps({'type': 'collection', 'entry': []}),
+                          content_type='application/json',
+                          headers=tenant_headers)
+        assert resp.status_code == 400
+
+    def test_bundle_with_unsupported_resources_skips_them(self, client, tenant_headers):
+        """Unsupported resource types in a Bundle are skipped, not stored.
+
+        The skip is reported rather than silent — see
+        tests/test_ingest_resilience.py::test_ingest_context_tells_its_caller_what_it_dropped
+        for the `skipped_count` / `skipped_types` half (#377).
+        """
+        bundle = {
+            'resourceType': 'Bundle', 'type': 'collection',
+            'entry': [
+                {'resource': {'resourceType': 'Patient', 'id': 'skip-pt'}},
+                {'resource': {'resourceType': 'ImagingStudy', 'id': 'skip-img'}},
+            ]
+        }
+        resp = client.post('/r6/fhir/Bundle/$ingest-context',
+                          data=json.dumps(bundle),
+                          content_type='application/json',
+                          headers=tenant_headers)
+        assert resp.status_code == 201
+        # Only Patient should be stored (ImagingStudy is not supported)
+        assert resp.get_json()['resource_count'] == 1
+
+    def test_bundle_all_valid_types(self, client, tenant_headers):
+        """All valid Bundle.type values should be accepted."""
+        for btype in ['document', 'message', 'collection', 'transaction', 'batch']:
+            bundle = {
+                'resourceType': 'Bundle', 'type': btype,
+                'entry': [{'resource': {'resourceType': 'Patient', 'id': f'btype-{btype}'}}]
+            }
+            resp = client.post('/r6/fhir/Bundle/$ingest-context',
+                              data=json.dumps(bundle),
+                              content_type='application/json',
+                              headers=tenant_headers)
+            assert resp.status_code == 201, f'Bundle.type={btype} should be accepted'
+
+
+# ===== Audit Export Formats =====
+
+class TestAuditExportFormats:
+    """Test audit trail export in different formats."""
+
+    def _generate_events(self, client, auth_headers, tenant_headers):
+        client.post('/r6/fhir/Patient',
+                    data=json.dumps({'resourceType': 'Patient', 'id': 'export-pt', 'name': [{'family': 'Export'}]}),
+                    content_type='application/json',
+                    headers=auth_headers)
+        client.get('/r6/fhir/Patient/export-pt', headers=tenant_headers)
+
+    def test_ndjson_format(self, client, auth_headers, tenant_headers):
+        self._generate_events(client, auth_headers, tenant_headers)
+        resp = client.get('/r6/fhir/AuditEvent/$export', headers=tenant_headers)
+        assert resp.status_code == 200
+        assert 'ndjson' in resp.content_type
+        lines = resp.data.decode().strip().split('\n')
+        assert len(lines) >= 1
+        # Each line is valid JSON
+        for line in lines:
+            parsed = json.loads(line)
+            assert parsed['resourceType'] == 'AuditEvent'
+
+    def test_fhir_bundle_format(self, client, auth_headers, tenant_headers):
+        self._generate_events(client, auth_headers, tenant_headers)
+        resp = client.get('/r6/fhir/AuditEvent/$export?_format=fhir-bundle',
+                         headers=tenant_headers)
+        assert resp.status_code == 200
+        data = json.loads(resp.data)
+        assert data['resourceType'] == 'Bundle'
+        assert data['type'] == 'collection'
+        assert len(data['entry']) >= 1
+
+
+# ===== Medical Disclaimer Propagation =====
+
+class TestDisclaimerPropagation:
+    """Ensure disclaimers propagate through all read paths."""
+
+    def test_disclaimer_on_observation_search(self, client, auth_headers, tenant_headers):
+        """Search results for clinical types should have disclaimer on entries."""
+        obs = {
+            'resourceType': 'Observation', 'id': 'discl-obs',
+            'status': 'final',
+            'code': {'coding': [{'system': 'http://loinc.org', 'code': '2339-0'}]}
+        }
+        client.post('/r6/fhir/Observation',
+                    data=json.dumps(obs),
+                    content_type='application/json',
+                    headers={**auth_headers, 'X-Human-Confirmed': 'true'})
+
+        resp = client.get('/r6/fhir/Observation', headers=tenant_headers)
+        assert resp.status_code == 200
+        data = resp.get_json()
+        # Disclaimer is on individual entries (each Observation resource)
+        entries = data.get('entry', [])
+        assert len(entries) >= 1
+        assert '_disclaimer' in entries[0]['resource']
+
+    def test_disclaimer_on_create_response(self, client, auth_headers):
+        """Create response for clinical types should have disclaimer."""
+        obs = {
+            'resourceType': 'Observation', 'id': 'discl-obs-2',
+            'status': 'final',
+            'code': {'coding': [{'system': 'http://loinc.org', 'code': '8867-4'}]}
+        }
+        resp = client.post('/r6/fhir/Observation',
+                          data=json.dumps(obs),
+                          content_type='application/json',
+                          headers={**auth_headers, 'X-Human-Confirmed': 'true'})
+        assert resp.status_code == 201
+        assert '_disclaimer' in resp.get_json()
+
+    def test_no_disclaimer_on_patient_search(self, client, sample_patient, auth_headers, tenant_headers):
+        """Patient search should NOT have disclaimer (not clinical)."""
+        client.post('/r6/fhir/Patient',
+                    data=json.dumps(sample_patient),
+                    content_type='application/json',
+                    headers=auth_headers)
+
+        resp = client.get('/r6/fhir/Patient', headers=tenant_headers)
+        assert '_disclaimer' not in resp.get_json()
+
+
+# ===== Validate Edge Cases =====
+
+class TestValidateEdgeCases:
+    """Edge cases for $validate endpoint."""
+
+    def test_validate_unsupported_type(self, client, tenant_headers):
+        resp = client.post('/r6/fhir/ImagingStudy/$validate',
+                          data=json.dumps({'resourceType': 'ImagingStudy'}),
+                          content_type='application/json',
+                          headers=tenant_headers)
+        assert resp.status_code == 400
+
+    def test_validate_empty_json(self, client, tenant_headers):
+        resp = client.post('/r6/fhir/Patient/$validate',
+                          data='not-json',
+                          content_type='application/json',
+                          headers=tenant_headers)
+        assert resp.status_code == 400
+
+    def test_validate_encounter_missing_status(self, client, tenant_headers):
+        resp = client.post('/r6/fhir/Encounter/$validate',
+                          data=json.dumps({'resourceType': 'Encounter'}),
+                          content_type='application/json',
+                          headers=tenant_headers)
+        assert resp.status_code == 422
+        data = resp.get_json()
+        assert any('status' in i.get('diagnostics', '') for i in data['issue'])
+
+
+# ===== Import Stub =====
+
+class TestImportStubWorkflow:
+    """Test cross-version import stub with various source versions."""
+
+    def test_import_from_r4(self, client, tenant_headers):
+        bundle = {
+            'resourceType': 'Bundle', 'type': 'collection',
+            'entry': [
+                {'resource': {'resourceType': 'Patient', 'id': 'r4-pt'}},
+                {'resource': {'resourceType': 'Observation', 'id': 'r4-obs', 'status': 'final'}},
+            ]
+        }
+        resp = client.post('/r6/fhir/$import-stub?source-version=R4',
+                          data=json.dumps(bundle),
+                          content_type='application/json',
+                          headers=tenant_headers)
+        assert resp.status_code == 202
+        data = resp.get_json()
+        assert data['_import_stub']['source_version'] == 'R4'
+        assert data['_import_stub']['entry_count'] == 2
+        assert all(e['transform_status'] == 'needs-transform' for e in data['_import_stub']['entries'])
+
+    def test_import_from_r5(self, client, tenant_headers):
+        bundle = {
+            'resourceType': 'Bundle', 'type': 'collection',
+            'entry': [{'resource': {'resourceType': 'Patient', 'id': 'r5-pt'}}]
+        }
+        resp = client.post('/r6/fhir/$import-stub?source-version=R5',
+                          data=json.dumps(bundle),
+                          content_type='application/json',
+                          headers=tenant_headers)
+        assert resp.status_code == 202
+        assert resp.get_json()['_import_stub']['source_version'] == 'R5'
+
+
+# ===== Phase 2: Dashboard Integration Tests =====
+
+
+class TestDashboardScope:
+    """The page states what its grade does not cover.
+
+    The panel-inventory tests that used to live here went with the panels.
+    Scope is the part worth pinning: a self-graded A that does not say what it
+    excluded is the most misleading thing this page could publish.
+    """
+
+    def test_dashboard_publishes_its_limits(self, client):
+        html = client.get('/r6-dashboard').data.decode()
+        assert 'What this grade does not cover' in html
+        # Two limits hold whatever the harness reports, so they are asserted
+        # by text rather than derived from the run.
+        assert 'not an audit' in html
+        assert 'conformance-selftest' in html
+
+    def test_dashboard_says_the_grade_is_self_awarded(self, client):
+        """MUTATION: delete the "grades itself" sentence -> red."""
+        html = client.get('/r6-dashboard').data.decode()
+        assert 'grades itself' in html
+        assert 'SOC 2' in html
+
+
+class TestPhase2VersionUpdate:
+    """Test version is updated for Phase 2."""
+
+    def test_health_shows_phase2_version(self, client):
+        from r6.version import __version__
+        resp = client.get('/r6/fhir/health')
+        data = resp.get_json()
+        # Sourced from package metadata (r6.version) — never a hardcoded string.
+        assert data['version'] == __version__
+
+
+class TestPhase2EndToEndWorkflow:
+    """End-to-end Phase 2 workflow: Permission + $stats + SubscriptionTopic."""
+
+    def test_phase2_workflow(self, client, auth_headers, tenant_headers):
+        # 1. Create Permission
+        permission = {
+            'resourceType': 'Permission', 'id': 'e2e-perm',
+            'status': 'active', 'combining': 'permit-overrides',
+            'rule': [{'type': 'permit', 'activity': [{'action': [{'coding': [{'code': 'read'}]}]}]}]
+        }
+        perm_resp = client.post('/r6/fhir/Permission',
+                                data=json.dumps(permission),
+                                content_type='application/json',
+                                headers=auth_headers)
+        assert perm_resp.status_code == 201
+
+        # 2. Evaluate Permission
+        eval_resp = client.post('/r6/fhir/Permission/$evaluate',
+                                data=json.dumps({'action': 'read'}),
+                                content_type='application/json',
+                                headers=tenant_headers)
+        assert eval_resp.status_code == 200
+        decision = next(p for p in eval_resp.get_json()['parameter'] if p['name'] == 'decision')
+        assert decision['valueCode'] == 'permit'
+
+        # 3. Create Observations for $stats
+        obs_headers = {**auth_headers, 'X-Human-Confirmed': 'true'}
+        for i, val in enumerate([80, 90, 100]):
+            client.post('/r6/fhir/Observation',
+                       data=json.dumps({
+                           'resourceType': 'Observation', 'id': f'e2e-obs-{i}',
+                           'status': 'final',
+                           'code': {'coding': [{'code': '2339-0'}]},
+                           'valueQuantity': {'value': val, 'unit': 'mg/dL'}
+                       }),
+                       content_type='application/json', headers=obs_headers)
+
+        # 4. Run $stats
+        stats_resp = client.get('/r6/fhir/Observation/$stats?code=2339-0',
+                                headers=tenant_headers)
+        assert stats_resp.status_code == 200
+        params = {p['name']: p for p in stats_resp.get_json()['parameter']}
+        assert params['count']['valueInteger'] == 3
+        assert params['mean']['valueDecimal'] == 90.0
+
+        # 5. Run $lastn
+        lastn_resp = client.get('/r6/fhir/Observation/$lastn?code=2339-0&max=1',
+                                headers=tenant_headers)
+        assert lastn_resp.status_code == 200
+        assert lastn_resp.get_json()['total'] == 1
+
+        # 6. Create SubscriptionTopic
+        topic = {
+            'resourceType': 'SubscriptionTopic', 'id': 'e2e-topic',
+            'url': 'http://test.org/topic', 'status': 'active',
+        }
+        topic_resp = client.post('/r6/fhir/SubscriptionTopic',
+                                 data=json.dumps(topic),
+                                 content_type='application/json',
+                                 headers=auth_headers)
+        assert topic_resp.status_code == 201
+
+        # 7. List topics
+        list_resp = client.get('/r6/fhir/SubscriptionTopic/$list',
+                               headers=tenant_headers)
+        assert list_resp.status_code == 200
+        assert list_resp.get_json()['total'] >= 1
+
+        # 8. Verify audit trail captured everything
+        audit_resp = client.get('/r6/fhir/AuditEvent?_count=50',
+                                headers=tenant_headers)
+        assert audit_resp.status_code == 200
+        assert audit_resp.get_json()['total'] >= 5
+
+
+class TestDemoAgentLoop:
+    """Test the orchestrated 6-step agent guardrail demo endpoint."""
+
+    def test_demo_loop_returns_all_steps(self, client):
+        """The demo loop endpoint returns all 6 guardrail steps."""
+        resp = client.post('/r6/fhir/demo/agent-loop',
+                           content_type='application/json',
+                           headers={'X-Tenant-Id': 'demo-test'})
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data['title'] == 'MCP Guardrail Pattern Sequence'
+        assert len(data['steps']) == 6
+        assert len(data['guardrails_demonstrated']) == 6
+
+    def test_demo_loop_step_sequence(self, client):
+        """Steps execute in the correct order with expected statuses."""
+        resp = client.post('/r6/fhir/demo/agent-loop',
+                           content_type='application/json',
+                           headers={'X-Tenant-Id': 'demo-seq'})
+        data = resp.get_json()
+        steps = data['steps']
+
+        # Step 1: Patient read (success)
+        assert steps[0]['step'] == 1
+        assert steps[0]['guardrail'] == 'PHI redaction'
+        assert steps[0]['status'] == 'success'
+
+        # Step 2: Propose observation (validated)
+        assert steps[1]['step'] == 2
+        assert steps[1]['guardrail'] == '$validate gate'
+        assert steps[1]['status'] == 'validated'
+
+        # Step 3: Permission denies (denied)
+        assert steps[2]['step'] == 3
+        assert steps[2]['status'] == 'denied'
+        deny_params = steps[2]['result']['parameter']
+        decision = next(p for p in deny_params if p['name'] == 'decision')
+        assert decision['valueCode'] == 'deny'
+
+        # Step 4: Permit rule + re-evaluate (permitted)
+        assert steps[3]['step'] == 4
+        assert steps[3]['status'] == 'permitted'
+        permit_params = steps[3]['result']['evaluation']['parameter']
+        decision = next(p for p in permit_params if p['name'] == 'decision')
+        assert decision['valueCode'] == 'permit'
+
+        # Step 5: Step-up auth gate
+        assert steps[4]['step'] == 5
+        assert steps[4]['status'] == 'awaiting_confirmation'
+        assert steps[4]['result']['human_confirmation_required'] is True
+
+        # Step 6: Commit with audit trail
+        assert steps[5]['step'] == 6
+        assert steps[5]['status'] == 'committed'
+        assert len(steps[5]['result']['audit_trail']) > 0
+
+    def test_demo_loop_generates_audit_events(self, client):
+        """The demo loop generates audit events visible in the audit feed."""
+        from r6.stepup import generate_step_up_token
+        client.post('/r6/fhir/demo/agent-loop',
+                    content_type='application/json',
+                    headers={'X-Tenant-Id': 'demo-audit'})
+
+        # Reading the audit feed for a non-public tenant requires auth now.
+        audit_resp = client.get('/r6/fhir/AuditEvent?_count=20',
+                                headers={'X-Tenant-Id': 'demo-audit',
+                                         'X-Step-Up-Token': generate_step_up_token('demo-audit')})
+        assert audit_resp.status_code == 200
+        assert audit_resp.get_json()['total'] >= 4
+
+    def test_demo_loop_no_tenant_required(self, client):
+        """The demo loop works without explicit tenant (falls back to demo-tenant)."""
+        resp = client.post('/r6/fhir/demo/agent-loop',
+                           content_type='application/json')
+        assert resp.status_code == 200
+
+    def test_demo_loop_refuses_non_public_tenants_without_the_secret(
+            self, client, monkeypatch):
+        """The demo loop WRITES and soft-deletes every Permission for the
+        tenant it is pointed at, and it lives under /demo/ — a prefix exempt
+        from tenant enforcement and human-in-the-loop.
+
+        Ungated it was an anonymous cross-tenant write + access-policy-delete
+        primitive against any tenant an attacker could name, live in
+        production. It rides the same fail-closed gate as seed/mint.
+        """
+        monkeypatch.setenv("INTERNAL_TOKEN_MINT_SECRET", "s3cret")
+
+        denied = client.post('/r6/fhir/demo/agent-loop',
+                             content_type='application/json',
+                             headers={'X-Tenant-Id': 'someones-real-tenant'})
+        assert denied.status_code == 403
+
+        allowed = client.post('/r6/fhir/demo/agent-loop',
+                              content_type='application/json',
+                              headers={'X-Tenant-Id': 'someones-real-tenant',
+                                       'X-Internal-Secret': 's3cret'})
+        assert allowed.status_code == 200
+
+    def test_demo_loop_does_not_delete_permissions_it_cannot_write(
+            self, client, monkeypatch):
+        """The destructive half specifically: a refused call must not have
+        soft-deleted the target tenant's access-control policy on its way out.
+
+        Uses a NON-public tenant on purpose — the conftest marks 'test-tenant'
+        public, which is exactly the case the gate is supposed to allow.
+        """
+        from models import db
+        from r6.models import R6Resource
+
+        victim = 'someone-elses-private-tenant'
+        db.session.add(R6Resource(
+            resource_type='Permission',
+            resource_json=json.dumps({'resourceType': 'Permission',
+                                      'id': 'keep-me'}),
+            resource_id='keep-me', tenant_id=victim))
+        db.session.commit()
+
+        monkeypatch.setenv("INTERNAL_TOKEN_MINT_SECRET", "s3cret")
+        refused = client.post('/r6/fhir/demo/agent-loop',
+                              content_type='application/json',
+                              headers={'X-Tenant-Id': victim})
+        assert refused.status_code == 403
+
+        survivor = R6Resource.query.filter_by(
+            resource_type='Permission', tenant_id=victim,
+            id='keep-me', is_deleted=False).first()
+        assert survivor is not None, "refused call still wiped the policy"
+
+    def test_demo_loop_redaction_applied(self, client):
+        """Step 1 shows redacted patient data."""
+        resp = client.post('/r6/fhir/demo/agent-loop',
+                           content_type='application/json',
+                           headers={'X-Tenant-Id': 'demo-redact'})
+        data = resp.get_json()
+        patient = data['steps'][0]['result']
+        # Identifier values are removed
+        if patient.get('identifier'):
+            for ident in patient['identifier']:
+                assert 'value' not in ident, "Identifier values should be removed"
+        # Check names are redacted (given truncated to initial)
+        if patient.get('name'):
+            for name_entry in patient['name']:
+                for given in name_entry.get('given', []):
+                    assert given.endswith('.'), f"Given name not redacted: {given}"
+
+    def test_demo_loop_is_idempotent(self, client, tenant_id, tenant_headers):
+        """Two presses of the demo button leave ONE of each resource.
+
+        The loop minted `demo-loop-{pt,obs,perm}-<uuid8>` per call, so every
+        press added a Patient — and the dashboard button plus `dashboard.spec.ts`
+        press it on every CI run. The demo tenant reached 19 Patients, at which
+        point $care-gaps correctly refused to guess whose preventive care to
+        evaluate and two steps of our own demo script stopped working (#415).
+        The guardrail showcase was what broke the guardrail showcase.
+
+        MUTATION: put the uuid8 suffix back on the ids -> red (2, not 1).
+        """
+        for _ in range(2):
+            resp = client.post('/r6/fhir/demo/agent-loop',
+                               content_type='application/json',
+                               headers={'X-Tenant-Id': tenant_id})
+            assert resp.status_code == 200
+
+        # Driven through the real search route, not the ORM: the accumulation
+        # was found by searching Patient on the live tenant.
+        for resource_type in ('Patient', 'Observation', 'Permission'):
+            search = client.get(f'/r6/fhir/{resource_type}',
+                                headers=tenant_headers)
+            assert search.status_code == 200
+            assert search.get_json()['total'] == 1, (
+                f'two demo runs left more than one {resource_type}')
+
+    def test_demo_loop_leaves_care_gaps_answerable(
+            self, client, tenant_id, tenant_headers):
+        """Step 4 of the 10-minute demo script, after two demo-button presses.
+
+        The ambiguity guard (#393) is untouched and must stay that way — it
+        resolves here because the tenant holds one patient again, not because
+        anything now guesses among several.
+        """
+        for _ in range(2):
+            client.post('/r6/fhir/demo/agent-loop',
+                        content_type='application/json',
+                        headers={'X-Tenant-Id': tenant_id})
+
+        resp = client.post('/r6/fhir/Patient/$care-gaps',
+                           headers=tenant_headers, json={})
+        assert resp.status_code == 200
+        params = resp.get_json()['parameter']
+        resolution = json.loads(
+            next(p for p in params
+                 if p['name'] == 'subjectResolution')['valueString'])
+        assert resolution == {'state': 'tenant-default',
+                              'subject': 'Patient/demo-loop-pt'}

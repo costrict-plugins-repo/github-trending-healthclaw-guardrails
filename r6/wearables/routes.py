@@ -1,0 +1,316 @@
+"""
+Flask Blueprint for wearables: provider discovery, OAuth kickoff/callback,
+sync status, manual sync trigger.
+
+Mounted at /wearables. Follows the Fasten Connect blueprint pattern.
+"""
+
+from __future__ import annotations
+
+import base64
+import hashlib
+import hmac
+import json
+import logging
+import os
+import time
+from datetime import datetime, timezone
+
+from flask import Blueprint, Response, current_app, jsonify, redirect, request
+from markupsafe import escape
+
+from models import db
+from r6 import constant_time
+from r6.access import (_TENANT_ID_PATTERN, Scope, TenantRejected,
+                       TenantSource, require_grant, require_open_tenant,
+                       tenant_from_request)
+from r6.audit import add_audit_event
+from r6.read_auth import authorize_tenant_read
+from r6.wearables.client import WearablesClient
+from r6.wearables.models import SUPPORTED_PROVIDERS, WearableConnection
+from r6.wearables.poller import run_once
+
+logger = logging.getLogger(__name__)
+
+wearables_blueprint = Blueprint('wearables', __name__, url_prefix='/wearables')
+
+_STATE_TTL_SECONDS = 600  # 10 minutes
+
+
+# --- state signing ---------------------------------------------------------
+
+def _state_secret() -> bytes:
+    secret = (
+        os.environ.get('WEARABLES_OAUTH_STATE_SECRET')
+        or os.environ.get('STEP_UP_SECRET')
+        or ''
+    )
+    return secret.encode('utf-8')
+
+
+def _sign_state(payload: dict) -> str:
+    raw = json.dumps(payload, separators=(',', ':'), sort_keys=True).encode()
+    body = base64.urlsafe_b64encode(raw).decode().rstrip('=')
+    sig = hmac.new(_state_secret(), body.encode(), hashlib.sha256).hexdigest()
+    return f'{body}.{sig}'
+
+
+def _verify_state(state: str) -> dict | None:
+    if not state or '.' not in state:
+        return None
+    body, sig = state.rsplit('.', 1)
+    expected = hmac.new(
+        _state_secret(), body.encode(), hashlib.sha256,
+    ).hexdigest()
+    if not constant_time.equal(sig, expected):
+        return None
+    try:
+        padding = '=' * (-len(body) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(body + padding))
+    except Exception:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if payload.get('exp', 0) < int(time.time()):
+        return None
+    return payload
+
+
+# --- provider discovery ----------------------------------------------------
+
+def _configured_providers_from_env() -> set[str]:
+    """
+    Infer which providers have OAuth app credentials configured in the
+    sidecar's env. Operators who set {PROVIDER}_CLIENT_ID will have the
+    provider appear as 'configured'.
+    """
+    configured = set()
+    for p in SUPPORTED_PROVIDERS:
+        if os.environ.get(f'{p.upper()}_CLIENT_ID'):
+            configured.add(p)
+    return configured
+
+
+@wearables_blueprint.route('/providers', methods=['GET'])
+def list_providers():
+    wc = WearablesClient()
+    providers_raw = wc.list_providers() if wc.enabled() else [
+        {'name': n} for n in SUPPORTED_PROVIDERS
+    ]
+    configured = _configured_providers_from_env()
+    providers = []
+    for p in providers_raw:
+        name = p.get('name') if isinstance(p, dict) else str(p)
+        if not name:
+            continue
+        providers.append({
+            'name': name,
+            'configured': name in configured,
+            'oauth_start': f'/wearables/oauth/start?provider={name}',
+        })
+    return jsonify({
+        'enabled': wc.enabled(),
+        'base_url_configured': wc.enabled(),
+        'providers': providers,
+    })
+
+
+# --- OAuth kickoff + callback ---------------------------------------------
+
+@wearables_blueprint.route('/oauth/start', methods=['GET'])
+def oauth_start():
+    provider = (request.args.get('provider') or '').lower()
+    tenant_id = request.args.get('tenant_id') or ''
+    if provider not in SUPPORTED_PROVIDERS:
+        return jsonify({'error': f'unsupported provider: {provider}'}), 400
+    if not tenant_id:
+        return jsonify({'error': 'tenant_id required'}), 400
+    # Unauthenticated and sent upstream as `user_id=hc-<tenant_id>`, so it
+    # must at least be a tenant id (FHI-60). Fixed wording: never echoed.
+    if not _TENANT_ID_PATTERN.fullmatch(tenant_id):
+        return jsonify({'error': 'invalid tenant_id'}), 400
+
+    wc = WearablesClient()
+    if not wc.enabled():
+        return jsonify({
+            'error': 'OPEN_WEARABLES_URL not configured',
+            'hint': 'Set OPEN_WEARABLES_URL to enable wearables integration',
+        }), 503
+
+    # Open Wearables wants a stable user id. We scope one per tenant so
+    # the same patient can hold multiple provider connections.
+    ow_user_id = f'hc-{tenant_id}'
+
+    base = request.host_url.rstrip('/')
+    callback_url = f'{base}/wearables/oauth/callback'
+    # NOTE: Open Wearables owns the OAuth authorize+callback; its
+    # /oauth/{provider}/authorize returns the redirect URL but is guarded by
+    # developer-session auth (not our API key), so this returns None with only
+    # an API key. Reconciling the full connect flow (who holds developer auth,
+    # whose callback runs) is an open integration decision — see client.py.
+    kickoff = wc.oauth_authorize_url(
+        provider,
+        ow_user_id=ow_user_id,
+        redirect_uri=callback_url,
+    )
+    if not kickoff:
+        return jsonify({
+            'error': 'wearables connect is not available on this deployment',
+            'detail': 'Open Wearables authorize requires developer-session '
+                      'auth; the connect flow needs integration wiring.',
+        }), 503
+    return redirect(kickoff, code=302)
+
+
+@wearables_blueprint.route('/oauth/callback', methods=['GET'])
+def oauth_callback():
+    state = request.args.get('state', '')
+    payload = _verify_state(state)
+    if not payload:
+        return jsonify({'error': 'invalid or expired state'}), 400
+
+    tenant_id = payload['tenant_id']
+    # A signed state outlives a disconnect: no new connection row for a
+    # tenant the account holder disconnected or deleted (409, audited).
+    require_open_tenant(tenant_id)
+    provider = payload['provider']
+    ow_user_id = payload['ow_user_id']
+    patient_ref = request.args.get('patient_ref') or None
+
+    # Upsert connection. If one already exists for this tuple, update
+    # connected_at and clear status.
+    conn = WearableConnection.query.filter_by(
+        tenant_id=tenant_id,
+        provider=provider,
+        ow_user_id=ow_user_id,
+    ).first()
+    now = datetime.now(timezone.utc)
+    if conn is None:
+        conn = WearableConnection(
+            tenant_id=tenant_id,
+            provider=provider,
+            ow_user_id=ow_user_id,
+            patient_ref=patient_ref,
+            connected_at=now,
+            last_sync_status='never',
+        )
+        db.session.add(conn)
+    else:
+        conn.connected_at = now
+        if patient_ref:
+            conn.patient_ref = patient_ref
+        conn.last_sync_status = 'never'
+        conn.last_sync_detail = None
+    try:
+        db.session.flush()
+        add_audit_event(
+            'create', 'WearableConnection', str(conn.id),
+            agent_id='wearable-oauth',
+            tenant_id=tenant_id,
+            detail=f'connected {provider}',
+        )
+        db.session.commit()
+    except Exception as exc:  # noqa: BLE001
+        db.session.rollback()
+        logger.error('wearable connection commit failed: %s',
+                     type(exc).__name__)
+        return jsonify({'error': 'commit failed'}), 500
+
+    html = (
+        '<!doctype html><html><head><meta charset="utf-8">'
+        '<title>Wearable Connected</title>'
+        '<style>body{font-family:system-ui;background:#0b0f14;color:#dbe3ef;'
+        'display:flex;align-items:center;justify-content:center;'
+        'min-height:100vh;margin:0}'
+        '.card{background:#0f141b;border:1px solid #1c242f;border-radius:10px;'
+        'padding:32px;max-width:480px;text-align:center}'
+        '.ok{color:#34d399;font-size:42px;margin-bottom:12px}'
+        'a{color:#22d3ee}</style></head><body><div class="card">'
+        f'<div class="ok">✓</div><h2>{escape(provider.title())} connected</h2>'
+        '<p>Wearable data will start flowing through HealthClaw Guardrails '
+        'on the next sync pass.</p>'
+        f'<p><a href="/r6/fhir/mcp-apps/wearables/?tenant_id={escape(tenant_id)}">'
+        'View connections</a></p>'
+        '</div></body></html>'
+    )
+    return Response(html, mimetype='text/html')
+
+
+# --- status + manual sync --------------------------------------------------
+
+@wearables_blueprint.route('/sync-status', methods=['GET'])
+def sync_status():
+    # A malformed id keeps its 401: authorize_tenant_read refused it.
+    try:
+        tenant_id = authorize_tenant_read(tenant_from_request(
+            sources=(TenantSource.QUERY, TenantSource.HEADER)).id)
+    except TenantRejected as exc:
+        if exc.reason == TenantRejected.ABSENT:
+            return jsonify({'error': 'tenant_id required'}), 400
+        tenant_id = None
+    if tenant_id is None:
+        return jsonify({
+            'error': 'authentication required for this tenant',
+        }), 401
+    conns = WearableConnection.query.filter_by(tenant_id=tenant_id).all()
+    wc = WearablesClient()
+    return jsonify({
+        'tenant_id': tenant_id,
+        'enabled': wc.enabled(),
+        'connections': [c.to_dict() for c in conns],
+    })
+
+
+@wearables_blueprint.route('/sync-now', methods=['POST'])
+def sync_now():
+    # Access kernel, slice 9 (docs/2026-08-03-access-kernel-spec.md §1.1). The
+    # matrix row already claimed TENANT_FORMAT for this route, but the 403 it
+    # measured came from the missing step-up token below, not from a format
+    # check: a caller holding a token reached run_once() with the raw string.
+    # The absent-header 400 is unchanged; a MALFORMED id now raises out to the
+    # app-wide handler instead of being carried into the sweep and the audit.
+    try:
+        tenant = tenant_from_request(sources=(TenantSource.HEADER,))
+    except TenantRejected as exc:
+        if exc.reason == TenantRejected.MALFORMED:
+            raise
+        return jsonify({'error': 'X-Tenant-Id required'}), 400
+
+    # Access kernel, slice 4 (docs/2026-08-03-access-kernel-spec.md §2.5).
+    # This site exists in the slice order to prove the MINORITY dialect
+    # survives migration: the same failure answers 401 at nine sites and 403
+    # at three, and normalizing that is the founder's call, not this
+    # migration's. So both statuses are passed explicitly and the wire
+    # behaviour is unchanged — 403 with no token, 403 with a bad one.
+    #
+    # Scope.WRITE, not TENANT_BOUND: validate_step_up_token's require_scope
+    # defaults to 'write', so the two-argument call this replaces was already
+    # demanding a write-scoped token. Reading the default rather than the
+    # call site is the difference between preserving behaviour and guessing
+    # at it.
+    grant = require_grant(
+        scope=Scope.WRITE,
+        tenant=tenant,
+        absent_status=403,
+        rejected_status=403,
+    )
+
+    # Scope the sweep to the authenticated tenant. run_once() defaults to a
+    # global sweep (the background poller relies on it); passing the GRANT's
+    # tenant here keeps this patient-triggered endpoint from touching other
+    # tenants (issue #311). grant.tenant_id rather than the header: the
+    # handler must not be able to sweep a tenant the grant did not authorize
+    # (spec §3(e)).
+    summary = run_once(current_app, tenant_id=grant.tenant_id)
+    add_audit_event(
+        'update', 'WearableConnection', None,
+        agent_id=request.headers.get('X-Agent-Id', 'wearable-manual-sync'),
+        tenant_id=grant.tenant_id,
+        detail=(
+            f"manual sync: checked={summary.get('connections_checked')} "
+            f"ingested={summary.get('observations_ingested')} "
+            f"errors={summary.get('errors')}"
+        ),
+    )
+    db.session.commit()
+    return jsonify(summary)

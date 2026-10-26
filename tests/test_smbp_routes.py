@@ -1,0 +1,112 @@
+import json
+
+from r6.models import R6Resource, db
+from r6.smbp.monitoring import build_bp_observation
+
+
+def test_enroll_creates_session(client, tenant_headers):
+    resp = client.post("/r6/smbp/enroll", headers=tenant_headers,
+                       json={"patient_ref": "Patient/p1", "language": "es"})
+    assert resp.status_code == 201
+    body = resp.get_json()
+    assert body["language"] == "es"
+    assert body["id"]
+
+
+def test_reading_requires_step_up(client, tenant_headers):
+    resp = client.post("/r6/smbp/reading", headers=tenant_headers,
+                       json={"patient_ref": "Patient/p1", "systolic": 142,
+                             "diastolic": 88, "effective": "2026-06-01T08:00:00Z"})
+    assert resp.status_code == 401
+
+
+def test_reading_logs_observation_and_classifies(client, auth_headers, tenant_id, app):
+    resp = client.post("/r6/smbp/reading", headers=auth_headers,
+                       json={"patient_ref": "Patient/p1", "systolic": 168,
+                             "diastolic": 104, "effective": "2026-06-02T20:00:00Z"})
+    assert resp.status_code == 201
+    body = resp.get_json()
+    assert body["triage"]["band"] == "stage2"
+    with app.app_context():
+        n = R6Resource.query.filter_by(resource_type="Observation",
+                                       tenant_id=tenant_id).count()
+        assert n >= 1
+
+
+def test_emergency_reading_flagged_in_response(client, auth_headers):
+    resp = client.post("/r6/smbp/reading", headers=auth_headers,
+                       json={"patient_ref": "Patient/p1", "systolic": 190,
+                             "diastolic": 122, "effective": "2026-06-03T08:00:00Z",
+                             "symptoms": ["chest_pain"]})
+    assert resp.status_code == 201
+    assert resp.get_json()["triage"]["emergency"] is True
+
+
+def _seed_session_and_readings(client, app, tenant_id, auth_headers):
+    enroll = client.post("/r6/smbp/enroll", headers={**auth_headers},
+                         json={"patient_ref": "Patient/p1", "language": "en"})
+    session_id = enroll.get_json()["id"]
+    with app.app_context():
+        for s, d, when in [(142, 90, "2026-06-01T08:00:00Z"),
+                           (150, 96, "2026-06-01T20:00:00Z"),
+                           (134, 86, "2026-06-02T08:00:00Z")]:
+            obs = build_bp_observation("Patient/p1", s, d, when)
+            db.session.add(R6Resource(resource_type="Observation",
+                                      resource_json=json.dumps(obs),
+                                      tenant_id=tenant_id))
+        db.session.commit()
+    return session_id
+
+
+def test_report_requires_read_auth_for_nonpublic_tenant(client, app, monkeypatch):
+    monkeypatch.setenv("READ_AUTH_ENABLED", "true")
+    monkeypatch.setenv("PUBLIC_TENANTS", "")
+    # enroll a session under a non-public tenant WITH a token, then read WITHOUT one
+    from r6.stepup import generate_step_up_token
+    tok = generate_step_up_token("private-smbp")
+    enroll = client.post("/r6/smbp/enroll",
+                         headers={"X-Tenant-Id": "private-smbp", "X-Step-Up-Token": tok},
+                         json={"patient_ref": "Patient/p1", "language": "en"})
+    session_id = enroll.get_json()["id"]
+    # report with only the tenant header (no token) must be rejected
+    resp = client.get(f"/r6/smbp/report/{session_id}",
+                      headers={"X-Tenant-Id": "private-smbp"})
+    assert resp.status_code == 401
+    assert resp.get_json()["issue"][0]["code"] == "security"
+
+
+def test_report_html_and_pdf(client, app, tenant_id, auth_headers, tenant_headers):
+    session_id = _seed_session_and_readings(client, app, tenant_id, auth_headers)
+    html = client.get(f"/r6/smbp/report/{session_id}", headers=tenant_headers)
+    assert html.status_code == 200
+    assert b"130/80" in html.data
+    pdf = client.get(f"/r6/smbp/report/{session_id}?format=pdf", headers=tenant_headers)
+    assert pdf.status_code == 200
+    assert pdf.data[:4] == b"%PDF"
+
+
+def test_report_skips_a_deleted_reading(client, app, tenant_id, auth_headers,
+                                        tenant_headers):
+    """A soft-deleted reading is not in the clinician report: not a row, not
+    in the averages, not a flag.
+
+    MUTATION: drop `is_deleted=False` from the report's query -> red."""
+    enroll = client.post("/r6/smbp/enroll", headers=auth_headers,
+                         json={"patient_ref": "Patient/p1", "language": "en"})
+    session_id = enroll.get_json()["id"]
+    with app.app_context():
+        for s, d, when, deleted in [(128, 78, "2026-06-01T08:00:00Z", False),
+                                    (188, 118, "2026-06-01T20:00:00Z", True)]:
+            row = R6Resource(resource_type="Observation",
+                             resource_json=json.dumps(build_bp_observation(
+                                 "Patient/p1", s, d, when)),
+                             tenant_id=tenant_id)
+            row.is_deleted = deleted
+            db.session.add(row)
+        db.session.commit()
+
+    html = client.get(f"/r6/smbp/report/{session_id}", headers=tenant_headers)
+    assert html.status_code == 200
+    assert b"128/78" in html.data
+    assert b"188/118" not in html.data, (
+        "a reading the patient deleted is in the clinician's report")
