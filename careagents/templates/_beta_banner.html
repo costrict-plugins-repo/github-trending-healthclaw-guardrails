@@ -1,0 +1,6 @@
+{# Beta posture (council ruling 2026-09-02, D3): one line, on the landing
+   page and the hub. On the hub it names the account's own records (calm
+   hub spec section 7). The landing page has no account. Tests pin it under
+   fifteen words. #}
+<p class="beta-banner"><b>Beta:</b> {{ banner_records | default("made-up records only") }}. Things will break,
+  <a href="/feedback">tell us</a>.</p>

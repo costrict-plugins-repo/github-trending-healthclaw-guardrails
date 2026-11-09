@@ -1,0 +1,1511 @@
+"""
+Curatr — FHIR Data Quality Evaluation Engine.
+
+Validates coding elements in FHIR resources against public terminology
+services and structural rules, then presents issues in plain language
+with patient-facing impact descriptions and resolution suggestions.
+
+Public terminology services used (no auth required):
+- tx.fhir.org  — HL7 public FHIR terminology server (SNOMED, LOINC, ICD-10)
+- NLM Clinical Tables API — ICD-10-CM code lookup and description
+- RXNAV API    — RxNorm drug code validation
+
+Fixes are applied with a linked FHIR Provenance resource so the original
+source is always traceable.
+"""
+
+import copy
+import hashlib
+import json
+import logging
+import re
+import uuid
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from typing import Optional
+
+import requests
+
+logger = logging.getLogger(__name__)
+
+# Public terminology service endpoints (no auth required)
+TX_FHIR_ORG = "https://tx.fhir.org/r4"
+NLM_ICD10_API = (
+    "https://clinicaltables.nlm.nih.gov/api/icd10cm/v3/search"
+)
+# /REST/rxcui.json searches BY NAME (?name=). Passing ?rxcui= to it is a
+# parameter error and RXNav answers HTTP 400 — which this code did from the
+# day it was written, so every RxNorm lookup returned None ("could not check")
+# and nothing ever looked broken. The per-concept properties endpoint below is
+# the one that takes an rxcui, and it returns the drug NAME.
+RXNAV_PROPERTIES_API = "https://rxnav.nlm.nih.gov/REST/rxcui/{rxcui}/properties.json"
+TERMINOLOGY_TIMEOUT = 5  # seconds
+
+# Code systems that are deprecated / retired
+DEPRECATED_SYSTEMS = {
+    "http://hl7.org/fhir/sid/icd-9-cm": {
+        "message": (
+            "ICD-9-CM was retired in October 2015 and is no longer "
+            "accepted by most US health systems and insurers."
+        ),
+        "replacement": "http://hl7.org/fhir/sid/icd-10-cm",
+        "replacement_name": "ICD-10-CM",
+        "severity": "critical",
+    },
+    "http://hl7.org/fhir/sid/icd-9": {
+        "message": "ICD-9 was retired in October 2015.",
+        "replacement": "http://hl7.org/fhir/sid/icd-10-cm",
+        "replacement_name": "ICD-10-CM",
+        "severity": "critical",
+    },
+    "2.16.840.1.113883.6.103": {
+        "message": (
+            "ICD-9-CM (OID 2.16.840.1.113883.6.103) was retired "
+            "October 2015."
+        ),
+        "replacement": "http://hl7.org/fhir/sid/icd-10-cm",
+        "replacement_name": "ICD-10-CM",
+        "severity": "critical",
+    },
+}
+
+# Systems that Curatr can actively validate
+SUPPORTED_VALIDATION_SYSTEMS = {
+    "http://snomed.info/sct": "SNOMED CT",
+    "http://loinc.org": "LOINC",
+    "http://hl7.org/fhir/sid/icd-10-cm": "ICD-10-CM",
+    "http://hl7.org/fhir/sid/icd-10": "ICD-10",
+    "http://www.nlm.nih.gov/research/umls/rxnorm": "RxNorm",
+}
+
+# Missing-field definitions for Condition
+_CONDITION_FIELDS = {
+    "code": {
+        "message": (
+            "Your condition record has no standard medical code attached."
+        ),
+        "impact": (
+            "Without a standard code, this condition cannot be matched "
+            "to reference data, insurance records, or clinical guidelines."
+        ),
+        "severity": "critical",
+    },
+    "subject": {
+        "message": "The condition is not linked to a patient record.",
+        "impact": "Unlinked conditions may be ignored by health systems.",
+        "severity": "critical",
+    },
+    "clinicalStatus": {
+        "message": (
+            "Clinical status is missing — it is not clear whether this "
+            "condition is currently active, resolved, or in remission."
+        ),
+        "impact": (
+            "Without clinical status, AI tools and providers may not "
+            "know whether this condition needs attention today."
+        ),
+        "severity": "warning",
+    },
+    "verificationStatus": {
+        "message": (
+            "Verification status is missing — it is unclear whether "
+            "this diagnosis has been confirmed."
+        ),
+        "impact": (
+            "A missing verification status means there is no indication "
+            "of whether this is a confirmed diagnosis, a suspicion, or "
+            "an error."
+        ),
+        "severity": "info",
+    },
+}
+
+_VALID_CLINICAL_STATUS = {
+    "active", "recurrence", "relapse",
+    "inactive", "remission", "resolved",
+}
+
+_VALID_VERIFICATION_STATUS = {
+    "unconfirmed", "provisional", "differential",
+    "confirmed", "refuted", "entered-in-error",
+}
+
+
+@dataclass
+class CuratrIssue:
+    """A single data quality issue found in a FHIR resource."""
+    field_path: str
+    severity: str          # critical | warning | info | suggestion
+    title: str
+    plain_language: str
+    impact: str
+    suggestion: str
+    code_system: Optional[str] = None
+    code_value: Optional[str] = None
+    suggested_value: Optional[dict] = None
+
+
+@dataclass
+class CuratrResult:
+    """Result of a Curatr evaluation pass."""
+    resource_type: str
+    resource_id: str
+    issues: list = field(default_factory=list)
+    overall_quality: str = "good"
+    summary: str = ""
+    checked_at: str = ""
+
+    def to_dict(self):
+        return {
+            "resource_type": self.resource_type,
+            "resource_id": self.resource_id,
+            "overall_quality": self.overall_quality,
+            "summary": self.summary,
+            "checked_at": self.checked_at,
+            "issue_count": len(self.issues),
+            "issues": [
+                {
+                    "field_path": i.field_path,
+                    "severity": i.severity,
+                    "title": i.title,
+                    "plain_language": i.plain_language,
+                    "impact": i.impact,
+                    "suggestion": i.suggestion,
+                    "code_system": i.code_system,
+                    "code_value": i.code_value,
+                    "suggested_value": i.suggested_value,
+                }
+                for i in self.issues
+            ],
+        }
+
+
+class CuratrEngine:
+    """
+    Evaluates FHIR resources for data quality issues.
+
+    Checks coding elements against public terminology services and
+    structural rules. Designed to be called from a Flask route or
+    MCP tool — does not write to the database.
+    """
+
+    def __init__(self, timeout=TERMINOLOGY_TIMEOUT):
+        self.timeout = timeout
+        self._session = requests.Session()
+        self._session.headers.update({"Accept": "application/fhir+json"})
+
+    # ------------------------------------------------------------------ #
+    # Public entry points                                                  #
+    # ------------------------------------------------------------------ #
+
+    def evaluate(self, resource: dict) -> CuratrResult:
+        """Dispatch evaluation to the correct resource handler."""
+        resource_type = resource.get("resourceType", "Unknown")
+        resource_id = resource.get("id", "unknown")
+
+        if resource_type == "Condition":
+            return self._evaluate_condition(resource)
+        if resource_type == "AllergyIntolerance":
+            return self._evaluate_allergy_intolerance(resource)
+        if resource_type == "MedicationRequest":
+            return self._evaluate_medication_request(resource)
+        if resource_type == "Immunization":
+            return self._evaluate_immunization(resource)
+        if resource_type == "Procedure":
+            return self._evaluate_procedure(resource)
+        if resource_type == "DiagnosticReport":
+            return self._evaluate_diagnostic_report(resource)
+
+        # Generic fallback: just check any coding elements present
+        issues = self._scan_codings(resource, resource_type)
+        return self._build_result(resource_type, resource_id, issues)
+
+    def _evaluate_condition(self, condition: dict) -> CuratrResult:
+        resource_id = condition.get("id", "unknown")
+        issues: list[CuratrIssue] = []
+
+        # 1. Required field checks
+        for fname, finfo in _CONDITION_FIELDS.items():
+            if not condition.get(fname):
+                issues.append(CuratrIssue(
+                    field_path=f"Condition.{fname}",
+                    severity=finfo["severity"],
+                    title=f"Missing {fname}",
+                    plain_language=finfo["message"],
+                    impact=finfo["impact"],
+                    suggestion=(
+                        f"Add a {fname} element to your Condition record."
+                    ),
+                ))
+
+        # 2. clinicalStatus value check
+        cs = condition.get("clinicalStatus", {})
+        for idx, coding in enumerate(cs.get("coding", [])):
+            code = coding.get("code", "")
+            if code and code not in _VALID_CLINICAL_STATUS:
+                issues.append(CuratrIssue(
+                    field_path=f"Condition.clinicalStatus.coding[{idx}]",
+                    severity="warning",
+                    title="Invalid clinical status code",
+                    plain_language=(
+                        f"The clinical status code '{code}' is not "
+                        "a recognized FHIR value."
+                    ),
+                    impact=(
+                        "Invalid status codes may cause this condition "
+                        "to be filtered out or misclassified in reports."
+                    ),
+                    suggestion=(
+                        "Use one of: "
+                        + ", ".join(sorted(_VALID_CLINICAL_STATUS))
+                        + "."
+                    ),
+                    code_system=coding.get("system"),
+                    code_value=code,
+                    suggested_value={"code": "active"},
+                ))
+
+        # 3. verificationStatus value check
+        vs = condition.get("verificationStatus", {})
+        for idx, coding in enumerate(vs.get("coding", [])):
+            code = coding.get("code", "")
+            if code and code not in _VALID_VERIFICATION_STATUS:
+                issues.append(CuratrIssue(
+                    field_path=(
+                        f"Condition.verificationStatus.coding[{idx}]"
+                    ),
+                    severity="warning",
+                    title="Invalid verification status code",
+                    plain_language=(
+                        f"The verification status code '{code}' is not "
+                        "a recognized FHIR value."
+                    ),
+                    impact=(
+                        "This affects whether the condition is treated "
+                        "as confirmed or still under evaluation."
+                    ),
+                    suggestion=(
+                        "Use one of: "
+                        + ", ".join(sorted(_VALID_VERIFICATION_STATUS))
+                        + "."
+                    ),
+                    code_system=coding.get("system"),
+                    code_value=code,
+                    suggested_value={"code": "confirmed"},
+                ))
+
+        # 4. Main condition code checks (deprecated system + live lookup)
+        code_elem = condition.get("code", {})
+        if code_elem:
+            issues.extend(self._check_codeable_concept(
+                code_elem, "Condition.code"
+            ))
+
+        return self._build_result("Condition", resource_id, issues)
+
+    def _evaluate_allergy_intolerance(self, resource: dict) -> CuratrResult:
+        """Evaluate AllergyIntolerance for US Core v9 data quality."""
+        resource_id = resource.get("id", "unknown")
+        issues: list[CuratrIssue] = []
+
+        # Required: clinicalStatus
+        if not resource.get("clinicalStatus"):
+            issues.append(CuratrIssue(
+                field_path="AllergyIntolerance.clinicalStatus",
+                severity="critical",
+                title="Missing clinical status",
+                plain_language="Your allergy record is missing a clinical status.",
+                impact="Without a status, it is unclear if this allergy is still active or resolved.",
+                suggestion="Add a clinicalStatus with code 'active', 'inactive', or 'resolved'.",
+            ))
+
+        # Required: patient
+        if not resource.get("patient"):
+            issues.append(CuratrIssue(
+                field_path="AllergyIntolerance.patient",
+                severity="critical",
+                title="Missing patient link",
+                plain_language="This allergy record is not linked to a patient.",
+                impact="Unlinked allergy records may be ignored or lost.",
+                suggestion="Add a patient reference.",
+            ))
+
+        # code element coding quality
+        code_elem = resource.get("code")
+        if code_elem:
+            issues.extend(self._check_codeable_concept(code_elem, "AllergyIntolerance.code"))
+        else:
+            issues.append(CuratrIssue(
+                field_path="AllergyIntolerance.code",
+                severity="warning",
+                title="Missing allergy code",
+                plain_language="Your allergy record has no standard allergen code.",
+                impact="Without a code, other systems cannot match this allergy to alerts or drug interactions.",
+                suggestion="Add a code using RxNorm (for drug allergies) or SNOMED CT (for other allergens).",
+            ))
+
+        # Reaction coding quality
+        for idx, reaction in enumerate(resource.get("reaction", [])):
+            for midx, manifestation in enumerate(reaction.get("manifestation", [])):
+                issues.extend(self._check_codeable_concept(
+                    manifestation, f"AllergyIntolerance.reaction[{idx}].manifestation[{midx}]"
+                ))
+
+        return self._build_result("AllergyIntolerance", resource_id, issues)
+
+    def _evaluate_medication_request(self, resource: dict) -> CuratrResult:
+        """Evaluate MedicationRequest for US Core v9 data quality."""
+        resource_id = resource.get("id", "unknown")
+        issues: list[CuratrIssue] = []
+
+        # Required fields
+        if not resource.get("status"):
+            issues.append(CuratrIssue(
+                field_path="MedicationRequest.status",
+                severity="critical",
+                title="Missing status",
+                plain_language="This medication request has no status.",
+                impact="Without a status, it is unclear if this prescription is active or cancelled.",
+                suggestion="Add a status: 'active', 'on-hold', 'cancelled', 'completed', etc.",
+            ))
+
+        if not resource.get("intent"):
+            issues.append(CuratrIssue(
+                field_path="MedicationRequest.intent",
+                severity="critical",
+                title="Missing intent",
+                plain_language="This medication request is missing its intent.",
+                impact="Intent identifies whether this is a plan, proposal, or actual order.",
+                suggestion="Add intent: 'proposal', 'plan', or 'order'.",
+            ))
+
+        # Medication code quality — check medicationCodeableConcept or medication.concept
+        med_code = (
+            resource.get("medicationCodeableConcept") or
+            resource.get("medication", {}).get("concept")
+        )
+        if med_code:
+            issues.extend(self._check_codeable_concept(med_code, "MedicationRequest.medication"))
+        elif not resource.get("medicationReference") and not resource.get("medication", {}).get("reference"):
+            issues.append(CuratrIssue(
+                field_path="MedicationRequest.medication[x]",
+                severity="critical",
+                title="Missing medication",
+                plain_language="No medication is identified in this request.",
+                impact="Without a medication code or reference, the prescription is uninterpretable.",
+                suggestion="Add a medicationCodeableConcept using RxNorm, or a medicationReference.",
+            ))
+
+        return self._build_result("MedicationRequest", resource_id, issues)
+
+    def _evaluate_immunization(self, resource: dict) -> CuratrResult:
+        """Evaluate Immunization for US Core v9 data quality."""
+        resource_id = resource.get("id", "unknown")
+        issues: list[CuratrIssue] = []
+
+        if not resource.get("status"):
+            issues.append(CuratrIssue(
+                field_path="Immunization.status",
+                severity="critical",
+                title="Missing status",
+                plain_language="This immunization record has no status.",
+                impact="Without a status, it is unclear if the vaccine was actually administered.",
+                suggestion="Set status to 'completed' for administered vaccines.",
+            ))
+
+        # vaccineCode quality check
+        vaccine_code = resource.get("vaccineCode")
+        if vaccine_code:
+            issues.extend(self._check_codeable_concept(vaccine_code, "Immunization.vaccineCode"))
+        else:
+            issues.append(CuratrIssue(
+                field_path="Immunization.vaccineCode",
+                severity="critical",
+                title="Missing vaccine code",
+                plain_language="This immunization record has no vaccine code.",
+                impact="Without a CVX or SNOMED code, this vaccine cannot be matched to immunization records.",
+                suggestion="Add a vaccineCode using CVX (http://hl7.org/fhir/sid/cvx) or SNOMED CT.",
+            ))
+
+        if not resource.get("occurrenceDateTime") and not resource.get("occurrenceString"):
+            issues.append(CuratrIssue(
+                field_path="Immunization.occurrenceDateTime",
+                severity="warning",
+                title="Missing occurrence date",
+                plain_language="No date is recorded for when this vaccine was given.",
+                impact="Without a date, this record cannot be used for immunization history timelines.",
+                suggestion="Add an occurrenceDateTime in FHIR date format (e.g. '2024-03-15').",
+            ))
+
+        return self._build_result("Immunization", resource_id, issues)
+
+    def _evaluate_procedure(self, resource: dict) -> CuratrResult:
+        """Evaluate Procedure for US Core v9 data quality."""
+        resource_id = resource.get("id", "unknown")
+        issues: list[CuratrIssue] = []
+
+        if not resource.get("status"):
+            issues.append(CuratrIssue(
+                field_path="Procedure.status",
+                severity="critical",
+                title="Missing status",
+                plain_language="This procedure record has no status.",
+                impact="Without a status, it is unclear if the procedure was performed or just planned.",
+                suggestion="Set status to 'completed' for procedures that have been performed.",
+            ))
+
+        code_elem = resource.get("code")
+        if code_elem:
+            issues.extend(self._check_codeable_concept(code_elem, "Procedure.code"))
+        else:
+            issues.append(CuratrIssue(
+                field_path="Procedure.code",
+                severity="critical",
+                title="Missing procedure code",
+                plain_language="This procedure has no standard medical code.",
+                impact="Without a CPT or SNOMED code, this procedure is unidentifiable in claims and records.",
+                suggestion="Add a code using SNOMED CT or CPT.",
+            ))
+
+        return self._build_result("Procedure", resource_id, issues)
+
+    def _evaluate_diagnostic_report(self, resource: dict) -> CuratrResult:
+        """Evaluate DiagnosticReport for US Core v9 data quality."""
+        resource_id = resource.get("id", "unknown")
+        issues: list[CuratrIssue] = []
+
+        if not resource.get("status"):
+            issues.append(CuratrIssue(
+                field_path="DiagnosticReport.status",
+                severity="critical",
+                title="Missing status",
+                plain_language="This diagnostic report has no status.",
+                impact="Without a status, it is unclear if this report is final or preliminary.",
+                suggestion="Set status to 'final' for completed reports.",
+            ))
+
+        code_elem = resource.get("code")
+        if code_elem:
+            issues.extend(self._check_codeable_concept(code_elem, "DiagnosticReport.code"))
+        else:
+            issues.append(CuratrIssue(
+                field_path="DiagnosticReport.code",
+                severity="critical",
+                title="Missing report code",
+                plain_language="This diagnostic report has no standard code.",
+                impact="Without a LOINC code, this report type cannot be identified.",
+                suggestion="Add a code using LOINC (http://loinc.org).",
+            ))
+
+        return self._build_result("DiagnosticReport", resource_id, issues)
+
+    # ------------------------------------------------------------------ #
+    # CodeableConcept and Coding checks                                   #
+    # ------------------------------------------------------------------ #
+
+    def _check_codeable_concept(
+        self, element: dict, path: str
+    ) -> list:
+        issues = []
+        codings = element.get("coding", [])
+
+        if not codings:
+            issues.append(CuratrIssue(
+                field_path=f"{path}.coding",
+                severity="warning",
+                title="No structured coding",
+                plain_language=(
+                    "Your condition has a text description but no "
+                    "standard medical code attached."
+                ),
+                impact=(
+                    "Without a standard code, this condition cannot be "
+                    "matched to reference data or clinical guidelines."
+                ),
+                suggestion=(
+                    "Ask your provider to add an ICD-10-CM or SNOMED CT "
+                    "code for this condition."
+                ),
+            ))
+            return issues
+
+        for idx, coding in enumerate(codings):
+            system = coding.get("system", "")
+            code = coding.get("code", "")
+            display = coding.get("display", "")
+            cpath = f"{path}.coding[{idx}]"
+
+            # Deprecated system check (fast, no network)
+            if system in DEPRECATED_SYSTEMS:
+                dep = DEPRECATED_SYSTEMS[system]
+                sys_label = system.split("/")[-1]
+                issues.append(CuratrIssue(
+                    field_path=cpath,
+                    severity=dep["severity"],
+                    title="Outdated code system",
+                    plain_language=dep["message"],
+                    impact=(
+                        f"Records using {sys_label} may not be "
+                        "recognized by current health IT systems, "
+                        "causing matching failures with providers "
+                        "and insurers."
+                    ),
+                    suggestion=(
+                        f"Update to {dep['replacement_name']} "
+                        f"({dep['replacement']}). Your provider can "
+                        "look up the equivalent code."
+                    ),
+                    code_system=system,
+                    code_value=code,
+                ))
+                continue
+
+            # Unrecognized system — info only, can't validate
+            if system and system not in SUPPORTED_VALIDATION_SYSTEMS:
+                issues.append(CuratrIssue(
+                    field_path=cpath,
+                    severity="info",
+                    title="Unrecognized code system",
+                    plain_language=(
+                        f"This record uses a code system ({system}) "
+                        "that Curatr cannot validate automatically."
+                    ),
+                    impact=(
+                        "The code may be valid in its source system but "
+                        "cannot be verified against a public terminology "
+                        "service."
+                    ),
+                    suggestion=(
+                        "Verify this code with your healthcare provider, "
+                        "or request it be mapped to ICD-10-CM or "
+                        "SNOMED CT."
+                    ),
+                    code_system=system,
+                    code_value=code,
+                ))
+                continue
+
+            if not system or not code:
+                continue
+
+            # Live terminology lookup
+            check = self._lookup_code(system, code)
+            if check:
+                issues.extend(
+                    self._issues_from_lookup(
+                        cpath, system, code, display, check
+                    )
+                )
+
+        return issues
+
+    def _scan_codings(self, resource: dict, resource_type: str) -> list:
+        """Generic scan: find all coding[] arrays anywhere in a resource."""
+        issues = []
+
+        def _recurse(obj, path):
+            if isinstance(obj, dict):
+                if "system" in obj and "code" in obj:
+                    system = obj.get("system", "")
+                    if system in DEPRECATED_SYSTEMS:
+                        dep = DEPRECATED_SYSTEMS[system]
+                        issues.append(CuratrIssue(
+                            field_path=path,
+                            severity=dep["severity"],
+                            title="Outdated code system",
+                            plain_language=dep["message"],
+                            impact=(
+                                "Outdated code system may not be "
+                                "recognized by current health IT systems."
+                            ),
+                            suggestion=(
+                                f"Update to {dep['replacement_name']}."
+                            ),
+                            code_system=system,
+                            code_value=obj.get("code"),
+                        ))
+                for k, v in obj.items():
+                    _recurse(v, f"{path}.{k}")
+            elif isinstance(obj, list):
+                for i, item in enumerate(obj):
+                    _recurse(item, f"{path}[{i}]")
+
+        _recurse(resource, resource_type)
+        return issues
+
+    # ------------------------------------------------------------------ #
+    # Terminology service calls                                            #
+    # ------------------------------------------------------------------ #
+
+    def _lookup_code(self, system: str, code: str) -> Optional[dict]:
+        """Route to the right terminology API for the given system."""
+        if system in (
+            "http://hl7.org/fhir/sid/icd-10-cm",
+            "http://hl7.org/fhir/sid/icd-10",
+        ):
+            return self._validate_icd10_nlm(code)
+        if system == "http://www.nlm.nih.gov/research/umls/rxnorm":
+            return self._validate_rxnorm(code)
+        if system in ("http://snomed.info/sct", "http://loinc.org"):
+            return self._validate_tx_fhir(system, code)
+        return None
+
+    def _validate_icd10_nlm(self, code: str) -> Optional[dict]:
+        """
+        Validate an ICD-10-CM code via NLM Clinical Tables API.
+        Returns {'valid': bool, 'display': str|None, 'message': str|None}.
+        """
+        try:
+            resp = self._session.get(
+                NLM_ICD10_API,
+                params={"sf": "code", "terms": code,
+                        "maxList": 1, "df": "code,name"},
+                timeout=self.timeout,
+            )
+            if resp.status_code != 200:
+                return None
+            data = resp.json()
+            # Response: [total, [codes], null, [[code, name], ...]]
+            if not data or len(data) < 4:
+                return None
+            total = data[0]
+            results = data[3] or []
+            if total == 0 or not results:
+                return {
+                    "valid": False,
+                    "display": None,
+                    "message": (
+                        f"Code '{code}' was not found in ICD-10-CM."
+                    ),
+                }
+            first = results[0]
+            if first[0].upper() == code.upper():
+                return {"valid": True, "display": first[1], "message": None}
+            return {
+                "valid": False,
+                "display": None,
+                "message": (
+                    f"Code '{code}' not found in ICD-10-CM. "
+                    f"Closest match: '{first[0]}'."
+                ),
+            }
+        except Exception as exc:
+            logger.debug("NLM ICD-10 lookup failed for %s: %s", code, exc)
+            return None
+
+    def _validate_rxnorm(self, code: str) -> Optional[dict]:
+        """
+        Look up an RxNorm RXCUI via the RXNav properties endpoint.
+        Returns {'valid': bool, 'display': str|None, 'message': str|None}.
+
+        `display` is the drug name, and returning it is the point. This method
+        used to hardcode it to None because it was written as a validity check
+        for the quality scan, where "is this a real code?" is the only
+        question. `terminology_resolver.resolve` reuses it to LABEL a code, so
+        a patient asking "what medications am I on?" was told their record
+        could not be read while four correctly-coded rows sat in it — the
+        upstream display having been stripped by redaction, as designed, with
+        nothing to put back.
+
+        RXNav answers 200 with `{}` for a code that is not a concept. That is
+        an authoritative "no" and is reported as valid=False. A non-200 or a
+        transport error stays None — "could not check" — because
+        terminology_resolver caches an authoritative verdict and must never
+        cache a blip (#344 D2).
+        """
+        try:
+            # Override the session's Accept. It is set once to
+            # application/fhir+json for tx.fhir.org, and RXNav answers a FHIR
+            # Accept with HTTP 406 Not Acceptable — a third way this lookup
+            # returned None that no unit test could see, because a mocked
+            # session has no opinion about headers.
+            resp = self._session.get(
+                RXNAV_PROPERTIES_API.format(rxcui=code),
+                headers={"Accept": "application/json"},
+                timeout=self.timeout,
+            )
+            if resp.status_code != 200:
+                return None
+            properties = (resp.json() or {}).get("properties") or {}
+            name = properties.get("name")
+            if isinstance(name, str) and name.strip():
+                return {"valid": True, "display": name.strip(),
+                        "message": None}
+            return {
+                "valid": False,
+                "display": None,
+                "message": f"RxNorm concept '{code}' not found.",
+            }
+        except Exception as exc:
+            logger.debug("RXNAV lookup failed for %s: %s", code, exc)
+            return None
+
+    def _validate_tx_fhir(
+        self, system: str, code: str
+    ) -> Optional[dict]:
+        """
+        Validate a code via HL7 public FHIR terminology server (tx.fhir.org).
+        Uses CodeSystem/$validate-code; returns FHIR Parameters.
+        """
+        try:
+            resp = self._session.get(
+                f"{TX_FHIR_ORG}/CodeSystem/$validate-code",
+                params={"system": system, "code": code},
+                timeout=self.timeout,
+            )
+            if resp.status_code != 200:
+                return None
+            params = resp.json().get("parameter", [])
+            result_p = next(
+                (p for p in params if p.get("name") == "result"), None
+            )
+            display_p = next(
+                (p for p in params if p.get("name") == "display"), None
+            )
+            message_p = next(
+                (p for p in params if p.get("name") == "message"), None
+            )
+            if result_p is None:
+                return None
+            return {
+                "valid": result_p.get("valueBoolean", False),
+                "display": (
+                    display_p.get("valueString") if display_p else None
+                ),
+                "message": (
+                    message_p.get("valueString") if message_p else None
+                ),
+            }
+        except Exception as exc:
+            logger.debug(
+                "tx.fhir.org validation failed for %s|%s: %s",
+                system, code, exc,
+            )
+            return None
+
+    # ------------------------------------------------------------------ #
+    # Issue builders                                                       #
+    # ------------------------------------------------------------------ #
+
+    def _issues_from_lookup(
+        self,
+        path: str,
+        system: str,
+        code: str,
+        display: str,
+        result: dict,
+    ) -> list:
+        issues = []
+        sys_name = SUPPORTED_VALIDATION_SYSTEMS.get(system, system)
+
+        if not result.get("valid"):
+            msg = result.get("message") or (
+                f"Code '{code}' could not be validated in {sys_name}."
+            )
+            issues.append(CuratrIssue(
+                field_path=path,
+                severity="warning",
+                title=f"Code not found in {sys_name}",
+                plain_language=msg,
+                impact=(
+                    f"If '{code}' is not a valid {sys_name} code, this "
+                    "condition may not match correctly when shared with "
+                    "other health systems."
+                ),
+                suggestion=(
+                    f"Check with your provider that '{code}' is the "
+                    f"correct {sys_name} code for your condition."
+                ),
+                code_system=system,
+                code_value=code,
+            ))
+        elif (
+            display
+            and result.get("display")
+            and display.strip().lower() != result["display"].strip().lower()
+        ):
+            canonical = result["display"]
+            issues.append(CuratrIssue(
+                field_path=f"{path}.display",
+                severity="suggestion",
+                title="Display name differs from terminology",
+                # The stored display is never quoted back: upstream feeds put
+                # patient names there, and this text reaches the caller (#282).
+                plain_language=(
+                    "The description on this record differs from the "
+                    f"official {sys_name} description, '{canonical}'."
+                ),
+                impact=(
+                    "Different descriptions for the same code can cause "
+                    "confusion when your record is shared with providers."
+                ),
+                suggestion=(
+                    f"Update the display text to: '{canonical}'"
+                ),
+                code_system=system,
+                code_value=code,
+                suggested_value={"display": canonical},
+            ))
+
+        return issues
+
+    # ------------------------------------------------------------------ #
+    # Result construction                                                  #
+    # ------------------------------------------------------------------ #
+
+    def _build_result(
+        self, resource_type: str, resource_id: str, issues: list
+    ) -> CuratrResult:
+        severities = [i.severity for i in issues]
+        if "critical" in severities:
+            quality = "critical"
+        elif "warning" in severities:
+            quality = "needs-review"
+        elif "info" in severities or "suggestion" in severities:
+            quality = "review-suggested"
+        else:
+            quality = "good"
+
+        if not issues:
+            # `evaluate` grades ONE resource. Duplication is a property of a
+            # set, so a single-resource pass cannot see it however many rules
+            # it gains — and "no data quality issues found" is a verdict on
+            # the whole record (#458). Say what was actually checked until a
+            # set-level evaluator exists.
+            summary = (
+                f"No coding or structural issues found in this one "
+                f"{resource_type} record. This checked one resource, not "
+                "your record; duplicates and other record types were not "
+                "examined."
+            )
+        else:
+            c = severities.count("critical")
+            w = severities.count("warning")
+            i = severities.count("info") + severities.count("suggestion")
+            parts = []
+            if c:
+                parts.append(f"{c} critical issue{'s' if c > 1 else ''}")
+            if w:
+                parts.append(f"{w} warning{'s' if w > 1 else ''}")
+            if i:
+                parts.append(
+                    f"{i} suggestion{'s' if i > 1 else ''}"
+                )
+            summary = (
+                "Found " + " and ".join(parts)
+                + f" in your {resource_type} record that may affect "
+                "how your health data is understood."
+            )
+
+        return CuratrResult(
+            resource_type=resource_type,
+            resource_id=resource_id,
+            issues=issues,
+            overall_quality=quality,
+            summary=summary,
+            checked_at=datetime.now(timezone.utc).strftime(
+                "%Y-%m-%dT%H:%M:%SZ"
+            ),
+        )
+
+
+# ------------------------------------------------------------------ #
+# Curation state + quality score (persisted on R6Resource)            #
+# ------------------------------------------------------------------ #
+
+_SEVERITY_WEIGHTS = {
+    "critical": 0.4,
+    "warning": 0.2,
+    "info": 0.05,
+    "suggestion": 0.05,
+}
+
+
+def compute_quality_score(result: "CuratrResult") -> float:
+    """
+    Map a CuratrResult's issue list to a 0.0–1.0 quality score.
+
+    1.0 = no issues found. Each issue docks a weight by severity.
+    Floor at 0.0; ceiling at 1.0.
+    """
+    score = 1.0
+    for issue in result.issues:
+        score -= _SEVERITY_WEIGHTS.get(issue.severity, 0.05)
+    return max(0.0, min(1.0, round(score, 3)))
+
+
+def persist_curation_state(
+    resource_type: str,
+    resource_id: str,
+    tenant_id: str | None,
+    result: "CuratrResult",
+    *,
+    fixed: bool = False,
+) -> None:
+    """
+    Update R6Resource.curation_state, quality_score, review_needed
+    based on a Curatr evaluation.
+
+    States:
+      raw -> in_review when issues are found
+      raw|in_review -> curated when fixed=True (set after apply_fix)
+      stays curated once promoted (monotonic until explicitly rejected)
+    """
+    from models import db
+    from r6.models import R6Resource
+
+    row = R6Resource.query.filter_by(
+        id=resource_id,
+        resource_type=resource_type,
+        is_deleted=False,
+        tenant_id=tenant_id,
+    ).first()
+    if not row:
+        return
+
+    row.quality_score = compute_quality_score(result)
+    row.review_needed = bool(result.issues)
+
+    if fixed:
+        row.curation_state = "curated"
+    elif result.issues and row.curation_state in (None, "raw"):
+        row.curation_state = "in_review"
+
+    try:
+        db.session.commit()
+    except Exception:
+        db.session.rollback()
+
+
+# ------------------------------------------------------------------ #
+# Fix application (writes to DB)                                      #
+# ------------------------------------------------------------------ #
+
+# What a data-quality fix may touch, per type: the elements the evaluator
+# above can propose an issue on, and nothing else (#739). A path outside
+# this vocabulary is not a data-quality fix, whatever the card said; the
+# apply side used to walk any dot path and create what was missing, so an
+# approved "fix" could rewrite `subject.reference`, `id`, `meta` or
+# `extension`. The linkage fields (`subject`, `patient`) are the evaluator's
+# too, but only as MISSING: a record that already names its patient is not
+# re-pointed under a fix label.
+FIXABLE_ROOTS = {
+    "Condition": frozenset({"code", "subject", "clinicalStatus",
+                            "verificationStatus", "category",
+                            "onsetDateTime", "recordedDate"}),
+    "AllergyIntolerance": frozenset({"code", "patient", "clinicalStatus",
+                                     "verificationStatus", "reaction"}),
+    "MedicationRequest": frozenset({"status", "intent",
+                                    "medicationCodeableConcept"}),
+    "Immunization": frozenset({"status", "vaccineCode",
+                               "occurrenceDateTime"}),
+    "Procedure": frozenset({"status", "code"}),
+    "DiagnosticReport": frozenset({"status", "code"}),
+}
+_LINKAGE_ROOTS = frozenset({"subject", "patient"})
+_PATIENT_REF = re.compile(r"^Patient/[A-Za-z0-9\-.]{1,255}$")
+
+# The shape of every fix the evaluator can propose, by root (#413 P1-B).
+# A path is `Type.root`, optionally `.coding`, `.coding[i]`,
+# `.coding[i].leaf`; which of those a root admits, and what value each
+# admits, is fixed here in code. Anything else is refused as a whole, before
+# any mutation, and the refusal names the fix by position — never by the
+# text that was submitted.
+_CODEABLE_ROOTS = frozenset({"code", "clinicalStatus", "verificationStatus",
+                             "vaccineCode", "medicationCodeableConcept"})
+_TOKEN_ROOTS = frozenset({"status", "intent"})
+_DATE_ROOTS = frozenset({"onsetDateTime", "recordedDate",
+                         "occurrenceDateTime"})
+_CODING_LEAVES = frozenset({"system", "code", "display"})
+_CODING_KEYS = _CODING_LEAVES
+_REACTION_KEYS = frozenset({"substance", "manifestation", "severity"})
+_REACTION_SEVERITY = frozenset({"mild", "moderate", "severe"})
+_PATH_RE = re.compile(
+    r"^(?P<type>[A-Z][A-Za-z]+)\.(?P<root>[a-zA-Z]+)"
+    r"(?P<coding>\.coding(?:\[(?P<idx>\d{1,3})\]"
+    r"(?:\.(?P<leaf>[a-zA-Z]+))?)?)?$")
+_DATE_RE = re.compile(
+    r"^\d{4}(-\d{2}(-\d{2}(T\d{2}:\d{2}(:\d{2}(\.\d+)?)?"
+    r"(Z|[+-]\d{2}:\d{2})?)?)?)?$")
+_MAX_STRING = 512
+_MAX_TOKEN = 64
+_MAX_FIXES = 20
+
+
+class FixRefused(Exception):
+    """The whole set is refused; ``reason`` is code-owned text that names a
+    fix by position and a vocabulary word, never submitted content."""
+
+    def __init__(self, reason):
+        super().__init__(reason)
+        self.reason = reason
+
+
+def _fix_root(field_path: str) -> str:
+    """The first element of a fix path with the resource-type prefix and any
+    index stripped: ``Condition.code.coding[0].display`` -> ``code``."""
+    parts = [p for p in str(field_path or "").split(".") if p]
+    if parts and parts[0][:1].isupper():
+        parts = parts[1:]
+    if not parts:
+        return ""
+    return parts[0].split("[", 1)[0]
+
+
+def _is_text(value, limit=_MAX_STRING):
+    return (isinstance(value, str) and 0 < len(value) <= limit
+            and value.isprintable())
+
+
+def _is_coding(value):
+    return (isinstance(value, dict) and value
+            and set(value) <= _CODING_KEYS
+            and _is_text(value.get("code"))
+            and all(_is_text(v) for v in value.values()))
+
+
+def _is_codeable(value):
+    # No `text`: free text on a coded element is the field the redacting
+    # read strips, and a fix must not become the way it gets written.
+    return (isinstance(value, dict) and set(value) == {"coding"}
+            and isinstance(value["coding"], list) and value["coding"]
+            and all(_is_coding(c) for c in value["coding"]))
+
+
+def _is_reaction(value):
+    if not isinstance(value, dict) or not value or not set(value) <= _REACTION_KEYS:
+        return False
+    if "substance" in value and not _is_codeable(value["substance"]):
+        return False
+    if "manifestation" in value and not (
+            isinstance(value["manifestation"], list) and value["manifestation"]
+            and all(_is_codeable(m) for m in value["manifestation"])):
+        return False
+    if "severity" in value and value["severity"] not in _REACTION_SEVERITY:
+        return False
+    return True
+
+
+def _parse_fix(n, resource_type, fix):
+    """(root, coding?, idx?, leaf?, value) for one fix, or FixRefused."""
+    roots = FIXABLE_ROOTS.get(resource_type)
+    if roots is None:
+        raise FixRefused(f"{resource_type} has no data-quality fixes")
+    if not isinstance(fix, dict):
+        raise FixRefused(f"fix {n} is not an object")
+    if "new_value" not in fix or fix.get("new_value") is None:
+        raise FixRefused(f"fix {n} carries no value; removing a field is not "
+                         "an operation in the data-quality vocabulary")
+    m = _PATH_RE.match(fix.get("field_path") or "") if isinstance(
+        fix.get("field_path"), str) else None
+    if m is None or m.group("type") != resource_type:
+        raise FixRefused(f"fix {n} is not a path on {resource_type}")
+    root = m.group("root")
+    if root not in roots:
+        raise FixRefused(f"fix {n} is outside the data-quality vocabulary for "
+                         f"{resource_type}")
+    coding = bool(m.group("coding"))
+    idx = int(m.group("idx")) if m.group("idx") is not None else None
+    leaf = m.group("leaf")
+    value = fix["new_value"]
+    if coding and root not in _CODEABLE_ROOTS:
+        raise FixRefused(f"fix {n}: {root} has no codings")
+    if leaf is not None and leaf not in _CODING_LEAVES:
+        raise FixRefused(f"fix {n}: not a coding field")
+
+    if root in _CODEABLE_ROOTS:
+        if leaf is not None:
+            ok = _is_text(value)
+        elif idx is not None:
+            ok = _is_coding(value)
+        elif coding:
+            ok = (isinstance(value, list) and value
+                  and all(_is_coding(c) for c in value))
+        else:
+            ok = _is_codeable(value)
+    elif root in _TOKEN_ROOTS:
+        ok = _is_text(value, _MAX_TOKEN) and " " not in value
+    elif root in _DATE_ROOTS:
+        ok = isinstance(value, str) and bool(_DATE_RE.match(value))
+    elif root in _LINKAGE_ROOTS:
+        ref = value.get("reference") if isinstance(value, dict) else value
+        ok = ((not isinstance(value, dict) or set(value) == {"reference"})
+              and isinstance(ref, str) and bool(_PATIENT_REF.fullmatch(ref)))
+        value = {"reference": ref} if ok else value
+    elif root == "category":
+        ok = (isinstance(value, list) and value
+              and all(_is_codeable(c) for c in value))
+    elif root == "reaction":
+        ok = (isinstance(value, list) and value
+              and all(_is_reaction(r) for r in value))
+    else:  # pragma: no cover — every root above is classified
+        ok = False
+    if not ok:
+        raise FixRefused(f"fix {n}: the value is not the right shape for "
+                         f"{root}")
+    return root, coding, idx, leaf, value
+
+
+def _normal_path(resource_type, root, coding, idx, leaf):
+    path = f"{resource_type}.{root}"
+    if coding:
+        path += ".coding"
+        if idx is not None:
+            path += f"[{idx}]"
+            if leaf is not None:
+                path += f".{leaf}"
+    return path
+
+
+def plan_fixes(resource_type: str, current: dict, fixes: list,
+               tenant_id: str):
+    """Every approved fix applied to a copy of ``current``, or FixRefused.
+
+    Returns ``(new_resource, paths)`` where ``paths`` are the normalised,
+    code-owned paths that changed, in order. Nothing is written here; the
+    caller persists the copy once, or nothing.
+    """
+    if not isinstance(fixes, list) or not fixes:
+        raise FixRefused("no fixes were given")
+    if len(fixes) > _MAX_FIXES:
+        raise FixRefused(f"more than {_MAX_FIXES} fixes in one request")
+    if FIXABLE_ROOTS.get(resource_type) is None:
+        raise FixRefused(f"{resource_type} has no data-quality fixes")
+
+    work = copy.deepcopy(current)
+    paths = []
+    for n, fix in enumerate(fixes, start=1):
+        root, coding, idx, leaf, value = _parse_fix(n, resource_type, fix)
+        path = _normal_path(resource_type, root, coding, idx, leaf)
+        for seen in paths:
+            if seen == path or path.startswith(seen + ".") \
+                    or path.startswith(seen + "[") \
+                    or seen.startswith(path + ".") or seen.startswith(path + "["):
+                raise FixRefused(f"fix {n} overlaps an earlier fix")
+
+        if root in _LINKAGE_ROOTS:
+            if work.get(root):
+                raise FixRefused(f"fix {n}: {root} is already set; a fix does "
+                                 "not re-point a record")
+            from r6.models import R6Resource
+            exists = R6Resource.query.filter_by(
+                resource_type="Patient",
+                id=value["reference"].split("/", 1)[1],
+                tenant_id=tenant_id, is_deleted=False).first()
+            if exists is None:
+                raise FixRefused(f"fix {n}: {root} must name a Patient in "
+                                 "this tenant")
+
+        if idx is not None:
+            codings = (work.get(root) or {}).get("coding") \
+                if isinstance(work.get(root), dict) else None
+            if not isinstance(codings, list) or idx >= len(codings):
+                raise FixRefused(f"fix {n}: no coding at that position")
+            if leaf is not None and not isinstance(codings[idx], dict):
+                raise FixRefused(f"fix {n}: no coding at that position")
+        elif coding and not isinstance(work.get(root), dict):
+            work[root] = {}
+
+        if not _apply_field_fix(work, path, value):  # pragma: no cover
+            raise FixRefused(f"fix {n} could not be applied")
+        paths.append(path)
+
+    if work == current:
+        raise FixRefused("the fixes change nothing")
+    return work, paths
+
+
+def fix_refusal(resource_type: str, current: dict, fixes: list,
+                tenant_id: str) -> str | None:
+    """Why this set of fixes is refused as a whole, or None when every fix
+    applies. Checked before any mutation, so a refusal applies nothing."""
+    try:
+        plan_fixes(resource_type, current, fixes, tenant_id)
+    except FixRefused as exc:
+        return exc.reason
+    return None
+
+
+def apply_fix(
+    resource_type: str,
+    resource_id: str,
+    approved_fixes: list,
+    patient_intent: str,
+    tenant_id: str,
+    agent_id: str = "curatr",
+    expected_version: int | None = None,
+    action_ref: str | None = None,
+) -> dict:
+    """
+    Apply patient-approved data quality fixes to a FHIR resource.
+
+    Each fix is ``{"field_path": "Condition.code.coding[0].display",
+    "new_value": "Type 2 diabetes mellitus without complications"}``.
+
+    Creates a linked Provenance resource and immutable AuditEvents.
+
+    ``expected_version`` is the ``meta.versionId`` the fixes were proposed
+    against (#413). When given and the record has moved on since, nothing is
+    applied and the result says so (``stale``): a human approved a change to
+    the record they saw, not to whatever it has become.
+
+    ``action_ref`` names the rail action this fix executes for (#413 P1-A).
+    It is written into the Provenance so a later attempt can find durable
+    evidence of this one — see ``find_fix_provenance`` — instead of applying
+    the fix twice.
+
+    This function owns the transaction: the record, the Provenance and both
+    mandatory audit rows commit together or not at all. A failure anywhere
+    before the commit leaves the store untouched and raises; nothing is
+    reported as applied that was not committed.
+
+    Returns dict with 'updated_resource', 'provenance', 'issues_fixed'.
+    """
+    # Import here to avoid circular imports at module load time
+    from models import db
+    from r6.models import R6Resource
+    from r6.audit import add_audit_event
+
+    resource = R6Resource.query.filter_by(
+        id=resource_id,
+        resource_type=resource_type,
+        is_deleted=False,
+        tenant_id=tenant_id,
+    ).first()
+
+    if not resource:
+        return {"error": f"{resource_type}/{resource_id} not found"}
+
+    if expected_version is not None and resource.version_id != expected_version:
+        return {"error": f"{resource_type}/{resource_id} is at version "
+                         f"{resource.version_id}; the fixes were proposed "
+                         f"against version {expected_version}",
+                "stale": True, "current_version": resource.version_id}
+
+    fhir_json = json.loads(resource.resource_json)
+    try:
+        fixed, changed_paths = plan_fixes(resource_type, fhir_json,
+                                          approved_fixes, tenant_id)
+    except FixRefused as exc:
+        return {"error": exc.reason, "refused": True,
+                "fixes_attempted": len(approved_fixes)
+                if isinstance(approved_fixes, list) else 0}
+    changes_applied = changed_paths
+
+    new_json = json.dumps(fixed, separators=(",", ":"), sort_keys=True)
+    loaded_version = resource.version_id
+    _between_load_and_write()
+
+    # The write is conditional on the version this plan was made against,
+    # enforced by the database, not by the check above (#413 P2). A writer
+    # that committed between our load and this statement — another approved
+    # fix, an ordinary update — changes the version, this UPDATE matches no
+    # row, and the whole transaction is abandoned. The version sequence and
+    # last_updated (and source) are set exactly as update_resource() sets them.
+    from sqlalchemy import update as _update
+    written = db.session.execute(
+        _update(R6Resource)
+        .where(R6Resource.tenant_id == tenant_id,
+               R6Resource.resource_type == resource_type,
+               R6Resource.id == resource_id,
+               R6Resource.is_deleted.is_(False),
+               R6Resource.version_id == loaded_version)
+        .values(resource_json=new_json,
+                sha256=hashlib.sha256(new_json.encode("utf-8")).hexdigest(),
+                version_id=loaded_version + 1,
+                last_updated=datetime.now(timezone.utc),
+                # As update_resource does: the fixed record is no longer
+                # what its channel delivered, so it claims none (FHI-42).
+                source=None)
+        .execution_options(synchronize_session=False)
+    ).rowcount
+    if written != 1:
+        db.session.rollback()
+        db.session.refresh(resource)
+        return {"error": f"{resource_type}/{resource_id} changed while the "
+                         f"fixes were being applied; nothing was changed",
+                "stale": True, "current_version": resource.version_id}
+    db.session.expire(resource)
+
+    # The summary names the normalised paths the plan changed — every one of
+    # them, and nothing that was submitted verbatim.
+    change_summary = "; ".join(p + " updated" for p in changed_paths)
+
+    # Build Provenance resource
+    provenance_id = str(uuid.uuid4())
+    now_str = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    provenance = {
+        "resourceType": "Provenance",
+        "id": provenance_id,
+        "target": [{"reference": f"{resource_type}/{resource_id}"}],
+        "recorded": now_str,
+        "activity": {
+            "coding": [{
+                "system": (
+                    "http://terminology.hl7.org/CodeSystem/"
+                    "v3-DataOperation"
+                ),
+                "code": "UPDATE",
+                "display": "revise",
+            }]
+        },
+        "agent": [{
+            "type": {
+                "coding": [{
+                    "system": (
+                        "http://terminology.hl7.org/CodeSystem/"
+                        "provenance-participant-type"
+                    ),
+                    "code": "author",
+                    "display": "Author",
+                }]
+            },
+            "who": {"display": "Patient via HealthClaw Curatr"},
+        }],
+        "reason": [{
+            "coding": [{
+                "system": (
+                    "http://terminology.hl7.org/CodeSystem/v3-ActReason"
+                ),
+                "code": "PATADMIN",
+                "display": "patient administration",
+            }]
+        }],
+        "extension": [{
+            "url": (
+                "https://healthclaw.example.org/fhir/StructureDefinition"
+                "/curatr-correction"
+            ),
+            "extension": [
+                {"url": "tool", "valueString": "HealthClaw Curatr"},
+                {"url": "patient_intent", "valueString": patient_intent},
+                {
+                    "url": "changes_applied",
+                    "valueInteger": len(changes_applied),
+                },
+                {
+                    "url": "change_summary",
+                    "valueString": change_summary,
+                },
+            ] + ([{"url": "action", "valueString": action_ref}]
+                 if action_ref else []),
+        }],
+    }
+
+    prov_json = json.dumps(
+        provenance, separators=(",", ":"), sort_keys=True
+    )
+    prov_resource = R6Resource(
+        resource_type="Provenance",
+        resource_json=prov_json,
+        resource_id=provenance_id,
+        tenant_id=tenant_id,
+    )
+
+    # One transaction. add_audit_event flushes inside it and never commits,
+    # so an audit that cannot be written takes the record change and the
+    # Provenance down with it (r6/audit.py). Only the exception class is
+    # kept: its text can carry the record.
+    try:
+        db.session.add(prov_resource)
+        add_audit_event(
+            "update", resource_type, resource_id,
+            agent_id=agent_id, tenant_id=tenant_id,
+            detail=f"curatr-fix: {change_summary}",
+        )
+        add_audit_event(
+            "create", "Provenance", provenance_id,
+            agent_id=agent_id, tenant_id=tenant_id,
+            detail=f"curatr-provenance for {resource_type}/{resource_id}",
+        )
+        db.session.commit()
+    except Exception as exc:
+        db.session.rollback()
+        raise RuntimeError(
+            "Failed to commit fix, provenance and audit: %s"
+            % type(exc).__name__
+        ) from exc
+
+    return {
+        "updated_resource": resource.to_fhir_json(),
+        "provenance": provenance,
+        "issues_fixed": len(changes_applied),
+        "change_summary": change_summary,
+    }
+
+
+def _between_load_and_write():
+    """Test seam: called after the record is loaded and planned, before the
+    conditional write. Production leaves it empty; a concurrency test patches
+    it to let another writer commit in the gap."""
+
+
+def find_fix_provenance(tenant_id: str, action_ref: str) -> dict | None:
+    """The committed Provenance of an earlier apply_fix for this action, or
+    None. This is what a retry consults before touching the record: a
+    Provenance that names the action is durable proof the fix was applied
+    once, whatever happened to the action row afterwards (#413 P1-A)."""
+    from r6.models import R6Resource
+    if not action_ref:
+        return None
+    # The marker is one JSON object with sorted keys and no spaces (that is
+    # how apply_fix serialises), so a substring match is exact.
+    marker = json.dumps({"url": "action", "valueString": action_ref},
+                        separators=(",", ":"), sort_keys=True)
+    rows = R6Resource.query.filter_by(
+        resource_type="Provenance", tenant_id=tenant_id, is_deleted=False,
+    ).filter(R6Resource.resource_json.contains(marker)).all()
+    for row in rows:
+        prov = json.loads(row.resource_json)
+        for ext in (prov.get("extension") or []):
+            for inner in (ext.get("extension") or []):
+                if inner.get("url") == "action" \
+                        and inner.get("valueString") == action_ref:
+                    return prov
+    return None
+
+
+def _apply_field_fix(resource: dict, field_path: str, new_value) -> bool:
+    """
+    Apply a single field update to a FHIR resource dict in place.
+
+    Supports dot-notation paths, stripping a leading resource type prefix.
+    Array indices like ``coding[0]`` are supported.
+
+    Returns True if the update was applied.
+    """
+    parts = field_path.split(".")
+    # Strip leading resource-type segment (e.g. "Condition")
+    if parts and parts[0][0].isupper():
+        parts = parts[1:]
+    if not parts:
+        return False
+
+    target = resource
+    for part in parts[:-1]:
+        if "[" in part:
+            key, rest = part.split("[", 1)
+            idx = int(rest.rstrip("]"))
+            lst = target.get(key)
+            if not isinstance(lst, list) or idx >= len(lst):
+                return False
+            target = lst[idx]
+        else:
+            if part not in target:
+                target[part] = {}
+            target = target[part]
+            if not isinstance(target, dict):
+                return False
+
+    final = parts[-1]
+    if "[" in final:
+        key, rest = final.split("[", 1)
+        idx = int(rest.rstrip("]"))
+        lst = target.get(key)
+        if not isinstance(lst, list) or idx >= len(lst):
+            return False
+        lst[idx] = new_value
+    else:
+        target[final] = new_value
+
+    return True

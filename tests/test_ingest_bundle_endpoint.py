@@ -1,0 +1,721 @@
+"""Regression tests for POST /r6/fhir/internal/ingest-bundle (#227).
+
+The file-upload / SHL import path lives behind this endpoint. It reuses
+`_ingest_one` (same code path Fasten/SHC take, with parameterized
+provenance so the audit event honestly says `direct-upload`), runs
+synchronously so a patient watching an upload sees an honest per-entry
+result, and rides the same fail-closed mint-secret gate as
+`internal/seed` and `internal/purge-tenant`.
+
+Coverage matrix for the release contract (see thread for the full spec):
+
+  Tenant / auth:
+    - Header is the ONLY tenant selector; body `tenant_id` is a legacy
+      selector that returns 400 `legacy_body_selector`.
+    - Non-public tenant without `X-Internal-Secret` → 403.
+    - Non-public tenant WITH secret → 200 (mint gate passes).
+  Limits:
+    - `Content-Length` over cap → 413 (no body read).
+    - No `Content-Length` (chunked or absent) + oversized stream → 413
+      via `stream.read(max_bytes + 1)`; the stream is never allowed to
+      spend unbounded memory.
+    - `entry` count over cap → 400 `too_many_entries`.
+    - env defaults apply when `INGEST_BUNDLE_MAX_*` are missing / junk.
+  MIME:
+    - Only `application/json` is accepted for the ENVELOPE (the body is
+      `{bundle: {...}}`, not a raw FHIR resource). `fhir+json` on the
+      envelope is a mislabel and would confuse the accept-list.
+    - Charset parameters (`application/json; charset=utf-8`) accepted.
+    - `text/plain` / missing Content-Type → 415.
+  Fail-loud per-entry:
+    - Unsupported resource type → per-entry `skipped` + `errors[]` code.
+    - `entry.resource` not a JSON object → per-entry `failed` + code.
+    - Per-entry ingest exception → per-entry `failed`, response carries
+      an opaque `correlation_id`, exception text NEVER surfaces to the
+      caller.
+  Atomicity:
+    - A mid-Bundle DB exception rolls back only the failing row via
+      savepoint; earlier successful rows remain readable and `ingested`
+      matches persisted rows.
+  Provenance:
+    - AuditEvent records `agent_id=direct-upload` for the upload path,
+      NOT the default `fasten-connect` — direct uploads must not borrow
+      Fasten's identity.
+  Audit outcome:
+    - `partial` when either `failed` OR `skipped` is non-zero.
+
+The CareAgents-side ownership, streaming cap, MIME accept-list, and UI
+result surface are covered in `tests/test_careagents.py`.
+"""
+
+from __future__ import annotations
+
+import json
+
+import pytest
+
+from r6.models import R6Resource, AuditEventRecord
+
+_ENDPOINT = "/r6/fhir/internal/ingest-bundle"
+
+
+def _bundle(resources):
+    return {"resourceType": "Bundle", "type": "collection",
+            "entry": [{"resource": r} for r in resources]}
+
+
+def _patient(pid="p-1", family="Testerson"):
+    return {"resourceType": "Patient", "id": pid,
+            "name": [{"family": family, "given": ["A"]}]}
+
+
+def _condition(cid="c-1"):
+    return {"resourceType": "Condition", "id": cid,
+            "code": {"coding": [{"system": "http://hl7.org/fhir/sid/icd-10",
+                                 "code": "E11.9",
+                                 "display": "Type 2 diabetes mellitus"}]}}
+
+
+def _post(client, body, tenant="test-tenant",
+          content_type="application/json"):
+    return client.post(_ENDPOINT, data=json.dumps(body),
+                       headers={"X-Tenant-Id": tenant,
+                                "Content-Type": content_type})
+
+
+# --- happy path --------------------------------------------------------------
+
+def test_valid_bundle_ingests_and_is_readable_back(client, app,
+                                                    tenant_headers):
+    r = _post(client, {"bundle": _bundle([_patient(), _condition()])})
+    assert r.status_code == 200, r.get_data(as_text=True)
+    result = r.get_json()
+    assert result["tenant_id"] == "test-tenant"
+    assert result["entries"] == 2
+    assert result["ingested"] == 2
+    assert result["skipped"] == 0
+    assert result["failed"] == 0
+    assert result["errors"] == []
+    assert result["correlation_id"]  # always present, PHI-safe handle
+
+    # Resources are actually written — reads against the same tenant see
+    # them, so this is a real ingest not an accounting-only OK.
+    got = client.get("/r6/fhir/Patient/p-1", headers=tenant_headers)
+    assert got.status_code == 200
+    got = client.get("/r6/fhir/Condition/c-1", headers=tenant_headers)
+    assert got.status_code == 200
+
+
+def test_charset_parameter_on_content_type_is_accepted(client):
+    r = _post(client, {"bundle": _bundle([_patient("c-1")])},
+              content_type="application/json; charset=utf-8")
+    assert r.status_code == 200
+    assert r.get_json()["ingested"] == 1
+
+
+# --- tenant selector contract ------------------------------------------------
+
+def test_body_tenant_id_is_rejected_as_legacy_selector(client):
+    # The header is the ONLY authoritative tenant. A body `tenant_id`
+    # even matching the header is refused so a request-shaping bug or
+    # attacker-controlled body cannot become a cross-tenant write oracle.
+    r = _post(client, {"tenant_id": "test-tenant",
+                       "bundle": _bundle([_patient()])})
+    assert r.status_code == 400
+    assert r.get_json()["error"] == "legacy_body_selector"
+
+
+def test_missing_tenant_header_returns_400(client):
+    r = client.post(_ENDPOINT,
+                    data=json.dumps({"bundle": _bundle([_patient()])}),
+                    headers={"Content-Type": "application/json"})
+    assert r.status_code == 400
+
+
+def test_invalid_tenant_format_returns_400(client):
+    r = client.post(_ENDPOINT,
+                    data=json.dumps({"bundle": _bundle([_patient()])}),
+                    headers={"X-Tenant-Id": "bad tenant!!",
+                             "Content-Type": "application/json"})
+    assert r.status_code == 400
+
+
+# --- MIME accept-list --------------------------------------------------------
+
+def test_missing_content_type_returns_415(client):
+    r = client.post(_ENDPOINT,
+                    data=json.dumps({"bundle": _bundle([_patient()])}),
+                    headers={"X-Tenant-Id": "test-tenant"})
+    assert r.status_code == 415
+    assert r.get_json()["error"] == "content_type_required"
+
+
+def test_fhir_plus_json_on_envelope_is_rejected(client):
+    # `application/fhir+json` labels a raw FHIR resource; the envelope
+    # body `{bundle: ...}` is not one. The patient-facing CareAgents
+    # route accepts fhir+json for the raw Bundle from the browser; this
+    # internal endpoint takes the wrapped call, so fhir+json here would
+    # be a mislabel and is refused.
+    r = _post(client, {"bundle": _bundle([_patient()])},
+              content_type="application/fhir+json")
+    assert r.status_code == 415
+
+
+def test_text_plain_body_returns_415(client):
+    r = client.post(_ENDPOINT, data="hello",
+                    headers={"X-Tenant-Id": "test-tenant",
+                             "Content-Type": "text/plain"})
+    assert r.status_code == 415
+
+
+# --- body shape --------------------------------------------------------------
+
+def test_malformed_json_body_returns_400(client):
+    r = client.post(_ENDPOINT, data="{not json",
+                    headers={"X-Tenant-Id": "test-tenant",
+                             "Content-Type": "application/json"})
+    assert r.status_code == 400
+    assert r.get_json()["error"] == "invalid_json"
+
+
+def test_non_bundle_body_returns_400_not_a_bundle(client):
+    r = _post(client, {"bundle": {"resourceType": "Patient",
+                                   "id": "not-a-bundle"}})
+    assert r.status_code == 400
+    assert r.get_json()["error"] == "not_a_bundle"
+
+
+def test_missing_bundle_returns_400_not_a_bundle(client):
+    r = _post(client, {})
+    assert r.status_code == 400
+    assert r.get_json()["error"] == "not_a_bundle"
+
+
+# --- fail-loud per-entry -----------------------------------------------------
+
+def test_unsupported_resource_type_is_skipped_with_reason(client):
+    r = _post(client, {"bundle": _bundle([
+        {"resourceType": "GarbageType", "id": "g-1"}])})
+    assert r.status_code == 200
+    result = r.get_json()
+    assert result["ingested"] == 0
+    assert result["skipped"] == 1
+    assert result["failed"] == 0
+    assert result["errors"], "unsupported types must appear in errors[]"
+    err = result["errors"][0]
+    assert err["index"] == 0
+    assert err["code"] == "unsupported_resource_type"
+    # The caller's own word for the type is not quoted back (#408): a type
+    # outside the code-owned nameable set is reported as "other". The index
+    # and the code already say which entry failed and why.
+    assert err["resourceType"] == "other"
+    assert "GarbageType" not in json.dumps(result)
+
+
+def test_the_callers_resource_type_is_never_reflected(client):
+    """Proof #408 asked for: whatever a caller puts in `resourceType`
+    (a name, a date of birth, an MRN) is not anywhere in the response."""
+    planted = "Jane Doe 1980-01-01 MRN 12345"
+    r = _post(client, {"bundle": _bundle([
+        {"resourceType": planted, "id": "p-1"},
+        {"resourceType": "MedicationAdministration", "id": "m-1"},
+        {"resourceType": "Patient", "id": "'; DROP TABLE r6_resource; --"},
+    ])})
+    assert r.status_code == 200
+    body = r.get_data(as_text=True)
+    for fragment in ("Jane", "Doe", "1980", "12345", "DROP TABLE"):
+        assert fragment not in body, fragment
+    named = [e["resourceType"] for e in r.get_json()["errors"]]
+    # A skippable type stays nameable, a stored type stays nameable, and
+    # the planted text collapses to the constant.
+    assert named == ["other", "MedicationAdministration", "Patient"]
+
+
+def test_partial_bundle_reports_per_entry(client):
+    r = _post(client, {"bundle": _bundle([
+        _patient("mix-1"),
+        {"resourceType": "GarbageType"},
+        _condition("mix-c-1")])})
+    assert r.status_code == 200
+    result = r.get_json()
+    assert result["ingested"] == 2
+    assert result["skipped"] == 1
+    assert result["failed"] == 0
+    assert 1 in [e["index"] for e in result["errors"]]
+
+
+def test_entry_without_a_resource_object_fails_only_that_entry(client):
+    body = {"bundle": {
+        "resourceType": "Bundle", "type": "collection",
+        "entry": [{"resource": _patient("ok-1")},
+                  {"resource": "not-an-object"},
+                  {"resource": _patient("ok-2")}]}}
+    r = _post(client, body)
+    assert r.status_code == 200
+    result = r.get_json()
+    assert result["ingested"] == 2
+    assert result["failed"] == 1
+    assert "invalid_entry" in [e["code"] for e in result["errors"]]
+
+
+def test_flat_entry_without_resource_wrapper_is_rejected(client):
+    # FHIR entries carry the resource under `entry.resource`. We used to
+    # accept a "flat" entry as a convenience; that was removed because
+    # it widens the surface for typos on the request side. A bare
+    # entry (a Patient at the entry level) fails with `invalid_entry`.
+    body = {"bundle": {"resourceType": "Bundle", "type": "collection",
+                       "entry": [_patient("flat-1")]}}
+    r = _post(client, body)
+    assert r.status_code == 200
+    result = r.get_json()
+    assert result["ingested"] == 0
+    assert result["failed"] == 1
+    assert result["errors"][0]["code"] == "invalid_entry"
+
+
+# --- caps: byte + entry ------------------------------------------------------
+
+def test_content_length_over_cap_rejects_without_reading_body(client,
+                                                              monkeypatch):
+    monkeypatch.setenv("INGEST_BUNDLE_MAX_BYTES", "1024")
+    payload = json.dumps({"bundle": _bundle(
+        [_patient(f"p-{i}", "X" * 20) for i in range(50)])})
+    assert len(payload) > 1024  # sanity
+    r = client.post(_ENDPOINT, data=payload,
+                    headers={"X-Tenant-Id": "test-tenant",
+                             "Content-Type": "application/json",
+                             "Content-Length": str(len(payload))})
+    assert r.status_code == 413
+    assert r.get_json()["error"] == "payload_too_large"
+
+
+def test_streaming_cap_catches_oversized_body_when_content_length_absent(
+        app, monkeypatch):
+    # `Content-Length` is not a memory bound — chunked or length-absent
+    # requests can still be arbitrarily large. `wsgi.input_terminated`
+    # tells werkzeug the stream is raw (not `LimitedStream`), matching
+    # what a chunked / Content-Length-absent request looks like at the
+    # WSGI layer. The endpoint's `stream.read(max_bytes+1)` must catch
+    # the overrun and refuse with 413.
+    import io as _io
+    monkeypatch.setenv("INGEST_BUNDLE_MAX_BYTES", "512")
+    payload = ("{" + " " * 2000 + "}").encode("utf-8")  # >512 bytes
+    with app.test_request_context(
+            _ENDPOINT, method="POST",
+            input_stream=_io.BytesIO(payload),
+            headers={"X-Tenant-Id": "test-tenant",
+                     "Content-Type": "application/json"},
+            environ_overrides={"wsgi.input_terminated": True,
+                               "CONTENT_LENGTH": ""}):
+        from r6.routes import _read_body_with_hard_cap
+        raw, err = _read_body_with_hard_cap(512)
+        assert raw is None, "streaming read must refuse before returning body"
+        assert err is not None
+        body, status = err
+        assert status == 413
+        assert body["error"] == "payload_too_large"
+
+
+def test_entry_count_over_cap_rejects(client, monkeypatch):
+    monkeypatch.setenv("INGEST_BUNDLE_MAX_ENTRIES", "3")
+    body = {"bundle": _bundle([_patient(f"cap-{i}") for i in range(4)])}
+    r = _post(client, body)
+    assert r.status_code == 400
+    assert r.get_json()["error"] == "too_many_entries"
+
+
+def test_defaults_apply_when_env_missing_or_junk(client, monkeypatch):
+    monkeypatch.setenv("INGEST_BUNDLE_MAX_BYTES", "not-a-number")
+    monkeypatch.setenv("INGEST_BUNDLE_MAX_ENTRIES", "-42")
+    r = _post(client, {"bundle": _bundle([_patient("d-1")])})
+    assert r.status_code == 200
+    assert r.get_json()["ingested"] == 1
+
+
+# --- fail-closed mint gate ---------------------------------------------------
+
+def test_non_public_tenant_without_secret_is_forbidden(client, monkeypatch):
+    monkeypatch.setenv("INTERNAL_TOKEN_MINT_SECRET", "s3cret")
+    r = client.post(_ENDPOINT,
+                    data=json.dumps({"bundle": _bundle([_patient()])}),
+                    headers={"X-Tenant-Id": "someones-real-tenant",
+                             "Content-Type": "application/json"})
+    assert r.status_code == 403
+
+
+def test_non_public_tenant_with_secret_is_allowed(client, monkeypatch):
+    monkeypatch.setenv("INTERNAL_TOKEN_MINT_SECRET", "s3cret")
+    r = client.post(_ENDPOINT,
+                    data=json.dumps({"bundle": _bundle([_patient("gated-1")])}),
+                    headers={"X-Tenant-Id": "someones-real-tenant",
+                             "Content-Type": "application/json",
+                             "X-Internal-Secret": "s3cret"})
+    assert r.status_code == 200
+    assert r.get_json()["ingested"] == 1
+
+
+# --- provenance: direct-upload audit event -----------------------------------
+
+def test_ingest_records_direct_upload_provenance_not_fasten(client, app):
+    _post(client, {"bundle": _bundle([_patient("prov-1")])})
+    with app.app_context():
+        # The per-resource AuditEventRecord for the create must attribute
+        # to `direct-upload`, not the `_ingest_one` default `fasten-connect`.
+        rows = AuditEventRecord.query.filter_by(
+            tenant_id="test-tenant", resource_type="Patient",
+            resource_id="prov-1").all()
+        assert rows, "an AuditEventRecord for the direct upload must exist"
+        assert any(r.agent_id == "direct-upload" for r in rows), (
+            "direct-upload path must not borrow fasten-connect provenance; "
+            f"got agent_ids={[r.agent_id for r in rows]}")
+
+
+def test_bundle_summary_audit_outcome_is_partial_on_skipped_or_failed(
+        client, app):
+    # A skipped entry (unsupported type) is a signal too, not just a hard
+    # failure — `partial` covers both. Previously `partial` only fired on
+    # failed>0, hiding skipped rows behind a `success` label.
+    r = _post(client, {"bundle": _bundle([
+        _patient("sum-1"),
+        {"resourceType": "GarbageType"}])})
+    assert r.status_code == 200
+    with app.app_context():
+        # The endpoint records ONE `ingest_bundle` summary event per call.
+        summaries = AuditEventRecord.query.filter_by(
+            tenant_id="test-tenant", event_type="ingest_bundle",
+            agent_id="direct-upload").all()
+        assert summaries, "one summary AuditEventRecord is required"
+        assert any(s.outcome == "partial" for s in summaries)
+
+
+# --- PHI-safe errors: no exception text surfaces -----------------------------
+
+def test_per_entry_exception_never_leaks_str_exc_to_caller(client,
+                                                            monkeypatch):
+    # Force `_ingest_one` to raise an exception whose message quotes a
+    # (fake) SQL statement carrying PHI-shaped tokens. The response MUST
+    # NOT echo the message; it MUST carry a stable code + correlation_id.
+
+    class _BadExc(RuntimeError):
+        pass
+
+    calls = {"n": 0}
+
+    def _boom(resource, tenant_id, agent_id=None, detail=None,
+              allowed_types=None, *, source):
+        calls["n"] += 1
+        raise _BadExc("INSERT INTO x VALUES ('SSN=123-45-6789','john@a.com')")
+
+    monkeypatch.setattr('r6.fasten.ingester._ingest_one', _boom)
+
+    body = {"bundle": _bundle([_patient("phi-1"), _patient("phi-2")])}
+    r = client.post(_ENDPOINT, data=json.dumps(body),
+                    headers={"X-Tenant-Id": "test-tenant",
+                             "Content-Type": "application/json"})
+    assert r.status_code == 200  # partial per-entry, not a batch fault
+    result = r.get_json()
+    assert result["failed"] == 2
+    assert calls["n"] == 2
+    for err in result["errors"]:
+        assert err["code"] == "ingest_error"
+        assert "correlation_id" in err
+        # The exception text must not appear anywhere in the response.
+        blob = json.dumps(err)
+        assert "INSERT" not in blob
+        assert "SSN=" not in blob
+        assert "@a.com" not in blob
+
+
+# --- atomicity: savepoint isolates a mid-Bundle failure ---------------------
+
+def test_savepoint_isolates_a_mid_bundle_failure(client, app, monkeypatch):
+    # A Bundle with three entries: the middle one is forced to raise
+    # inside `_ingest_one`. Per-entry SAVEPOINT means:
+    #   - the first entry stays committed and readable
+    #   - the middle entry rolls back, is `failed`, is NOT readable
+    #   - the third entry stays committed and readable
+    # `ingested` in the response reflects only rows the caller can read.
+    from r6.fasten import ingester as ingester_mod
+    real = ingester_mod._ingest_one
+
+    def _sometimes_boom(resource, tenant_id, agent_id='fasten-connect',
+                        detail='Ingested via Fasten EHI export',
+                        allowed_types=None, *, source):
+        if resource.get('id') == 'atom-boom':
+            raise RuntimeError('driver blew up on this row')
+        return real(resource, tenant_id, agent_id=agent_id, detail=detail,
+                    allowed_types=allowed_types, source=source)
+
+    monkeypatch.setattr('r6.fasten.ingester._ingest_one', _sometimes_boom)
+
+    body = {"bundle": _bundle([
+        _patient('atom-ok-1'),
+        _patient('atom-boom'),
+        _patient('atom-ok-2')])}
+    r = _post(client, body)
+    assert r.status_code == 200
+    result = r.get_json()
+    assert result["ingested"] == 2
+    assert result["failed"] == 1
+
+    with app.app_context():
+        alive_ids = {row.id for row in R6Resource.query.filter_by(
+            tenant_id="test-tenant", resource_type="Patient").all()}
+        # Only the successful rows exist — the failed row was rolled
+        # back by its savepoint and cannot be read.
+        assert "atom-ok-1" in alive_ids
+        assert "atom-ok-2" in alive_ids
+        assert "atom-boom" not in alive_ids
+
+
+# --- idempotency: same (tenant, type, id) upserts ----------------------------
+
+def test_reingest_of_same_id_updates_rather_than_duplicates(client, app):
+    _post(client, {"bundle": _bundle([_patient("dup-1", family="First")])})
+    _post(client, {"bundle": _bundle([_patient("dup-1", family="Second")])})
+    with app.app_context():
+        rows = R6Resource.query.filter_by(
+            tenant_id="test-tenant", resource_type="Patient",
+            id="dup-1").all()
+        assert len(rows) == 1  # upsert on (tenant, type, id)
+
+
+# --- security (#267 CTO review) -----------------------------------------------
+#
+# 850 lines of tests in this file, written before the review, and NONE of
+# them asserted: that a public tenant is not writable without a secret, that
+# AuditEvent/Permission/Consent/Provenance/Bundle are refused, that a caller-
+# supplied resource id is validated, or that the upstream `display`/`text`
+# a resource carries is stripped on read-back. Every test above runs through
+# `_post`'s default `tenant="test-tenant"`, which is public — the suite's
+# default path *is* what B1 exploited. These close that gap directly.
+
+_MINT_SECRET = "qa-verify-secret-not-a-real-one"
+
+
+# NOT autouse — setting INTERNAL_TOKEN_MINT_SECRET globally would flip every
+# test above (including `test_display_and_text_do_not_survive_to_the_read_back`
+# below, which deliberately does NOT request this fixture) out of the
+# fail-open dev-mode path and break the plain `_post` helper's 850 lines of
+# existing coverage, none of which ever sends X-Internal-Secret.
+@pytest.fixture
+def _mint_secret_env(monkeypatch):
+    monkeypatch.setenv("INTERNAL_TOKEN_MINT_SECRET", _MINT_SECRET)
+
+
+def _post_with_secret(client, body, tenant="test-tenant", secret=None):
+    headers = {"X-Tenant-Id": tenant, "Content-Type": "application/json"}
+    if secret is not None:
+        headers["X-Internal-Secret"] = secret
+    return client.post(_ENDPOINT, data=json.dumps(body), headers=headers)
+
+
+def test_public_tenant_write_requires_the_secret_too(client, _mint_secret_env):
+    # B1: `_internal_mint_authorized`'s public-tenant exemption does NOT
+    # apply to ingestion — authoring content is a different risk than
+    # minting a token. No secret, public tenant -> still 403.
+    r = _post_with_secret(client, {"bundle": _bundle([_patient("attack-1")])},
+                          tenant="test-tenant", secret=None)
+    assert r.status_code == 403, r.get_json()
+
+
+def test_forbidden_types_are_refused_not_ingested(client, _mint_secret_env):
+    body = {"bundle": _bundle([
+        {"resourceType": "AuditEvent", "id": "forged-1"},
+        {"resourceType": "Permission", "id": "forged-2"},
+        {"resourceType": "Consent", "id": "forged-3"},
+        {"resourceType": "Provenance", "id": "forged-4"},
+        {"resourceType": "Bundle", "id": "forged-5"},
+    ])}
+    r = _post_with_secret(client, body, secret=_MINT_SECRET)
+    result = r.get_json()
+    assert result["ingested"] == 0, result
+    codes = sorted(e["code"] for e in result["errors"])
+    assert codes == ["forbidden_type"] * 5, codes
+
+
+def test_deeply_nested_json_is_refused_not_crashed_no_credentials(
+        client, _mint_secret_env):
+    # B2: the body was previously parsed BEFORE the auth check, so this
+    # crashed (RecursionError, uncaught -> 500) with zero credentials
+    # against ANY tenant. 60000-deep nesting, well under the byte cap.
+    huge = "1"
+    for _ in range(60000):
+        huge = "[" + huge + "]"
+    payload = ('{"bundle":' + huge + "}").encode()
+    r = client.post(_ENDPOINT, data=payload,
+                    headers={"X-Tenant-Id": "someone-elses-private-tenant",
+                             "Content-Type": "application/json"})
+    # 403, not "400 or 403". Accepting 400 here accepted the bug: the
+    # RecursionError catch also answers 400, so the loose assertion passed
+    # whether auth ran before the parse or after it. Mutation-checked —
+    # moving the auth gate back below json.loads leaves this test green if
+    # 400 is allowed.
+    assert r.status_code == 403, r.status_code
+
+
+@pytest.mark.parametrize("label,body,headers", [
+    # Each of these fails a DIFFERENT check further down the handler. If auth
+    # runs first, every one of them is 403 and none of the later codes can
+    # appear. That is the property, stated as a property rather than inferred
+    # from one input.
+    ("unparseable body", b"not-json{", {"Content-Type": "application/json"}),
+    ("wrong content type", b'{"bundle":{}}', {"Content-Type": "text/plain"}),
+    ("missing content type", b'{"bundle":{}}', {}),
+    ("legacy body selector", b'{"tenant_id":"x","bundle":{}}',
+     {"Content-Type": "application/json"}),
+    ("not even a JSON object", b'"a string"',
+     {"Content-Type": "application/json"}),
+])
+def test_auth_is_the_first_gate_whatever_else_is_wrong_with_the_request(
+        client, _mint_secret_env, label, body, headers):
+    """B2's real defect was ORDER, not any single input.
+
+    The endpoint used to sniff the content type, read the body and parse it
+    before asking whether the caller was allowed to be here at all. Every
+    check below the auth gate is therefore reachable by an anonymous caller,
+    and each one is a different way to spend our CPU and memory for free.
+
+    So this asserts the ordering itself: a request that is wrong in some
+    *other* way, sent with no credentials, must still be refused as
+    unauthorized — never with the downstream code that describes what else
+    was wrong with it.
+    """
+    r = client.post(_ENDPOINT, data=body,
+                    headers={"X-Tenant-Id": "someone-elses-private-tenant",
+                             **headers})
+    assert r.status_code == 403, (
+        f"{label}: got {r.status_code} — a downstream check ran before the "
+        f"auth gate: {r.get_data(as_text=True)[:120]}")
+
+
+def test_the_depth_guard_refuses_nesting_python_can_still_parse(
+        client, _mint_secret_env):
+    """Covers `_json_depth_within`, which nothing else reaches.
+
+    The 60000-deep case below trips `RecursionError` inside `json.loads`
+    first, so it exercises the except-clause and never the depth walk —
+    `_INGEST_MAX_JSON_DEPTH` could be raised to ten million and the suite
+    stayed green. This nests deep enough to break the limit but shallow
+    enough that CPython parses it happily, so the constant is load-bearing.
+    """
+    from r6.routes import _INGEST_MAX_JSON_DEPTH
+
+    depth = _INGEST_MAX_JSON_DEPTH + 20
+    payload = ('{"bundle":' + "[" * depth + "1" + "]" * depth + "}").encode()
+
+    r = client.post(_ENDPOINT, data=payload,
+                    headers={"X-Tenant-Id": "someone-elses-private-tenant",
+                             "Content-Type": "application/json",
+                             "X-Internal-Secret": _MINT_SECRET})
+    assert r.status_code == 400, r.get_json()
+
+    # And a bundle just inside the limit must still be accepted, or the guard
+    # is a blanket refusal wearing a depth check's name.
+    ok_depth = max(1, _INGEST_MAX_JSON_DEPTH - 4)
+    nested = "[" * ok_depth + "1" + "]" * ok_depth
+    r = client.post(
+        _ENDPOINT,
+        data=('{"bundle":{"resourceType":"Bundle","type":"collection",'
+              '"entry":[],"_probe":' + nested + "}}").encode(),
+        headers={"X-Tenant-Id": "someone-elses-private-tenant",
+                 "Content-Type": "application/json",
+                 "X-Internal-Secret": _MINT_SECRET})
+    assert r.status_code == 200, r.get_json()
+
+
+def test_deeply_nested_json_refused_as_too_deep_with_credentials(
+        client, _mint_secret_env):
+    huge = "1"
+    for _ in range(60000):
+        huge = "[" + huge + "]"
+    payload = ('{"bundle":' + huge + "}").encode()
+    r = client.post(_ENDPOINT, data=payload,
+                    headers={"X-Tenant-Id": "someone-elses-private-tenant",
+                             "Content-Type": "application/json",
+                             "X-Internal-Secret": _MINT_SECRET})
+    assert r.status_code == 400, r.get_json()
+
+
+def test_malformed_resource_ids_are_refused_not_stored_or_audited(
+        client, app, _mint_secret_env):
+    body = {"bundle": _bundle([
+        {"resourceType": "Patient", "id": "Jane Doe 1980-01-01 MRN 12345"},
+        {"resourceType": "Patient", "id": "../../etc/passwd"},
+        {"resourceType": "Patient", "id": "x" * 400},
+    ])}
+    r = _post_with_secret(client, body, tenant="someone-elses-private-tenant",
+                          secret=_MINT_SECRET)
+    result = r.get_json()
+    assert result["ingested"] == 0, result
+    codes = sorted(e["code"] for e in result["errors"])
+    assert codes == ["invalid_resource_id"] * 3, codes
+    with app.app_context():
+        # The rejected ids must never reach the audit trail — CTO review
+        # found an unvalidated id copied into AuditEventRecord.resource_id,
+        # which health_compliance.py later exports to the auditor-facing
+        # compliance bundle.
+        leaked = AuditEventRecord.query.filter_by(
+            tenant_id="someone-elses-private-tenant",
+            resource_id="../../etc/passwd").count()
+        assert leaked == 0
+
+
+def test_a_normal_id_still_ingests_after_the_validation_fix(client, _mint_secret_env):
+    r = _post_with_secret(
+        client, {"bundle": _bundle([_patient("pt-legit-1")])},
+        tenant="someone-elses-private-tenant", secret=_MINT_SECRET)
+    assert r.get_json()["ingested"] == 1
+
+
+def test_display_and_text_do_not_survive_to_the_read_back(client, app,
+                                                          tenant_headers):
+    # The non-negotiable this whole product is named after, and the one
+    # existing happy-path test never actually checked: it asserted only
+    # status_code == 200 despite its own fixture carrying a display and a
+    # family name. Stored raw is fine (matches the Fasten contract); NOT
+    # stripping it on read would be the leak this repo has been bitten by
+    # before.
+    r = _post(client, {"bundle": _bundle([_patient("canary-1",
+                                                    family="Secretname")])})
+    assert r.status_code == 200
+    read = client.get("/r6/fhir/Patient/canary-1", headers=tenant_headers)
+    text = read.get_data(as_text=True)
+    assert "Secretname" not in text
+
+
+def test_a_medication_statement_is_stored_and_read_back_redacted(
+        client, app, tenant_headers):
+    """#377 on the upload path. The allowlist here is computed from
+    SUPPORTED_TYPES, so a statement should be stored once the type is
+    supported. This test shows it is, rather than inferring it.
+
+    MUTATION: drop 'MedicationStatement' from SUPPORTED_TYPES -> red
+    (skipped, not ingested).
+    """
+    planted = "Jane Q Synthetic MRN 000-SYN"
+    statement = {
+        "resourceType": "MedicationStatement", "id": "ms-377-upload",
+        "status": "recorded", "subject": {"reference": "Patient/p-1"},
+        "medicationCodeableConcept": {
+            "text": f"metformin per {planted}",
+            "coding": [{"system": "http://www.nlm.nih.gov/research/umls/rxnorm",
+                        "code": "860975", "display": f"{planted} metformin"}]},
+    }
+    r = _post(client, {"bundle": _bundle([statement])})
+    assert r.status_code == 200, r.get_data(as_text=True)
+    result = r.get_json()
+    assert result["ingested"] == 1 and result["skipped"] == 0, result
+    assert result["errors"] == []
+
+    with app.app_context():
+        assert R6Resource.query.filter_by(
+            tenant_id="test-tenant", resource_type="MedicationStatement",
+            id="ms-377-upload").first() is not None
+
+    read = client.get("/r6/fhir/MedicationStatement/ms-377-upload",
+                      headers=tenant_headers)
+    assert read.status_code == 200
+    assert planted not in read.get_data(as_text=True)
+    concept = read.get_json()["medicationCodeableConcept"]
+    assert concept["coding"][0]["display"] == "Metformin 500 mg"

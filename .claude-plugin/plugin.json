@@ -1,0 +1,26 @@
+{
+  "name": "healthclaw-guardrails",
+  "description": "FHIR AI agent guardrails with 29 MCP tools. PHI redaction on every read, step-up authorization for writes, immutable audit trails, tenant isolation, Curatr data quality evaluation and correction, Fasten Connect EHR ingestion, and HealthEx portable health record export. FHIR R4 US Core v9 (stable) + FHIR R6 ballot3 (experimental). A healthclaw.io reference implementation.",
+  "version": "1.0.0",
+  "author": {
+    "name": "aks129"
+  },
+  "homepage": "https://healthclaw.io",
+  "repository": "https://github.com/aks129/HealthClawGuardrails",
+  "license": "MIT",
+  "keywords": [
+    "fhir", "fhir-r4", "fhir-r6", "hl7", "mcp", "healthcare",
+    "phi", "hipaa", "guardrails", "audit-trail", "step-up-auth",
+    "curatr", "ehr", "fasten", "medplum", "us-core", "clinical-ai"
+  ],
+  "skills": "./skills",
+  "mcpServers": {
+    "healthclaw-local": {
+      "type": "http",
+      "url": "http://localhost:3001/mcp",
+      "headers": {
+        "X-Tenant-ID": "desktop-demo"
+      }
+    }
+  }
+}

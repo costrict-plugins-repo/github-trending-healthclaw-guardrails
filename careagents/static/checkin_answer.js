@@ -1,0 +1,676 @@
+/* SMART Health Check-in: what the wallet can answer, and the answer itself.
+   No page, no network: checkin_wallet.js does those. Kept apart so the
+   rules below can be exercised on their own (e2e checkin-wallet spec).
+
+   The rules, per request item:
+     unsupported  the library said so, or it is neither a FHIR selection
+                  this wallet can send nor a small inline form it can show
+                  (readForm), or it asks only for kinds of record this
+                  wallet never shares (requestedTypes finds none), which
+                  the account may well hold
+     unavailable  nothing on file claims the requested profile. Nothing is
+                  stamped with a claim to make it fit, and "no known
+                  allergies" is never sent: an allergy goes only when it
+                  codes a substance (shareableAllergy), so an absence, a
+                  refuted record or one said only in words reads unavailable
+     declined     there is something, and the person did not choose to share
+     fulfilled    the person chose to share it: one Bundle, fhirVersion 4.0.1
+                  (a form: one QuestionnaireResponse, every question answered)
+
+   Request keys are read with Object.hasOwn (own()), never `in` or a bare
+   lookup: the request is the website's, and a key named like a built-in
+   property must not reach a prototype.
+*/
+import { selectEntries, selects } from "./vendor/smart-health-checkin-client/0.4.4/wallet.js";
+
+const FHIR_JSON = "application/fhir+json";
+const SNOMED = ["http://snomed.info/sct", "urn:oid:2.16.840.1.113883.6.96"];
+const RXNORM = "http://www.nlm.nih.gov/research/umls/rxnorm";
+
+/* obj[key] when obj has it as its own property, else undefined. */
+const own = (obj, key) => (obj !== null && typeof obj === "object" &&
+  Object.hasOwn(obj, key) ? obj[key] : undefined);
+
+// SNOMED 716186003 "no known allergy" and its descendants, its inactive
+// predecessor 160244002, and 260413007 "None". With NKA_LOINC, the same set
+// as careagents/agent.py _NKA_CODES; tests/test_checkin_wallet.py holds them
+// equal.
+export const NKA_CODES = [
+  "716186003", "409137002", "428197003", "428607008",
+  "429625007", "716220001", "1003774007", "160244002", "260413007",
+];
+const LOINC = "http://loinc.org";
+// LOINC answers that state an absence (r6.terminology.LOINC_ABSENCE_ANSWERS).
+export const NKA_LOINC = ["LA10030-7", "LA9134-3", "LA4715-4"];
+// SNOMED 1631000175102 "Patient not asked": allergies not checked, which is
+// no allergy either (r6.terminology.ALLERGY_STATUS_CONCEPTS). With the two
+// lists above, every engine absence concept (r6.terminology
+// ABSENCE_CONCEPTS); tests/test_checkin_wallet.py holds them equal.
+export const ALLERGY_STATUS_CODES = ["1631000175102"];
+
+// Code systems that name a substance (US Core's AllergyIntolerance.code
+// binding): RxNorm, SNOMED by either spelling, UNII, NDF-RT.
+const SUBSTANCE_SYSTEMS = [RXNORM, ...SNOMED, "http://fdasis.nlm.nih.gov",
+  "http://hl7.org/fhir/ndfrt"];
+// A verificationStatus that takes the allergy back: itself a statement of
+// absence, or a record that should never have been.
+const WITHDRAWN = ["refuted", "entered-in-error"];
+
+function codings(concept) {
+  const c = own(concept, "coding");
+  return Array.isArray(c) ? c.filter((x) => x !== null && typeof x === "object") : [];
+}
+
+/* A code as the engine compares it: a string or a number, trimmed. A
+   padded " 716186003" is still that concept, not a substance. */
+const codeOf = (c) => {
+  const v = own(c, "code");
+  return typeof v === "string" || typeof v === "number" ? String(v).trim() : "";
+};
+
+function statesAbsence(c) {
+  const system = own(c, "system");
+  const code = codeOf(c);
+  return (SNOMED.includes(system) &&
+      (NKA_CODES.includes(code) || ALLERGY_STATUS_CODES.includes(code))) ||
+    (system === LOINC && NKA_LOINC.includes(code));
+}
+
+/* An allow-list, not a list of absence phrases (#960 security review):
+   an AllergyIntolerance is shared only when a coding names a substance in
+   a substance code system, no coding states an absence, and its
+   verificationStatus is not refuted or entered-in-error. Free text is
+   never read, either to send a record or to hold one back; a record said
+   only in words reads unavailable. Errs one way: toward unavailable,
+   never toward an inferred "none". */
+export function shareableAllergy(resource) {
+  const code = codings(own(resource, "code"));
+  if (code.some(statesAbsence)) return false;
+  if (codings(own(resource, "verificationStatus")).some(
+    (c) => WITHDRAWN.includes(own(c, "code")))) return false;
+  return code.some((c) => SUBSTANCE_SYSTEMS.includes(own(c, "system")) &&
+    typeof own(c, "code") === "string" && codeOf(c) !== "");
+}
+
+const shareable = (resource) => resource.resourceType !== "AllergyIntolerance" ||
+  shareableAllergy(resource);
+
+/* What the engine's checkin export can send (r6/checkin.py CHECKIN_TYPES),
+   and the profile claims that make a row of each type exportable
+   (CLAIMS_BY_TYPE). tests/test_checkin_relay.py holds both equal. */
+export const CHECKIN_TYPES = [
+  "AllergyIntolerance", "Condition", "Coverage", "Immunization",
+  "MedicationRequest", "Patient",
+];
+export const PROFILE_TYPES = {
+  "http://hl7.org/fhir/us/core/StructureDefinition/us-core-patient": "Patient",
+  "http://hl7.org/fhir/us/core/StructureDefinition/us-core-condition": "Condition",
+  "http://hl7.org/fhir/us/core/StructureDefinition/us-core-condition-problems-health-concerns": "Condition",
+  "http://hl7.org/fhir/us/core/StructureDefinition/us-core-condition-encounter-diagnosis": "Condition",
+  "http://hl7.org/fhir/us/core/StructureDefinition/us-core-allergyintolerance": "AllergyIntolerance",
+  "http://hl7.org/fhir/us/core/StructureDefinition/us-core-medicationrequest": "MedicationRequest",
+  "http://hl7.org/fhir/us/core/StructureDefinition/us-core-immunization": "Immunization",
+  "http://hl7.org/fhir/us/core/StructureDefinition/us-core-coverage": "Coverage",
+  "http://hl7.org/fhir/us/insurance-card/StructureDefinition/C4DIC-Coverage": "Coverage",
+};
+
+/* Whether this wallet can answer the item at all. */
+function answerable(item, unsupported) {
+  const content = own(item, "content");
+  const accept = own(item, "accept");
+  return !unsupported.has(own(item, "id")) &&
+    own(content, "kind") === "selection.fhir" &&
+    Array.isArray(accept) && accept.includes(FHIR_JSON);
+}
+
+/* --- Forms (FHI-55) -------------------------------------------------------
+
+   A `form.fhir` item is answered only from the Questionnaire the website
+   sent inline, and only when it is small and single-choice, as the PHQ-2
+   is: display lines and choice questions, each with its own coded answer
+   options. One level of `group` is allowed too, as the SPEED dry eye form
+   has (#1049): a heading over display lines and choice questions held to
+   the same rules, the heading's words checked as a question's are. A
+   group inside a group is not. A question of another kind (free text, a
+   number, a date, pick-several) is not answered here: when it is optional
+   it is shown as one this wallet does not answer and left out of the
+   response, as the contact lens trial form's are; when it is `required`,
+   or carries an extension that could say so, the form cannot be completed
+   without it, so the form is unsupported. So is any form with a
+   modifierExtension or an SDC constraint (changesWhatIsRequired).
+   Everything shown is the website's own words, put on the page as text,
+   never as markup; the Questionnaire's generated narrative is never read.
+   Anything else is unsupported rather than half shown. The answers stay in
+   this tab: they go only into the sealed response. */
+
+const FORM_MAX_CHARS = 32768;      // the Questionnaire, serialised
+// The contact lens trial form asks 19 (it was 10, PHQ-2 and SPEED sized).
+const FORM_MAX_QUESTIONS = 30;
+const FORM_MAX_SKIPPED = 10;       // questions shown as not answered here
+const FORM_MAX_OPTIONS = 10;
+const FORM_TEXT_MAX = 500;
+const FORM_CANONICAL_MAX = 1024;
+// What would make a question more than one pick from a fixed list. `item`
+// is allowed on a top-level group only (readItems).
+const FORM_REFUSED_KEYS = ["item", "enableWhen", "answerValueSet", "initial"];
+// The other FHIR R4 question types: left out when optional (readItems). A
+// type outside this list is not a question to leave out.
+const FORM_SKIPPED_TYPES = ["boolean", "decimal", "integer", "date",
+  "dateTime", "time", "string", "text", "url", "choice", "open-choice",
+  "attachment", "reference", "quantity"];
+
+const FORM_CONSTRAINT =
+  "http://hl7.org/fhir/StructureDefinition/questionnaire-constraint";
+
+/* Whether anything in the Questionnaire could change what must be
+   answered beyond what readItems reads (#1061 security F1): a
+   modifierExtension anywhere (FHIR: one not understood means the element
+   must not be processed), or an SDC questionnaire-constraint anywhere,
+   which can require an answer to a question this wallet leaves out.
+   Walked with a stack, not recursion: the size cap bounds the work, not
+   the depth. */
+function changesWhatIsRequired(q) {
+  const stack = [q];
+  while (stack.length) {
+    const node = stack.pop();
+    if (node === null || typeof node !== "object") continue;
+    if (Array.isArray(node)) { node.forEach((v) => stack.push(v)); continue; }
+    if (Object.hasOwn(node, "modifierExtension") ||
+        own(node, "url") === FORM_CONSTRAINT) return true;
+    Object.values(node).forEach((v) => stack.push(v));
+  }
+  return false;
+}
+
+const text = (v, max = FORM_TEXT_MAX) =>
+  typeof v === "string" && v.trim() && v.length <= max ? v : null;
+
+// Bidi embedding, override and isolate controls (U+202A-202E, U+2066-2069),
+// and the implicit marks ALM, LRM and RLM (U+061C, U+200E, U+200F), which
+// draw nothing but can turn "(0, 4)" into "(4 ,0)" (#1052 security F2).
+const BIDI = /[؜‎‏‪-‮⁦-⁩]/u;
+// Characters that draw nothing: format characters such as U+200B, and the
+// Hangul fillers (U+3164, U+115F, U+1160, U+FFA0), which are letters.
+const IGNORABLE = /\p{Default_Ignorable_Code_Point}/gu;
+// Right-to-left scripts (Hebrew, Arabic, Syriac, Thaana, NKo and the rest of
+// U+0590-08FF, their presentation forms, and the RTL supplementary blocks).
+// One visible RTL letter reorders the digits beside it, so "(0, 4)" draws
+// as "(4 ,0)" (#1052 security F3). The wallet reads in English and Spanish;
+// a form in an RTL script is unsupported rather than drawn misleadingly.
+const RTL = /[\u0590-\u08FF\uFB1D-\uFDFF\uFE70-\uFEFE\u{10800}-\u{10FFF}\u{1E800}-\u{1EFFF}]/u;
+
+/* Words the person will read: `text`, with at least one letter or digit
+   that draws something (a string of characters that draw nothing is blank
+   on screen however it trims, #1030 security F1; a Hangul filler is a
+   letter that draws nothing, #1052 security F1), and no bidi control,
+   mark or right-to-left letter that could reorder what is around it.
+   Otherwise null, and the form is unsupported. */
+const words = (v, max = FORM_TEXT_MAX) =>
+  text(v, max) && /[\p{L}\p{N}]/u.test(v.replace(IGNORABLE, "")) &&
+    !BIDI.test(v) && !RTL.test(v) ? v : null;
+
+function readOption(option) {
+  const c = own(option, "valueCoding");
+  const code = text(own(c, "code"), 256);
+  const display = words(own(c, "display"));
+  const system = own(c, "system");
+  if (!code || !display) return null;
+  if (system !== undefined && !text(system, FORM_CANONICAL_MAX)) return null;
+  const coding = system === undefined ? { code, display } : { system, code, display };
+  return { coding, display };
+}
+
+/* Reads `items` into `form`, in order: display lines into the form's
+   `displays` (or, inside a group, the group's), choice questions into
+   form.questions, each with the index into form.groups of the group it
+   sits in, or null at the top. `group` is that index while reading a
+   group's own items. An optional question of another kind goes into
+   form.skipped, with its group and `at`, the number of questions before
+   it, which says where it sits among them. False when any item is outside
+   the rules. */
+function readItems(items, form, linkIds, group) {
+  for (const it of items) {
+    if (it === null || typeof it !== "object") return false;
+    const type = own(it, "type");
+    // One level: a group at the top may carry items, nothing else may.
+    const isGroup = type === "group" && group === null;
+    if (FORM_REFUSED_KEYS.some((k) => Object.hasOwn(it, k) &&
+        !(k === "item" && isGroup))) return false;
+    const repeats = own(it, "repeats") === true;
+    if (repeats && (type === "display" || type === "group")) return false;
+    const linkId = text(own(it, "linkId"), 255);
+    const said = words(own(it, "text"));
+    if (!linkId || !said || linkIds.has(linkId)) return false;
+    linkIds.add(linkId);
+    if (type === "display") {
+      (group === null ? form.displays : form.groups[group].displays).push(said);
+      continue;
+    }
+    const prefix = own(it, "prefix");
+    if (prefix !== undefined && !words(prefix, 16)) return false;
+    if (!isGroup && (type !== "choice" || repeats)) {
+      // Not one pick from a list: shown, never answered, its options (if
+      // any) unread. Required, it cannot be left out of a completed form;
+      // and an extension may say so another way (questionnaire-minOccurs),
+      // so one that carries any is not left out either (#1061 security F1).
+      const required = own(it, "required");
+      if (!FORM_SKIPPED_TYPES.includes(type) || Object.hasOwn(it, "extension") ||
+          (required !== undefined && required !== false)) return false;
+      form.skipped.push({ linkId, prefix: prefix || "", text: said, group,
+        at: form.questions.length });
+      continue;
+    }
+    if (isGroup) {
+      // A heading over at least one question: nothing to answer is a
+      // heading over nothing, and options belong to questions.
+      const children = own(it, "item");
+      if (Object.hasOwn(it, "answerOption") || !Array.isArray(children)) return false;
+      const before = form.questions.length;
+      form.groups.push({ linkId, prefix: prefix || "", text: said, displays: [] });
+      if (!readItems(children, form, linkIds, form.groups.length - 1)) return false;
+      if (form.questions.length === before) return false;
+      continue;
+    }
+    const options = own(it, "answerOption");
+    if (!Array.isArray(options) || options.length < 2 ||
+        options.length > FORM_MAX_OPTIONS) return false;
+    const read = options.map(readOption);
+    if (read.includes(null)) return false;
+    form.questions.push({ linkId, prefix: prefix || "", text: said, options: read, group });
+  }
+  return true;
+}
+
+/* The form an item carries, or null when this wallet will not answer it:
+   { canonical, title, displays: [text], groups: [{ linkId, prefix, text,
+   displays: [text] }], questions: [{ linkId, prefix, text, options:
+   [{ coding, display }], group: index into groups or null }], skipped:
+   [{ linkId, prefix, text, group, at }] }. Questions are in the
+   Questionnaire's order, so a group's are next to each other; the
+   30-question cap counts them all. A skipped question is shown in its
+   place, before questions[at] (or after the last), and never answered.
+   Display lines are shown before the questions they belong with, wherever
+   they sit among them: the form's above every question, a group's under
+   its heading and above its questions (checkin_wallet.js formQuestions). */
+export function readForm(item) {
+  const content = own(item, "content");
+  const accept = own(item, "accept");
+  if (own(content, "kind") !== "form.fhir" || !Array.isArray(accept) ||
+      !accept.includes(FHIR_JSON)) return null;
+  const q = own(content, "questionnaire");
+  if (own(q, "resourceType") !== "Questionnaire") return null;
+  let size;
+  try { size = JSON.stringify(q).length; } catch (e) { return null; }
+  if (size > FORM_MAX_CHARS || changesWhatIsRequired(q)) return null;
+
+  // What the answer names: the item's canonical exactly as sent (a `|1`
+  // version included), else the inline url, with its version if it has one.
+  let canonical = own(content, "questionnaireCanonical");
+  if (canonical === undefined) {
+    const url = text(own(q, "url"), FORM_CANONICAL_MAX);
+    const version = own(q, "version");
+    canonical = url && (version === undefined ? url
+      : text(version, 64) && `${url}|${version}`);
+  }
+  if (!text(canonical, FORM_CANONICAL_MAX)) return null;
+
+  const items = own(q, "item");
+  if (!Array.isArray(items)) return null;
+  const form = { displays: [], groups: [], questions: [], skipped: [] };
+  if (!readItems(items, form, new Set(), null)) return null;
+  const { displays, groups, questions, skipped } = form;
+  if (!questions.length || questions.length > FORM_MAX_QUESTIONS ||
+      skipped.length > FORM_MAX_SKIPPED) return null;
+  return { canonical, title: words(own(q, "title")) || "", displays, groups,
+    questions, skipped };
+}
+
+/* The QuestionnaireResponse for `picked` ({ linkId: option index }), or
+   null unless every question has exactly one of its own options. A
+   group's answers sit under the group's linkId, as FHIR nests them. */
+function questionnaireResponse(form, picked) {
+  const item = [];
+  let into = null;   // the group being filled, while its questions last
+  for (const question of form.questions) {
+    const i = own(picked, question.linkId);
+    if (!Number.isInteger(i) || i < 0 || i >= question.options.length) return null;
+    const answered = { linkId: question.linkId, text: question.text,
+      answer: [{ valueCoding: { ...question.options[i].coding } }] };
+    if (question.group === null) { into = null; item.push(answered); continue; }
+    if (!into || into.at !== question.group) {
+      const g = form.groups[question.group];
+      into = { at: question.group, node: { linkId: g.linkId, text: g.text, item: [] } };
+      item.push(into.node);
+    }
+    into.node.item.push(answered);
+  }
+  return {
+    resourceType: "QuestionnaireResponse",
+    status: "completed",
+    questionnaire: form.canonical,
+    authored: new Date().toISOString(),
+    item,
+  };
+}
+
+const strings = (obj, key) => {
+  const v = own(obj, key);
+  return Array.isArray(v) ? v.filter((s) => typeof s === "string") : [];
+};
+
+/* The kinds of record the request's answerable items ask for, sorted: what
+   the wallet asks the CareAgents relay for, and so the exact type set the
+   engine's single-use token is minted for. A profile is read as the
+   library reads it (base before any `|version`; profilesFrom as a stem);
+   one this table does not know asks for nothing. An item with no selector
+   asks for every type. Nothing outside CHECKIN_TYPES is ever asked for. */
+export function requestedTypes(request, unsupportedItems) {
+  const unsupported = new Set((unsupportedItems || []).map((u) => own(u, "id")));
+  const items = own(request, "items");
+  const wanted = new Set();
+  for (const item of Array.isArray(items) ? items : []) {
+    if (!answerable(item, unsupported)) continue;
+    const content = own(item, "content");
+    const types = strings(content, "resourceTypes");
+    const profiles = strings(content, "profiles");
+    const stems = strings(content, "profilesFrom");
+    let found;
+    if (profiles.length || stems.length) {
+      found = [];
+      for (const p of profiles) {
+        const base = p.split("|")[0];
+        if (Object.hasOwn(PROFILE_TYPES, base)) found.push(PROFILE_TYPES[base]);
+      }
+      for (const s of stems) {
+        const stem = s.split("|")[0].replace(/\/+$/, "") + "/";
+        for (const [url, t] of Object.entries(PROFILE_TYPES)) {
+          if (url.startsWith(stem)) found.push(t);
+        }
+      }
+      if (types.length) found = found.filter((t) => types.includes(t));
+    } else {
+      found = types.length ? types : CHECKIN_TYPES;
+    }
+    found.filter((t) => CHECKIN_TYPES.includes(t)).forEach((t) => wanted.add(t));
+  }
+  return [...wanted].sort();
+}
+
+/* The record set as Bundle entries whose references can be followed.
+   selectEntries pulls along what a match references (a payer, a
+   prescriber) only when the reference IS that entry's fullUrl, and records
+   say "Patient/<id>". So, on a copy: each "Type/id" that names an entry here
+   becomes that entry's fullUrl. */
+export function prepareRecords(bundle) {
+  const entries = ((bundle && bundle.entry) || [])
+    .filter((e) => e && e.fullUrl && e.resource && e.resource.resourceType)
+    .map((e) => ({ fullUrl: e.fullUrl, resource: structuredClone(e.resource) }));
+  const urlOf = new Map(entries.map((e) =>
+    [`${e.resource.resourceType}/${e.resource.id}`, e.fullUrl]));
+  const rewrite = (node) => {
+    if (Array.isArray(node)) { node.forEach(rewrite); return; }
+    if (!node || typeof node !== "object") return;
+    for (const [k, v] of Object.entries(node)) {
+      if (k === "reference" && typeof v === "string" && urlOf.has(v)) node[k] = urlOf.get(v);
+      else rewrite(v);
+    }
+  };
+  entries.forEach((e) => rewrite(e.resource));
+  const patient = entries.find((e) => e.resource.resourceType === "Patient");
+  return { entries, patientFullUrl: patient ? patient.fullUrl : null };
+}
+
+/* For each item: { item, unsupported, entries, primary }, and `form` for a
+   form this wallet can show (readForm). `entries` is what would be sent;
+   `primary` is the part of it the item asked for, which is what the person
+   is shown (a payer or prescriber rides along unnamed). */
+export function matchItems(request, unsupportedItems, records) {
+  const unsupported = new Set((unsupportedItems || []).map((u) => own(u, "id")));
+  return own(request, "items").map((item) => {
+    const form = unsupported.has(own(item, "id")) ? null : readForm(item);
+    if (form) return { item, unsupported: false, form, entries: [], primary: [] };
+    if (!answerable(item, unsupported)) {
+      return { item, unsupported: true, entries: [], primary: [] };
+    }
+    const content = own(item, "content");
+    const sendable = records.entries.filter((e) => shareable(e.resource));
+    // Only what the item asks for makes it answerable: a payer that would
+    // ride along by reference is not, on its own, something to share.
+    const primary = sendable.filter((e) => selects(content, e.resource));
+    if (!primary.length) {
+      // Nothing to send. If the item asks only for kinds this wallet never
+      // shares (Observation labs, say), "nothing on file" would be untrue
+      // for an account that holds them: the wallet can't answer it.
+      const never = !requestedTypes({ items: [item] }, []).length;
+      return { item, unsupported: never, entries: [], primary: [] };
+    }
+    // The Patient has an item of its own; elsewhere it is not pulled along.
+    const asksForPatient = primary.some((e) => e.fullUrl === records.patientFullUrl);
+    const exclude = asksForPatient || !records.patientFullUrl ? [] : [records.patientFullUrl];
+    return { item, unsupported: false, primary,
+      entries: selectEntries(content, sendable, { exclude }) };
+  });
+}
+
+/* The SMART response. `share` maps item id -> true for what the person
+   chose to share; anything else is not shared. `answers` maps a form's
+   item id -> { linkId: option index }; a form chosen with any question
+   unanswered is declined, never sent in part. No HTEST tag: the records
+   are the account's own now, not the synthetic test patient, and a test
+   marker on them would mislabel them (the #960 note said the real-record
+   export drops it). */
+export function buildResponse(request, matches, share, answers = {}) {
+  const artifacts = [];
+  const requestStatus = [];
+  for (const m of matches) {
+    const id = own(m.item, "id");
+    if (m.unsupported) { requestStatus.push({ item: id, status: "unsupported" }); continue; }
+    if (m.form) {
+      const qr = own(share, id) === true ? questionnaireResponse(m.form, own(answers, id)) : null;
+      if (!qr) { requestStatus.push({ item: id, status: "declined" }); continue; }
+      artifacts.push({ id: `fhir-${id}`, mediaType: FHIR_JSON, fhirVersion: "4.0.1",
+        fulfills: [id], value: qr });
+      requestStatus.push({ item: id, status: "fulfilled" });
+      continue;
+    }
+    if (!m.entries.length) { requestStatus.push({ item: id, status: "unavailable" }); continue; }
+    if (own(share, id) !== true) { requestStatus.push({ item: id, status: "declined" }); continue; }
+    artifacts.push({
+      id: `fhir-${id}`,
+      mediaType: FHIR_JSON,
+      fhirVersion: "4.0.1",
+      fulfills: [id],
+      value: {
+        resourceType: "Bundle",
+        type: "collection",
+        entry: m.entries.map((e) => ({ fullUrl: e.fullUrl, resource: e.resource })),
+      },
+    });
+    requestStatus.push({ item: id, status: "fulfilled" });
+  }
+  return {
+    type: "smart-health-checkin-response",
+    version: "1",
+    requestId: own(request, "id"),
+    artifacts,
+    requestStatus,
+  };
+}
+
+/* --- What the person is shown, in plain words ---------------------------
+
+   Never a FHIR type name, never a coding's `display`, never an upstream
+   feed's words: those are where a real feed puts other people's names. The
+   records come only from the engine's checkin export, which drops every
+   upstream `display` and `text` and writes each CodeableConcept's `text`
+   as OUR label for its code, from r6/terminology.py (r6/access.py
+   _codes_with_our_text), or leaves none. So a record is named by that
+   engine-written `text`, the same words the website receives; then by
+   LABELS, for a code the engine does not label yet; then by a plain
+   fallback ("A medicine"). Otherwise by structured fields of the person's
+   own (their name, the payer Organization's name, a masked member id).
+   tests/test_checkin_relay.py runs a canary through the real engine. */
+
+const CVX = "http://hl7.org/fhir/sid/cvx";
+
+export const LABELS = {
+  [`${SNOMED[0]}|38341003`]: "Hypertensive disorder",
+  [`${RXNORM}|7980`]: "Penicillin",
+  [`${RXNORM}|314076`]: "Lisinopril 10 mg",
+  [`${CVX}|150`]: "Influenza vaccine",
+};
+
+const HEADINGS = {
+  Patient: "Your name, birth date and contact details",
+  Condition: "Your health problems",
+  AllergyIntolerance: "Your allergies",
+  MedicationRequest: "Your medicines",
+  MedicationStatement: "Your medicines",
+  Immunization: "Your vaccines",
+  Coverage: "Your insurance card",
+};
+
+/* --- Made-up records (#1081) ---------------------------------------------
+
+   Whether the records are the made-up patient's is the server's word, never
+   the records' own: a feed can stamp HTEST "test data" on a person's real
+   records and the engine keeps it (#1086 security F1). The relay says so in
+   a header (careagents/checkin_wallet.py MADE_UP_HEADER), and the wallet
+   passes it on to our own sample clinic as MADE_UP_MESSAGE on the answer's
+   status rows, and to no other website. */
+
+export const MADE_UP_MESSAGE = "Answered from a made-up patient's records.";
+
+/* Did the relay say the made-up patient answered? `headers` is the relay
+   response's Headers. Only this header, never the records (#1086 F1). */
+export function relaySaysMadeUp(headers) {
+  return Boolean(headers) && typeof headers.get === "function" &&
+    headers.get("X-Checkin-Records") === "made-up";
+}
+
+/* Did our wallet say this answer came from the made-up patient? `items` is
+   the check-in library's response.items(). */
+export function saidMadeUp(items) {
+  return Array.isArray(items) && items.some((i) =>
+    i !== null && typeof i === "object" && i.message === MADE_UP_MESSAGE);
+}
+
+/* Our words without the claim that the records are the person's:
+   "Your medicines" becomes "Medicines". */
+export function unowned(line) {
+  return typeof line === "string" && line.startsWith("Your ")
+    ? line.charAt(5).toUpperCase() + line.slice(6) : line;
+}
+
+/* Our heading for an item, from what it matched, or, with nothing on
+   file, from the one kind of record it asks for: the same heading either
+   way. The website's own title only when there is no one kind to name it
+   by (a form, say), which the page shows as the website's (websiteHeading). */
+export function itemHeading(match) {
+  return ourHeading(match) || websiteHeading(match);
+}
+
+function ourHeading(match) {
+  let types = new Set((match.primary || []).map((e) => e.resource.resourceType));
+  if (!types.size) types = new Set(requestedTypes({ items: [match.item] }, []));
+  if (types.size === 1) {
+    const h = own(HEADINGS, [...types][0]);
+    if (typeof h === "string") return h;
+  }
+  return null;
+}
+
+/* The website's own words for an item we have no heading of ours for: its
+   title, else its id, and only ever a string. Null when the heading is
+   ours. */
+export function websiteHeading(match) {
+  if (ourHeading(match)) return null;
+  for (const key of ["title", "id"]) {
+    const v = own(match.item, key);
+    if (typeof v === "string" && v) return v;
+  }
+  return "";
+}
+
+function labelOf(concept) {
+  // The engine's label for this code (see above), never upstream words.
+  const ours = own(concept, "text");
+  if (typeof ours === "string" && ours.trim()) return ours.trim();
+  for (const c of codings(concept)) {
+    const system = SNOMED.includes(own(c, "system")) ? SNOMED[0] : own(c, "system");
+    const label = own(LABELS, `${system}|${String(own(c, "code"))}`);
+    if (typeof label === "string") return label;
+  }
+  return null;
+}
+
+const MONTHS = ["January", "February", "March", "April", "May", "June",
+  "July", "August", "September", "October", "November", "December"];
+
+/* A FHIR date or dateTime as "4 July 1985" ("July 1985", "1985" when that
+   is all it says). Read from its digits, never through a time zone, so
+   the day cannot shift. */
+export function day(s) {
+  const m = typeof s === "string" ? /^(\d{4})(?:-(\d{2})(?:-(\d{2}))?)?/.exec(s) : null;
+  if (!m) return "";
+  const month = m[2] ? MONTHS[Number(m[2]) - 1] : undefined;
+  if (!month) return m[1];
+  return m[3] ? `${Number(m[3])} ${month} ${m[1]}` : `${month} ${m[1]}`;
+}
+
+/* The last 4 characters, and only of an id at least twice that long, so at
+   most half of it shows; a shorter one is "on file" (#960 security note: a
+   5-character id showed 4 of its 5). */
+export function masked(value) {
+  const s = typeof value === "string" ? value : "";
+  return s.length >= 8 ? `ending ${s.slice(-4)}` : "on file";
+}
+
+/* One short line per record the item asked for. `entries` is everything
+   that would be sent with it, so a Coverage can name its payer. */
+export function recordNames(match) {
+  const byUrl = new Map((match.entries || []).map((e) => [e.fullUrl, e.resource]));
+  return (match.primary || []).flatMap(({ resource: r }) => {
+    switch (r.resourceType) {
+      case "Patient": {
+        const n = (Array.isArray(r.name) && r.name[0]) || {};
+        const given = Array.isArray(n.given) ? n.given.filter((g) =>
+          typeof g === "string" && g.trim()) : [];
+        const who = [...given, n.family].filter(Boolean).join(" ") || "Your name";
+        const lines = [r.birthDate ? `${who}, born ${day(r.birthDate)}` : who];
+        // What else goes with it, named but not repeated here.
+        const also = [
+          Array.isArray(r.address) && r.address.length && "address",
+          Array.isArray(r.telecom) && r.telecom.some((t) => t && t.system === "phone") && "phone",
+          Array.isArray(r.telecom) && r.telecom.some((t) => t && t.system === "email") && "email",
+        ].filter(Boolean);
+        if (also.length) lines.push(`Your ${also.join(", ")}`);
+        return lines;
+      }
+      case "Coverage": {
+        const payerRef = Array.isArray(r.payor) && r.payor[0] && r.payor[0].reference;
+        const payer = byUrl.get(payerRef);
+        const insurer = (payer && payer.resourceType === "Organization" &&
+          typeof payer.name === "string" && payer.name.trim()) || "Your insurer";
+        return `${insurer}, member ID ${masked(r.subscriberId)}`;
+      }
+      case "Immunization": {
+        const what = labelOf(r.vaccineCode) || "A vaccine";
+        return r.occurrenceDateTime ? `${what}, ${day(r.occurrenceDateTime)}` : what;
+      }
+      case "MedicationRequest":
+      case "MedicationStatement":
+        return labelOf(r.medicationCodeableConcept) || "A medicine";
+      case "AllergyIntolerance":
+        return labelOf(r.code) || "An allergy";
+      case "Condition":
+        return labelOf(r.code) || "A health problem";
+      case "Organization":
+        // Its own name, as a Coverage names its payer above; never its
+        // narrative `text` or a type's words.
+        return (typeof r.name === "string" && r.name.trim()) || "An organization";
+      default:
+        return "A record";
+    }
+  });
+}

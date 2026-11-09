@@ -1,0 +1,41 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.aks129/healthclaw-guardrails",
+  "description": "Guardrailed FHIR access for AI agents: PHI redaction, audit trail, step-up auth, tenant isolation",
+  "repository": {
+    "url": "https://github.com/aks129/HealthClawGuardrails",
+    "source": "github"
+  },
+  "version": "2.1.0",
+  "websiteUrl": "https://healthclaw.io",
+  "remotes": [
+    {
+      "type": "streamable-http",
+      "url": "https://mcp-demo-production-ee2c.up.railway.app/mcp",
+      "headers": []
+    },
+    {
+      "type": "streamable-http",
+      "url": "https://mcp-server-production-5112.up.railway.app/mcp",
+      "headers": [
+        {
+          "description": "Deployment-scoped bearer credential, required on every request — this endpoint returns 401 without it. Issued by the operator; not self-serve. For a keyless trial use the demo remote listed first, which is hard-pinned to a synthetic tenant.",
+          "isRequired": true,
+          "isSecret": true,
+          "name": "Authorization"
+        },
+        {
+          "description": "Tenant identifier",
+          "isRequired": false,
+          "name": "X-Tenant-Id"
+        },
+        {
+          "description": "Tenant-bound HMAC step-up token, required for write-tier tools and non-public tenant reads",
+          "isRequired": false,
+          "isSecret": true,
+          "name": "X-Step-Up-Token"
+        }
+      ]
+    }
+  ]
+}

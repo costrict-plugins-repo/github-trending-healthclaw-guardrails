@@ -1,0 +1,599 @@
+"""
+Fasten EHI Export streaming ingester.
+
+Downloads FHIR R4 NDJSON files from Fasten export links and ingests them
+into the HealthClaw Guardrails resource store with full audit trail.
+
+Design:
+- Streams downloads (httpx streaming) to handle 30MB–3GB files without OOM
+- Runs in a daemon thread so the webhook handler returns 200 immediately
+- Commits progress every _PROGRESS_BATCH resources (avoids long DB locks)
+- Skips unsupported resource types gracefully (no crash, counted per type
+  in the import summary so a dropped type is nameable — #377)
+- Runs Curatr evaluation post-ingestion for clinical resource types when
+  FASTEN_CURATR_SCAN=true is set
+"""
+import collections
+import json
+import logging
+import os
+import re
+import uuid
+from datetime import datetime, timezone
+from urllib.parse import urlparse
+
+import httpx
+
+from models import db
+from r6.audit import add_audit_event
+from r6.fasten.models import connection_revoked, tenant_closed
+from r6.log_safety import loggable_id
+from r6.models import RECORD_SOURCES, R6Resource
+
+logger = logging.getLogger(__name__)
+
+_PROGRESS_BATCH = 10  # commit progress every N resources (observability)
+_DOWNLOAD_TIMEOUT = httpx.Timeout(connect=10.0, read=300.0, write=60.0, pool=10.0)
+
+# The CHARSET is the security control here, not the length. A caller-supplied
+# id outside this shape was previously stored verbatim and copied into
+# AuditEventRecord.resource_id (#267 review) — audit `detail` stays PHI-free
+# by convention, but that convention did nothing for the adjacent column, and
+# health_compliance.py exports resource_id into the auditor-facing compliance
+# bundle. An id restricted to [A-Za-z0-9-.] cannot carry a name, a date, a
+# path, or markup, which is what that finding was about.
+#
+# The ceiling is 255 (R6Resource.id / AuditEventRecord.resource_id are both
+# String(255)), NOT the FHIR spec's 64. Real Epic exports routinely violate
+# the spec limit — the 2026-07-08 live incident documented in
+# tests/test_ingest_resilience.py had 65/250 ids over 64 chars, running to
+# ~109, and is exactly why that column was widened rather than truncated.
+# Capping at 64 here would silently re-impose the ceiling that incident
+# forced us off, as `invalid_id` skips on the live Fasten connector rather
+# than a crash — which is worse, because nothing would page. Validated
+# before use, not filtered: a failing id is refused per-entry, never
+# truncated or replaced.
+_RESOURCE_ID_PATTERN = re.compile(r'^[A-Za-z0-9\-\.]{1,255}$')
+
+# `_ingest_one` outcomes that mean WE REFUSED DATA, as opposed to `skipped`,
+# which means "a resource type this store does not keep" — routine, expected,
+# and not news. Both call sites used to collapse the two, so a real export
+# carrying an id outside the charset would be dropped, counted as a skip, and
+# reported as a successful import with nothing to page on (#293).
+REFUSED_OUTCOMES = frozenset({'invalid_id', 'forbidden'})
+
+# FHIR resource type names this code is willing to REPEAT.
+#
+# #363 gave a refusal a reason. A `skipped` stayed one integer covering every
+# type the store does not keep, so "which type did we drop?" had no answer in
+# the audit trail or the log. That is the #377 case: an EHR sending the
+# medication list as MedicationStatement looks exactly like an export that
+# carried a few hundred billing rows, and the issue's own precondition —
+# check the counters before building anything — could not be met.
+#
+# `resourceType` is caller-supplied on every line of an NDJSON export, and
+# audit `detail` is exported into the auditor-facing compliance bundle, so
+# the name is CONSTRUCTED from this set rather than filtered out of the feed
+# (docs/agent-task-guide.md §2, same rule as `_safe_unsupported_key`).
+# Anything not listed counts under UNNAMED_SKIPPED_TYPE — still counted,
+# never quoted. A type that later joins R6Resource.SUPPORTED_TYPES simply
+# stops reaching the skip branch, so an entry here going stale is harmless.
+UNNAMED_SKIPPED_TYPE = 'other'
+
+_NAMEABLE_SKIPPED_TYPES = frozenset({
+    # Medication semantics we do not store. MedicationStatement left this
+    # list when it became a stored type (#377).
+    'MedicationAdministration', 'MedicationKnowledge',
+    # Imaging, documents, raw attachments
+    'ImagingStudy', 'ImagingSelection', 'Media', 'Binary', 'Composition',
+    'DocumentManifest',
+    # Financial — usually the bulk of an EHI export by row count
+    'Claim', 'ClaimResponse', 'ExplanationOfBenefit', 'Account', 'Invoice',
+    'ChargeItem', 'PaymentNotice', 'PaymentReconciliation', 'Contract',
+    'EnrollmentRequest', 'EnrollmentResponse', 'InsurancePlan',
+    'CoverageEligibilityRequest', 'CoverageEligibilityResponse',
+    # Workflow, scheduling, orders
+    'Appointment', 'AppointmentResponse', 'Schedule', 'Slot', 'Task',
+    'Communication', 'CommunicationRequest', 'DeviceRequest',
+    'SupplyRequest', 'SupplyDelivery', 'VisionPrescription', 'NutritionOrder',
+    # Clinical types outside the stored set
+    'ClinicalImpression', 'DetectedIssue', 'RiskAssessment', 'AdverseEvent',
+    'BodyStructure', 'EpisodeOfCare', 'EncounterHistory', 'Flag', 'Device',
+    'DeviceUsage', 'DeviceUseStatement', 'Substance', 'MolecularSequence',
+    'GuidanceResponse', 'List', 'Group', 'Basic', 'Linkage',
+    # Directory, terminology, conformance
+    'Person', 'HealthcareService', 'Endpoint', 'Measure', 'MeasureReport',
+    'Library', 'ValueSet', 'CodeSystem', 'ConceptMap', 'NamingSystem',
+    'StructureDefinition', 'SearchParameter', 'OperationDefinition',
+    'CapabilityStatement', 'ImplementationGuide', 'Parameters',
+    'ResearchStudy', 'ResearchSubject', 'VerificationResult',
+})
+
+# How many distinct type names one summary may carry. An export can present
+# arbitrarily many. The summary is a signal, not an inventory, and audit
+# detail is read by humans.
+_SKIPPED_TYPES_IN_SUMMARY = 6
+
+
+def safe_skipped_type(resource: dict) -> str:
+    """The name we are willing to record for a resource we did not store."""
+    name = resource.get('resourceType')
+    if isinstance(name, str) and name in _NAMEABLE_SKIPPED_TYPES:
+        return name
+    return UNNAMED_SKIPPED_TYPE
+
+
+def safe_type_name(resource: dict) -> str:
+    """The name we are willing to return for ANY entry, stored or not.
+
+    The bundle path's per-entry error list names the entry's type back to
+    the caller for every outcome, including the ones a supported type can
+    reach (forbidden, invalid id, persistence failure), so the nameable set
+    is the stored types plus the skippable ones. Anything else is 'other':
+    a caller who put a name, a date of birth or 400 characters of prose in
+    `resourceType` gets it back as a count and an index, never as text
+    (#408, same rule as `safe_skipped_type` on the streaming path).
+    """
+    from r6.models import R6Resource
+    name = resource.get('resourceType')
+    if isinstance(name, str) and (R6Resource.is_supported_type(name)
+                                  or name in _NAMEABLE_SKIPPED_TYPES):
+        return name
+    return UNNAMED_SKIPPED_TYPE
+
+
+def skipped_type_summary(counts) -> str:
+    """Render `Type:n` pairs, most-skipped first, bounded.
+
+    Empty string when nothing was skipped, so a caller can append it
+    conditionally and a clean import's summary stays unchanged.
+    """
+    if not counts:
+        return ''
+    ordered = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+    shown = ordered[:_SKIPPED_TYPES_IN_SUMMARY]
+    rendered = ','.join(f'{name}:{n}' for name, n in shown)
+    if len(ordered) > len(shown):
+        rendered += f',+{len(ordered) - len(shown)}'
+    return rendered
+
+
+def log_refusal(log, where: str, tenant_id: str, resource: dict,
+                result: str) -> None:
+    """Record that a resource was refused — never WHICH resource.
+
+    The refused id is the one field that must not appear. It is refused
+    precisely because it fell outside `[A-Za-z0-9-.]`, and the shapes that
+    fail that test in the wild are names, dates and MRNs. Logging it to
+    explain the refusal would publish the thing the refusal exists to stop.
+
+    One function rather than two call sites, because that invariant is what
+    diverges: three callers of `_ingest_one` already handle failure three
+    different ways (#306).
+    """
+    log.warning('%s refused a resource: tenant=%s type=%s reason=%s',
+                where, loggable_id(tenant_id),
+                resource.get('resourceType', '?'), result)
+
+
+def _is_fasten_download_host(url: str) -> bool:
+    """True only when *url* is an https link whose host is fastenhealth.com or
+    a subdomain of it.
+
+    The Fasten private key is attached as Basic auth for the download hop, so
+    the host must be validated exactly — a substring check (`'fastenhealth.com'
+    in url`) would send the credentials to a look-alike host such as
+    ``https://evil.com/fastenhealth.com`` or ``https://fastenhealth.com.evil.com/``.
+    Requiring https also stops the key from ever going over cleartext.
+    """
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return False
+    if parsed.scheme != 'https':
+        return False
+    host = (parsed.hostname or '').lower()
+    return host == 'fastenhealth.com' or host.endswith('.fastenhealth.com')
+
+# Clinical types eligible for automatic Curatr scan after ingestion
+_CURATR_ELIGIBLE = frozenset({
+    'Condition', 'AllergyIntolerance', 'MedicationRequest',
+    'Immunization', 'Procedure', 'DiagnosticReport',
+})
+
+
+def _stopped_by_disconnect(job_id: int, task_id: str, tenant_id: str,
+                           org_connection_id: str) -> bool:
+    """True, with the uncommitted batch dropped, once access is taken back:
+    the tenant disconnected in CareAgents, or this connection revoked at
+    Fasten (patient.authorization_revoked).
+
+    Called before every commit in stream_ingest. The revoke endpoint has
+    usually failed the job already, but this thread holds a stale job
+    object whose next commit would write its own status back over that, so
+    the job is closed by a conditional UPDATE rather than through the
+    object (a purge may also have deleted the row, which matches nothing).
+    """
+    from r6.fasten.models import FastenJob
+    from r6.fasten.reaper import TERMINAL_STATUSES
+
+    if not (tenant_closed(tenant_id)
+            or connection_revoked(org_connection_id)):
+        return False
+    db.session.rollback()
+    (FastenJob.query
+     .filter(FastenJob.id == job_id,
+             FastenJob.status.notin_(TERMINAL_STATUSES))
+     .update({'status': 'failed', 'failure_reason': 'disconnected',
+              'completed_at': datetime.now(timezone.utc)},
+             synchronize_session=False))
+    add_audit_event(
+        event_type='fasten_import_refused',
+        agent_id='fasten-connect',
+        tenant_id=tenant_id,
+        outcome='failure',
+        detail=f'job={task_id} stopped: disconnected',
+    )
+    db.session.commit()
+    logger.info('Fasten job %s stopped: tenant disconnected', task_id)
+    return True
+
+
+def stream_ingest(app, job_id: int, download_links: list, tenant_id: str) -> None:
+    """
+    Background worker: stream-download NDJSON export files and ingest FHIR resources.
+
+    Runs in a daemon thread via threading.Thread.
+    Uses app.app_context() for all DB access.
+
+    Every commit is preceded by a disconnect check, so an ingest that is
+    running when the account holder disconnects stops at its next commit
+    and keeps nothing it had not committed yet.
+    """
+    from r6.fasten.models import FastenJob  # avoid circular import at module level
+
+    with app.app_context():
+        job = db.session.get(FastenJob, job_id)
+        if not job:
+            logger.error('FastenJob %s not found', job_id)
+            return
+        task_id = job.task_id
+        org_connection_id = job.org_connection_id
+
+        if _stopped_by_disconnect(job_id, task_id, tenant_id,
+                                  org_connection_id):
+            return
+        job.status = 'downloading'
+        db.session.commit()
+
+        ingested = 0
+        skipped = 0
+        refused = 0
+        failed = 0
+        skipped_types: collections.Counter = collections.Counter()
+        curatr_eligible_ids: list[tuple[str, str]] = []  # (resource_type, resource_id)
+
+        try:
+            for url in download_links:
+                logger.info('Fasten: streaming download for job %s', job.task_id)
+                # Fasten's download endpoint requires Basic auth (it 302s to
+                # a signed URL; httpx drops the auth header on cross-host
+                # redirects, so the signed hop stays clean).
+                _auth = None
+                _pub = os.environ.get('FASTEN_PUBLIC_KEY', '').strip()
+                _priv = os.environ.get('FASTEN_PRIVATE_KEY', '').strip()
+                if _pub and _priv and _is_fasten_download_host(url):
+                    _auth = (_pub, _priv)
+                with httpx.stream(
+                    'GET', url, timeout=_DOWNLOAD_TIMEOUT,
+                    follow_redirects=True, auth=_auth
+                ) as resp:
+                    resp.raise_for_status()
+
+                    if _stopped_by_disconnect(job_id, task_id, tenant_id,
+                                              org_connection_id):
+                        return
+                    job.status = 'ingesting'
+                    db.session.commit()
+
+                    for raw_line in resp.iter_lines():
+                        line = raw_line.strip()
+                        if not line:
+                            continue
+                        try:
+                            resource = json.loads(line)
+                            result, rid = _ingest_one(resource, tenant_id,
+                                                      source='fasten')
+                            if result == 'ok':
+                                ingested += 1
+                                rt = resource.get('resourceType', '')
+                                if rt in _CURATR_ELIGIBLE and rid:
+                                    curatr_eligible_ids.append((rt, rid))
+                            elif result in REFUSED_OUTCOMES:
+                                refused += 1
+                                log_refusal(logger, f'Fasten job {job.task_id}',
+                                            tenant_id, resource, result)
+                            else:
+                                skipped += 1
+                                skipped_types[safe_skipped_type(resource)] += 1
+                        except json.JSONDecodeError:
+                            failed += 1
+                        except Exception as exc:
+                            failed += 1
+                            # CRITICAL: roll back the failed flush so the
+                            # session isn't poisoned. Without this, one bad
+                            # resource makes every subsequent resource fail
+                            # with "transaction has been rolled back", wedging
+                            # the whole job (found live 2026-07-08: a single
+                            # over-length id poisoned all 250).
+                            try:
+                                db.session.rollback()
+                            except Exception:
+                                pass
+                            logger.warning('Fasten ingest error: %s',
+                                           type(exc).__name__)
+
+                        total = ingested + skipped + failed
+                        if total % _PROGRESS_BATCH == 0:
+                            if _stopped_by_disconnect(job_id, task_id,
+                                                      tenant_id,
+                                                      org_connection_id):
+                                return
+                            job.ingested_resources = ingested
+                            job.skipped_resources = skipped
+                            job.failed_resources = failed
+                            db.session.commit()
+                            logger.info(
+                                'Fasten job %s progress: ingested=%d skipped=%d '
+                                'failed=%d', job.task_id, ingested, skipped, failed)
+
+            if _stopped_by_disconnect(job_id, task_id, tenant_id,
+                                      org_connection_id):
+                return
+            job.status = 'complete'
+            job.ingested_resources = ingested
+            job.skipped_resources = skipped
+            job.failed_resources = failed
+            job.completed_at = datetime.now(timezone.utc)
+
+            # WHICH types were dropped, not just how many. A bare count
+            # cannot tell an export full of billing rows apart from a feed
+            # whose entire medication list is a type we do not keep (#377).
+            types_summary = skipped_type_summary(skipped_types)
+
+            add_audit_event(
+                event_type='fasten_import_complete',
+                agent_id='fasten-connect',
+                tenant_id=tenant_id,
+                outcome='success',
+                detail=(
+                    f'job={job.task_id} '
+                    f'ingested={ingested} skipped={skipped} '
+                    f'refused={refused} failed={failed}'
+                    + (f' skipped_types={types_summary}'
+                       if types_summary else '')
+                ),
+            )
+            db.session.commit()
+            logger.info(
+                'Fasten job %s complete: ingested=%d skipped=%d '
+                'refused=%d failed=%d skipped_types=%s',
+                job.task_id, ingested, skipped, refused, failed,
+                types_summary or '-',
+            )
+
+            # Optional: run Curatr quality scan on clinical resources. Best
+            # effort ONLY — the ingest is already committed 'complete' above,
+            # so a scan failure must never flip the job to 'failed'.
+            curatr_issues = 0
+            if os.environ.get('FASTEN_CURATR_SCAN', '').lower() == 'true':
+                try:
+                    curatr_issues = _run_curatr_scan(
+                        curatr_eligible_ids, tenant_id, job.task_id) or 0
+                except Exception as scan_exc:  # pragma: no cover - defensive
+                    logger.warning('Fasten Curatr scan failed (ingest already '
+                                   'complete): %s', type(scan_exc).__name__)
+                    db.session.rollback()
+
+            # Push a Telegram notification to every chat bound to this tenant.
+            # Summary-level only; no PHI. Failures are swallowed — notify is a
+            # nice-to-have, not a blocker on the ingest commit.
+            try:
+                from r6.telegram_push import notify_tenant
+                msg_lines = [
+                    '📥 *Records imported*',
+                    f'• {ingested} resources ingested',
+                ]
+                if skipped:
+                    msg_lines.append(f'• {skipped} skipped (unsupported types)')
+                if failed:
+                    msg_lines.append(f'• {failed} failed')
+                if curatr_issues:
+                    msg_lines.append(f'• {curatr_issues} data-quality issues flagged')
+                msg_lines.append('')
+                msg_lines.append('Try `/summary`, `/conditions`, `/curatr`, or `/dashboard`.')
+                notify_tenant(tenant_id, '\n'.join(msg_lines))
+            except Exception as notify_exc:  # pragma: no cover - defensive
+                logger.warning('Fasten notify push failed: %s',
+                               type(notify_exc).__name__)
+
+        except Exception as exc:
+            job.status = 'failed'
+            # Persist only a bounded category. Exception strings from HTTP and
+            # database clients commonly embed URLs, tokens, or bound FHIR JSON.
+            job.failure_reason = type(exc).__name__[:200]
+            job.completed_at = datetime.now(timezone.utc)
+            add_audit_event(
+                event_type='fasten_import_failed',
+                agent_id='fasten-connect',
+                tenant_id=tenant_id,
+                outcome='failure',
+                detail=f'job={job.task_id}',
+            )
+            db.session.commit()
+            logger.error('Fasten job %d failed: %s', job_id,
+                         type(exc).__name__)
+            try:
+                from r6.telegram_push import notify_tenant
+                notify_tenant(
+                    tenant_id,
+                    '⚠️ *Import failed*\n'
+                    'Your last data pull did not complete. '
+                    'Try `/health` to diagnose, or run /connect again.',
+                )
+            except Exception:  # pragma: no cover - defensive
+                pass
+
+
+def _ingest_one(resource: dict, tenant_id: str,
+                agent_id: str = 'fasten-connect',
+                detail: str = 'Ingested via Fasten EHI export',
+                allowed_types: frozenset | None = None,
+                *, source: str | None,
+                ) -> tuple[str, str | None]:
+    """
+    Ingest a single FHIR resource into the guardrails store.
+
+    Returns ('ok', resource_id) on success, ('skipped', None) for unsupported
+    types, ('forbidden', None) for a type excluded by `allowed_types`, or
+    ('invalid_id', None) for a caller-supplied id outside the FHIR id shape
+    or not a string (an int is coerced; a bool, float, list or object is not).
+    Raises on unexpected DB errors.
+
+    `agent_id` and `detail` parameterize the audit event so a caller other
+    than Fasten (e.g. the #227 direct-upload path) records honest provenance
+    rather than borrowing Fasten's. Defaults preserve prior behavior for the
+    Fasten and SHC callers.
+
+    `allowed_types`, when given, is an additional allowlist checked AFTER
+    `is_supported_type` — it narrows, never widens. `None` preserves prior
+    behavior exactly (every supported type is ingestible), which is what the
+    Fasten/SHC callers still want; the direct-upload path (#227) passes an
+    explicit clinical-only set so an unauthenticated-adjacent caller cannot
+    author AuditEvent/Permission/Consent/Provenance/Bundle resources even
+    though the store technically supports storing them.
+
+    `source` is the channel the record arrived through, one of
+    `r6.models.RECORD_SOURCES` (FHI-42), or None for content no channel we
+    can vouch for delivered (a caller-supplied seed bundle). Keyword-only
+    with no default, so a new caller cannot forget it; each caller passes a
+    literal, never a request field. An off-list value raises ValueError
+    before anything is written. Both the new-row and the upsert branch set
+    it: the latest channel wins, as the content does.
+    """
+    if source is not None and source not in RECORD_SOURCES:
+        raise ValueError('source must be one of RECORD_SOURCES or None')
+    resource_type = resource.get('resourceType', '')
+
+    if not resource_type or not R6Resource.is_supported_type(resource_type):
+        return 'skipped', None
+    if allowed_types is not None and resource_type not in allowed_types:
+        return 'forbidden', None
+
+    resource_id = resource.get('id')
+    if resource_id is not None:
+        # An int keeps coercing to a string — pre-existing, and live on the
+        # Fasten connector. Any other non-string (bool, float, list, object)
+        # is refused BEFORE str(), because str(True) and str(1.5) both pass
+        # the id pattern. bool is a subclass of int, hence checked first (#286).
+        if isinstance(resource_id, bool) or not isinstance(resource_id, (str, int)):
+            return 'invalid_id', None
+        resource_id = str(resource_id)
+        if not _RESOURCE_ID_PATTERN.fullmatch(resource_id):
+            return 'invalid_id', None
+    else:
+        resource_id = str(uuid.uuid4())
+    resource_json = json.dumps(resource, separators=(',', ':'))
+
+    # Identity is (tenant_id, resource_type, id) — composite PK. The same
+    # FHIR id held by ANOTHER tenant (or another type in this tenant) is a
+    # different row entirely, so the old cross-tenant PK collision (which
+    # silently dropped the resource from the import) cannot occur.
+    existing = R6Resource.query.filter_by(
+        tenant_id=tenant_id, resource_type=resource_type, id=resource_id
+    ).first()
+    if existing:
+        # Re-ingest of a row we already hold — including one that was
+        # soft-deleted: a fresh import of the same (tenant, type, id)
+        # revives it rather than colliding with the tombstone.
+        existing.update_resource(resource_json)
+        existing.source = source
+        # Lifting a tombstone is recorded as such (#558): the audit row
+        # below says 'update' with the revive named, never a plain create.
+        revived = bool(existing.is_deleted)
+        existing.is_deleted = False
+    else:
+        revived = False
+        new_res = R6Resource(
+            resource_type=resource_type,
+            resource_json=resource_json,
+            resource_id=resource_id,
+            tenant_id=tenant_id,
+            source=source,
+        )
+        db.session.add(new_res)
+
+    db.session.flush()
+
+    add_audit_event(
+        event_type='update' if revived else 'create',
+        resource_type=resource_type,
+        resource_id=resource_id,
+        agent_id=agent_id,
+        tenant_id=tenant_id,
+        outcome='success',
+        detail=(f'{detail}; tombstone lifted on re-ingest' if revived
+                else detail),
+    )
+
+    return 'ok', resource_id
+
+
+def _run_curatr_scan(
+    eligible: list[tuple[str, str]], tenant_id: str, task_id: str
+) -> int:
+    """
+    Run Curatr quality evaluation on ingested clinical resources.
+    Results are logged and audited; no auto-fix is applied (patient must approve).
+    Returns total issue count surfaced (used by the post-ingest Telegram push).
+    """
+    if not eligible:
+        return 0
+
+    from r6.curatr import CuratrEngine  # local import to keep module lightweight
+
+    evaluator = CuratrEngine()
+    issues_found = 0
+
+    for resource_type, resource_id in eligible[:100]:  # cap at 100 per import
+        try:
+            res_obj = R6Resource.query.filter_by(
+                tenant_id=tenant_id, resource_type=resource_type,
+                id=resource_id,
+            ).first()
+            if not res_obj:
+                continue
+            resource = json.loads(res_obj.resource_json)
+            result = evaluator.evaluate(resource)
+            count = len(result.issues)
+            if count:
+                issues_found += count
+                add_audit_event(
+                    event_type='curatr_scan',
+                    resource_type=resource_type,
+                    resource_id=resource_id,
+                    agent_id='fasten-connect',
+                    tenant_id=tenant_id,
+                    outcome='success',
+                    detail=f'issues={count}',
+                )
+        except Exception as exc:
+            logger.warning('Curatr scan error for resource type %s: %s',
+                           resource_type, type(exc).__name__)
+    db.session.commit()
+
+    logger.info(
+        'Fasten job %s Curatr scan complete: %d issues across %d resources',
+        task_id, issues_found, len(eligible),
+    )
+    return issues_found

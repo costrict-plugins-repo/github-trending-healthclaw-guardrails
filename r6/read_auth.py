@@ -1,0 +1,151 @@
+"""Shared tenant-bound read authorization for Flask route surfaces."""
+
+from __future__ import annotations
+
+import re
+
+from flask import jsonify, request, session
+
+# Env-only predicates live in runtime_config, at the bottom of the import
+# graph. They were here, and r6.oauth reached through r6.routes' re-export of
+# one of them to get at it — a cycle built to fetch three lines that read an
+# environment variable. Re-exported so this module's own importers are
+# unchanged.
+from r6.runtime_config import is_public_tenant, read_auth_enabled
+from r6.oauth import fhir_resource, validate_bearer_token
+
+
+_TRUE_VALUES = frozenset({"1", "true", "yes"})
+_TENANT_PATTERN = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
+TENANT_SESSION_KEY = "cc_tenant"
+_OAUTH_READ_SCOPES = frozenset({
+    "patient/*.read",
+    "smart/patient/*.read",
+    "fhir.read",
+    "user/*.read",
+    "system/*.read",
+})
+
+
+def read_auth_required(tenant_id: str) -> bool:
+    return read_auth_enabled() and not is_public_tenant(tenant_id)
+
+
+def _oauth_authorizes(token: str, tenant_id: str) -> bool:
+    ok, info = validate_bearer_token(token)
+    if not ok or not isinstance(info, dict):
+        return False
+    if info.get("tenant_id") != tenant_id:
+        return False
+    # RFC 8707: only a token minted for this FHIR surface is a credential
+    # here. One minted at the same issuer for another audience (the MCP
+    # server's) is refused, whatever tenant and scopes it carries — spec
+    # §9.2, the replay nobody would otherwise notice.
+    if info.get("aud") != fhir_resource():
+        return False
+    return bool(set(info.get("scopes") or ()) & _OAUTH_READ_SCOPES)
+
+
+def disconnected_patient_connect_token(tenant_id: str) -> bool:
+    """True when the step-up token just accepted is a patient connect token
+    and the tenant has since been disconnected (SEC940-F2).
+
+    Disconnect (POST /r6/fhir/internal/fasten-revoke) writes the tenant
+    tombstone; the 30-day token agent-access handed a browser must stop
+    reading then, not when it expires. CareAgents' own server-minted tokens
+    carry another subject and keep reading the records Disconnect keeps
+    (#847). Asked only after has_grant validated the token, so an
+    unauthenticated caller learns nothing about which tenants are closed.
+    The token is read from the sources has_grant reads, in its order.
+    """
+    from r6.stepup import PATIENT_CONNECT_SUBJECT, token_subject
+
+    token = (request.headers.get("X-Step-Up-Token") or "").strip()
+    if not token:
+        auth = (request.headers.get("Authorization") or "").strip()
+        token = auth[7:].strip() if auth.lower().startswith("bearer ") else ""
+    if token_subject(token) != PATIENT_CONNECT_SUBJECT:
+        return False
+    # Lazy: r6.fasten imports the access kernel, which imports this module.
+    from r6.fasten.models import tenant_closed
+    return tenant_closed(tenant_id)
+
+
+def authorize_tenant_read(
+    tenant_id: str,
+    *,
+    session_tenant: str | None = None,
+    always_require: bool = False,
+) -> str | None:
+    """Return the tenant only after its read claim is authorized.
+
+    Public tenants bypass credentials only through ``PUBLIC_TENANTS``. When
+    auth is required, accepted credentials are a matching authenticated
+    session, tenant-bound step-up token (including read-scoped tokens), or a
+    tenant-bound SMART OAuth bearer carrying a read scope.
+
+    ``always_require`` is used by surfaces such as command center that were
+    already private before the rollout flag existed. Other routes preserve
+    local/testing compatibility while production startup requires the flag.
+    """
+    if not tenant_id or not _TENANT_PATTERN.fullmatch(tenant_id):
+        return None
+    if is_public_tenant(tenant_id):
+        return tenant_id
+    if not always_require and not read_auth_enabled():
+        return tenant_id
+    if session_tenant is None:
+        session_tenant = session.get(TENANT_SESSION_KEY)
+    if session_tenant == tenant_id:
+        return tenant_id
+
+    # Kernel slice 19: the step-up branch asks has_grant, which reads
+    # X-Step-Up-Token and then the bearer alias in the same order this
+    # function did, strips both the same way (#334), accepts read-scoped
+    # tokens (TENANT_BOUND is the validator's require_scope=None), and
+    # answers None in exactly the cases require_grant would refuse. The
+    # OAuth branch below is untouched: a bearer that is not a step-up token
+    # still gets its SMART scope check. Imported here, not at the top,
+    # because r6.access imports TENANT_SESSION_KEY from this module.
+    from r6.access import Scope, Tenant, TenantSource, has_grant
+
+    if (has_grant(scope=Scope.TENANT_BOUND,
+                  tenant=Tenant(id=tenant_id, source=TenantSource.DEFAULT),
+                  also_bearer=True) is not None
+            and not disconnected_patient_connect_token(tenant_id)):
+        return tenant_id
+    auth = (request.headers.get("Authorization") or "").strip()
+    bearer = auth[7:].strip() if auth.lower().startswith("bearer ") else ""
+    if bearer and _oauth_authorizes(bearer, tenant_id):
+        return tenant_id
+    return None
+
+
+def authenticate_tenant_read(tenant_id):
+    """Validate read credentials for `tenant_id`.
+
+    Shared by the GET before_request hook and POST read-shaped operations
+    (e.g. Questionnaire/$populate). Returns None when access is allowed,
+    or an (OperationOutcome, status) tuple to abort with.
+
+    Mirrors the gate semantics: public tenants and the disabled flag pass;
+    otherwise a tenant-bound step-up token OR a SMART bearer is required.
+
+    The OperationOutcome is built inline rather than through
+    r6.access.outcome_response: r6.access imports this module, so reaching
+    back would be a cycle.
+    """
+    if authorize_tenant_read(tenant_id) is not None:
+        return None
+    # Do NOT leak whether the tenant exists or why the token failed.
+    return jsonify({
+        'resourceType': 'OperationOutcome',
+        'issue': [
+            {
+                'severity': 'error',
+                'code': 'security',
+                'diagnostics': (f"Read access to tenant '{tenant_id}' "
+                                "requires authentication"),
+            }
+        ]
+    }), 401
