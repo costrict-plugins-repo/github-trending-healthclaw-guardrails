@@ -1,0 +1,1316 @@
+"""
+openclaw — Telegram bot for HealthClaw Guardrails.
+
+Provides a conversational interface to the local MCP FHIR guardrail stack.
+
+Commands
+--------
+/start          Welcome + bind this chat to TENANT_ID (idempotent)
+/connect        Get the Fasten TEFCA verification URL for this tenant
+/health         Stack health check (Flask + MCP reachability)
+/conditions     List Conditions for the configured tenant
+/labs           Recent lab results (Observation search)
+/curatr         Run Curatr clinical evaluation on current Conditions
+/curatr fix     Propose the first fix from the last Curatr evaluation (nothing changes here)
+/approve        Where to approve a proposed fix (CareAgents review page, not this chat)
+/token          Display the current step-up token (for debugging)
+
+Environment variables
+---------------------
+TELEGRAM_BOT_TOKEN   Required. BotFather token.
+TENANT_ID            Tenant to query. Default: desktop-demo.
+MCP_BASE_URL         MCP HTTP bridge base URL. Default: http://localhost:3001.
+MCP_AUTH_TOKEN       Bearer token for authenticated MCP HTTP requests.
+FHIR_BASE_URL        Flask FHIR base URL. Default: http://localhost:5000/r6/fhir.
+STEP_UP_SECRET       HMAC secret for step-up tokens.
+"""
+
+import logging
+import re
+import os
+import time
+from collections import deque
+
+import requests
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.error import Conflict
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
+
+logging.basicConfig(
+    format='%(asctime)s %(levelname)-8s %(name)s — %(message)s',
+    level=logging.INFO,
+)
+logger = logging.getLogger('openclaw')
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+
+BOT_TOKEN = os.environ['TELEGRAM_BOT_TOKEN']
+TENANT_ID = os.environ.get('TENANT_ID', 'desktop-demo')
+MCP_BASE_URL = os.environ.get('MCP_BASE_URL', 'http://localhost:3001').rstrip('/')
+MCP_AUTH_TOKEN = os.environ.get('MCP_AUTH_TOKEN', '').strip()
+FHIR_BASE_URL = os.environ.get('FHIR_BASE_URL', 'http://localhost:5000/r6/fhir').rstrip('/')
+STEP_UP_SECRET = os.environ.get('STEP_UP_SECRET', '')
+
+# Command Center persistence — if Flask is reachable, every chat turn is
+# logged to /command-center/api/conversations so the dashboard can show
+# recent Telegram activity per agent.
+CC_API_BASE = os.environ.get(
+    'COMMAND_CENTER_API',
+    FHIR_BASE_URL.replace('/r6/fhir', '') + '/command-center/api',
+).rstrip('/')
+
+_RPC_URL = f'{MCP_BASE_URL}/mcp/rpc'
+
+# Per-chat ephemeral state (pending writes, last curatr result)
+_chat_state: dict[int, dict] = {}
+
+# Telegram command → command-center agent id. Determines which agent
+# persona each bot interaction is attributed to in the dashboard.
+COMMAND_TO_AGENT = {
+    # Maps /command → persona id in agents.yaml.
+    # sally (pcp-advisor) owns the "what's up with my health?" questions.
+    # mary (pharmacy) handles meds. dom does fitness/vitals. joe runs plumbing.
+    'start': 'sally',
+    'connect': 'sally',       # data-onboarding flow lives with PCP advisor
+    'health': 'joe',          # stack health check — service optimizer
+    'conditions': 'sally',
+    'labs': 'sally',
+    'dashboard': 'sally',
+    'curatr': 'joe',
+    'curatr_fix': 'joe',
+    'approve': 'joe',
+    'token': 'joe',
+    'hbo_connect': 'sally',   # Health Bank One OAuth consent
+    'hbo_pull': 'joe',        # HBO MCP pull + ingest
+}
+
+# Public base URL where the dashboard is reachable. Override for production
+# (e.g., https://healthclaw.io).
+DASHBOARD_BASE_URL = os.environ.get('DASHBOARD_BASE_URL', 'https://healthclaw.io').rstrip('/')
+
+# Health Bank One — optional config. If HBO_AUTHORIZATION_ENDPOINT is unset,
+# /hbo-connect tells the user to configure it.
+HBO_AUTHORIZATION_ENDPOINT = os.environ.get('HBO_AUTHORIZATION_ENDPOINT', '').strip()
+HBO_CLIENT_ID = os.environ.get('HBO_CLIENT_ID', '').strip()
+HBO_REDIRECT_URI = os.environ.get(
+    'HBO_REDIRECT_URI', f'{DASHBOARD_BASE_URL}/hbo/callback').strip()
+HBO_SCOPES = os.environ.get('HBO_SCOPES', 'openid offline_access').strip()
+HBO_MCP_URL = os.environ.get(
+    'HBO_MCP_URL', 'https://mcp.app.healthbankone.com/mcp').strip()
+
+# Optional ops-alert destination for mid-run poller-conflict storms (see
+# "Mid-run singleton hardening" below). The bot has no dedicated admin/ops
+# channel otherwise — r6.telegram_push.notify_tenant is patient-facing and
+# needs the Flask app's DB, which this standalone poller process doesn't
+# have. If unset, storm detection still logs CRITICAL and exits; it just
+# can't push a chat alert.
+TELEGRAM_ADMIN_CHAT_ID = os.environ.get('TELEGRAM_ADMIN_CHAT_ID', '').strip()
+
+
+def _persist_turn(update: Update, agent_id: str, role: str, text: str,
+                  metadata: dict | None = None) -> None:
+    """
+    POST a conversation turn to the command center API. Silent-on-failure —
+    the bot must keep working even if the dashboard API is down.
+    """
+    try:
+        msg = update.effective_message if update else None
+        user = update.effective_user if update else None
+        chat_id = str(msg.chat_id) if msg else None
+
+        payload = {
+            'tenant_id': TENANT_ID,
+            'agent_id': agent_id,
+            'channel': 'telegram',
+            'session_id': chat_id,
+            'user_id': str(user.id) if user else None,
+            'role': role,
+            'text': text,
+        }
+        if metadata:
+            payload['metadata'] = metadata
+        requests.post(
+            f'{CC_API_BASE}/conversations',
+            json=payload,
+            timeout=2,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.debug('Command center persistence failed: %s', exc)
+
+
+async def _log_incoming(update: Update, command: str) -> str:
+    """Persist the inbound user command and return the chosen agent_id."""
+    agent_id = COMMAND_TO_AGENT.get(command, 'health-advisor')
+    if update and update.effective_message:
+        _persist_turn(
+            update,
+            agent_id,
+            'user',
+            f'/{command} {update.effective_message.text or ""}'.strip(),
+        )
+    return agent_id
+
+
+async def _reply(update: Update, text: str, agent_id: str,
+                 parse_mode: str | None = None) -> None:
+    """Send a Telegram reply and log the assistant turn to the dashboard."""
+    if update and update.effective_message:
+        if parse_mode:
+            await update.effective_message.reply_text(text, parse_mode=parse_mode)
+        else:
+            await update.effective_message.reply_text(text)
+    _persist_turn(update, agent_id, 'assistant', text[:1000])
+
+
+# ---------------------------------------------------------------------------
+# MCP HTTP bridge helpers
+# ---------------------------------------------------------------------------
+
+def _rpc(tool: str, *, headers: dict | None = None, **params) -> dict:
+    """
+    Call an MCP tool via the HTTP bridge (POST /mcp/rpc).
+
+    Uses JSON-RPC 2.0 with method=tools/call. `headers` are extra request
+    headers the bridge forwards to Flask (X-Step-Up-Token for a write).
+    Returns the result value on success, raises on HTTP error.
+    """
+    payload = {
+        'jsonrpc': '2.0',
+        'id': 1,
+        'method': 'tools/call',
+        'params': {
+            'name': tool,
+            'arguments': {'tenant_id': TENANT_ID, **params},
+        },
+    }
+    headers = dict(headers or {})
+    if MCP_AUTH_TOKEN:
+        headers['Authorization'] = f'Bearer {MCP_AUTH_TOKEN}'
+    resp = requests.post(_RPC_URL, json=payload, headers=headers, timeout=20)
+    resp.raise_for_status()
+    data = resp.json()
+    if 'error' in data:
+        raise RuntimeError(data['error'].get('message', str(data['error'])))
+    return data.get('result', data)
+
+
+def _fhir_get(path: str) -> dict:
+    """Direct FHIR GET with tenant header (bypasses MCP for quick reads)."""
+    resp = requests.get(
+        f'{FHIR_BASE_URL}/{path.lstrip("/")}',
+        headers={'X-Tenant-ID': TENANT_ID},
+        timeout=15,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+def tenant_is_world_readable(timeout: float = 5.0):
+    """Can an unauthenticated caller read this bot's tenant?
+
+    OBSERVED, not configured. The bot could mirror PUBLIC_TENANTS from its own
+    environment, but a mirror of a server-side setting is wrong exactly when
+    it matters: the bot's env says private, the server's says public, and the
+    bot cheerfully invites someone to publish their medical records. So this
+    asks the only authority — it makes the request an anonymous stranger would
+    make, and reads what comes back.
+
+    Returns True (anyone can read it), False (credentials required), or None
+    (could not tell). Callers must treat None like True. "I could not
+    determine whether your records would be public" is not a state in which
+    to pull someone's real medical history.
+    """
+    try:
+        resp = requests.get(
+            f'{FHIR_BASE_URL}/Patient',
+            params={'_count': 1},
+            headers={'X-Tenant-ID': TENANT_ID},   # no credentials, on purpose
+            timeout=timeout,
+        )
+    except Exception as exc:  # noqa: BLE001 — network, DNS, TLS, timeout
+        logger.warning('could not determine tenant readability: %s',
+                       type(exc).__name__)
+        return None
+    if resp.status_code == 200:
+        return True
+    if resp.status_code in (401, 403):
+        return False
+    logger.warning('unexpected status probing tenant readability: %s',
+                   resp.status_code)
+    return None
+
+
+#: Shown instead of the connect menu when the bound tenant is world-readable.
+#: Names the tenant, because "this deployment" is not something a user can act
+#: on and the tenant id is what they would quote to whoever runs it.
+CONNECT_REFUSED_PUBLIC = (
+    '🚫 *Not on this bot.*\n\n'
+    'This bot is bound to tenant `{tenant}`, and anyone can read that '
+    'tenant without signing in — I checked just now. Pulling your real '
+    'records into it would publish your medical history to whoever asks.\n\n'
+    'This is the demo bot. It is for exploring the guardrails against '
+    'synthetic records. To connect real records, use a bot bound to a '
+    'private tenant of your own.'
+)
+
+CONNECT_REFUSED_UNKNOWN = (
+    '🚫 *Not right now.*\n\n'
+    'I could not reach HealthClaw to check whether tenant `{tenant}` is '
+    'private, and I will not pull your real records into a tenant I cannot '
+    'confirm is private. Try again in a minute.'
+)
+
+
+def _get_step_up_token() -> str:
+    """Fetch a fresh step-up token from the mint endpoint.
+
+    The endpoint returns the token under `token` (older callers expected
+    `step_up_token`). When INTERNAL_TOKEN_MINT_SECRET is set, minting for a
+    non-public tenant (this bot's TENANT_ID) requires X-Internal-Secret.
+    """
+    headers = {'X-Tenant-ID': TENANT_ID}
+    # Trimmed, as the engine trims its copy (r6/runtime_config.py).
+    mint_secret = os.environ.get('INTERNAL_TOKEN_MINT_SECRET', '').strip()
+    if mint_secret:
+        headers['X-Internal-Secret'] = mint_secret
+    resp = requests.post(
+        f'{FHIR_BASE_URL}/internal/step-up-token',
+        json={'tenant_id': TENANT_ID},
+        headers=headers,
+        timeout=10,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    return data.get('token') or data.get('step_up_token', '')
+
+
+def _write_headers() -> dict:
+    """Headers for a write-tier MCP tool call: a fresh step-up token and the
+    tenant it is bound to."""
+    return {'X-Step-Up-Token': _get_step_up_token(), 'X-Tenant-Id': TENANT_ID}
+
+
+# ---------------------------------------------------------------------------
+# Formatting helpers
+# ---------------------------------------------------------------------------
+
+def _fmt_condition(entry: dict) -> str:
+    res = entry.get('resource', {})
+    code = (
+        res.get('code', {})
+           .get('coding', [{}])[0]
+           .get('display', res.get('code', {}).get('text', '?'))
+    )
+    status = res.get('clinicalStatus', {}).get('coding', [{}])[0].get('code', '?')
+    return f'• {code} ({status})'
+
+
+def _fmt_observation(entry: dict) -> str:
+    res = entry.get('resource', {})
+    code = (
+        res.get('code', {})
+           .get('coding', [{}])[0]
+           .get('display', res.get('code', {}).get('text', '?'))
+    )
+    qty = res.get('valueQuantity', {})
+    if qty:
+        value = f"{qty.get('value', '?')} {qty.get('unit', '')}".strip()
+    elif res.get('component'):
+        # Panel observations (e.g. blood pressure) carry values in components
+        parts = []
+        for comp in res['component'][:4]:
+            cq = comp.get('valueQuantity', {})
+            if cq.get('value') is None:
+                continue
+            label = (comp.get('code', {}).get('coding', [{}])[0]
+                     .get('display', '') or '').split(' ')[0].lower()
+            parts.append(f"{label + ' ' if label else ''}{cq['value']}")
+        value = ('/'.join(p.split()[-1] for p in parts)
+                 + ' ' + (res['component'][0].get('valueQuantity', {}).get('unit', '') or '')
+                 ).strip() if parts else '(see full record)'
+    elif res.get('valueString'):
+        value = str(res['valueString'])[:40]
+    else:
+        value = '(no numeric value)'
+    return f'• {code}: {value}'
+
+
+# ---------------------------------------------------------------------------
+# Handlers
+# ---------------------------------------------------------------------------
+
+def _bind_chat_to_tenant(chat_id: int, username: str | None) -> tuple[bool, str]:
+    """
+    Tell Flask to bind this Telegram chat to TENANT_ID so the Fasten ingest
+    webhook can push back. Idempotent; returns (ok, detail) — detail is
+    safe to surface in chat ("bound", "already bound", or an error class).
+    """
+    try:
+        if STEP_UP_SECRET:
+            step_up = _get_step_up_token()
+        else:
+            # No shared secret (e.g. running the quickstart recipe against a
+            # remote stack): mint via the server. Works for public tenants
+            # (desktop-demo); non-public tenants correctly get a 403 there.
+            mint = requests.post(
+                f'{FHIR_BASE_URL}/internal/step-up-token',
+                json={'tenant_id': TENANT_ID},
+                headers={'X-Tenant-Id': TENANT_ID},
+                timeout=5,
+            )
+            if mint.status_code != 200:
+                return False, f'server mint http {mint.status_code}'
+            step_up = mint.json().get('token', '')
+            if not step_up:
+                return False, 'server mint returned no token'
+        resp = requests.post(
+            f'{FHIR_BASE_URL}/internal/bind-telegram',
+            json={
+                'tenant_id': TENANT_ID,
+                'chat_id': chat_id,
+                'username': username,
+                'step_up_token': step_up,
+            },
+            timeout=5,
+        )
+        if resp.status_code == 201:
+            return True, 'bound'
+        return False, f'http {resp.status_code}'
+    except requests.RequestException as exc:
+        return False, f'network: {exc.__class__.__name__}'
+
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    agent_id = await _log_incoming(update, 'start')
+
+    chat_id = update.effective_chat.id if update.effective_chat else None
+    username = (update.effective_user.username if update.effective_user else None) or None
+    bind_ok, bind_detail = (False, 'no chat_id')
+    if chat_id is not None:
+        bind_ok, bind_detail = _bind_chat_to_tenant(chat_id, username)
+        logger.info('bind chat=%s tenant=%s ok=%s detail=%s',
+                    chat_id, TENANT_ID, bind_ok, bind_detail)
+
+    bind_line = (
+        f'✅ Chat bound to tenant `{TENANT_ID}` — you will get a ping when records arrive.'
+        if bind_ok else
+        f'⚠️ Could not bind chat (`{bind_detail}`). You can still use commands; notifications are off.'
+    )
+
+    # One-time risk acknowledgment for the chat-app channel. Telegram is a
+    # consumer channel, not BAA-covered transport; this is patient-directed
+    # access to one's own records. See templates/privacy.html "Messaging
+    # Platforms" for the full posture.
+    #
+    # This text must promise only controls that actually exist. A summary-only
+    # mode was advertised here before it was built; offering a privacy control
+    # that does nothing leaves the user worse off than saying nothing, because
+    # they choose to continue on the strength of it. If summary-only ships,
+    # add it back here and to the privacy policy's mitigations list together.
+    #
+    # The SAME rule governs the command list below, and it was broken there:
+    # /summary and /curatr_fix were both listed with no handler registered,
+    # so each answered 'Unknown command. Try /start for the command list.' —
+    # the list that had just offered them. /curatr_fix now has its handler;
+    # /summary is gone, because nothing implements it.
+    # tests/test_bot_answers_what_it_advertises.py holds the two in sync.
+    # The second sentence here used to tell the user these were their own
+    # records, and ask them to accept the channel risk on that basis. Every
+    # clause of it was wrong on this bot: one tenant is shared by every user,
+    # and it is world-readable. A clinical reviewer flagged it as reading oddly on the
+    # synthetic tenant (#459); it read oddly because it was false.
+    #
+    # The old wording is not quoted here on purpose — the test that bans it
+    # reads this file, and caught this very comment on the first draft.
+    #
+    # It was also doing consent work it could not support. /connect pulls real
+    # records into TENANT_ID, and a user who believed that sentence would have
+    # been agreeing on the strength of it. The rule three lines below —
+    # promise only controls that actually exist — applies to statements of
+    # fact just as much as to features.
+    risk_line = (
+        '⚠️ Heads up: chat apps aren’t encrypted medical channels. '
+        f'This bot reads and writes one tenant, `{TENANT_ID}`, which is '
+        'shared by everyone using it — not a private space of your own.'
+    )
+
+    text = (
+        '*HealthClaw Guardrails Bot*\n\n'
+        f'{risk_line}\n\n'
+        f'{bind_line}\n\n'
+        'Commands:\n'
+        '/connect — pull your records (Fasten + TEFCA)\n'
+        '/hbo\\_connect — authorize Health Bank One (OAuth)\n'
+        '/hbo\\_pull — pull + ingest HBO verified records\n'
+        '/dashboard — open the command center (signed 24h link)\n'
+        '/conditions — list Conditions\n'
+        '/labs — recent lab results\n'
+        '/curatr — run Curatr data-quality evaluation\n'
+        '/curatr\\_fix — propose first Curatr fix (approved elsewhere)\n'
+        '/approve — where a proposed fix gets approved\n'
+        '/health — stack health check\n'
+        '/token — show current step-up token\n\n'
+        f'Tenant: `{TENANT_ID}`'
+    )
+    await _reply(update, text, agent_id, parse_mode='Markdown')
+
+
+async def cmd_connect(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show a menu of available health data connection options.
+
+    Refuses outright on a world-readable tenant. The banner tells the truth
+    now, but a banner is a sentence someone can skip; this is the half that
+    survives them skipping it (#459).
+    """
+    await _log_incoming(update, 'connect')
+
+    readable = tenant_is_world_readable()
+    if readable is not False:
+        template = (CONNECT_REFUSED_PUBLIC if readable
+                    else CONNECT_REFUSED_UNKNOWN)
+        await update.message.reply_text(
+            template.format(tenant=TENANT_ID), parse_mode='Markdown')
+        return
+
+    keyboard = [
+        [InlineKeyboardButton(
+            'Fasten TEFCA — hospitals, labs, EHRs (nationwide)',
+            callback_data='connect:fasten',
+        )],
+        [InlineKeyboardButton(
+            'Health Bank One — verified records + insurance',
+            callback_data='connect:hbo',
+        )],
+        [InlineKeyboardButton(
+            'Flexpa — 200+ payers/insurers (CMS-9115)',
+            callback_data='connect:flexpa',
+        )],
+        [InlineKeyboardButton(
+            'Epic / patient portals (Health Skillz)',
+            callback_data='connect:epic',
+        )],
+        [InlineKeyboardButton(
+            'MEDENT — small-practice EHR (SMART on FHIR)',
+            callback_data='connect:medent',
+        )],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    text = (
+        '*Connect your health records*\n\n'
+        'Choose a source to connect. You can connect multiple — '
+        'all records flow into the same tenant and are deduplicated.'
+    )
+    await update.message.reply_text(text, parse_mode='Markdown', reply_markup=reply_markup)
+
+
+async def _connect_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle inline keyboard button presses from /connect menu."""
+    query = update.callback_query
+    await query.answer()
+    choice = query.data  # e.g. 'connect:fasten'
+
+    connect_url = f'{DASHBOARD_BASE_URL}/connect/{TENANT_ID}'
+
+    if choice == 'connect:fasten':
+        text = (
+            '*Fasten TEFCA*\n\n'
+            'Verify once with CLEAR or ID.me — records stream from every QHIN '
+            '(hospitals, labs, EHRs). Usually 5–45 min.\n\n'
+            f'{connect_url}'
+        )
+    elif choice == 'connect:hbo':
+        text = (
+            '*Health Bank One*\n\n'
+            'Identity-verified records + insurance context.\n\n'
+            'Run /hbo\\_connect to start the OAuth flow.'
+        )
+    elif choice == 'connect:flexpa':
+        text = (
+            '*Flexpa — 200+ payers*\n\n'
+            'Connects claims, EOBs, coverage from major US insurers (CMS-9115).\n\n'
+            'Run /flexpa\\_connect to get the authorization link.'
+        )
+    elif choice == 'connect:epic':
+        text = (
+            '*Epic / patient portals*\n\n'
+            'Connects MyChart and most major patient portals via Health Skillz.\n\n'
+            'Run /epic\\_connect to get the authorization link.'
+        )
+    elif choice == 'connect:medent':
+        text = (
+            '*MEDENT*\n\n'
+            'Small-practice EHR with SMART on FHIR (v23.5+).\n\n'
+            'Run /medent\\_connect to authorize via your patient portal.'
+        )
+    else:
+        text = 'Unknown option.'
+
+    await query.edit_message_text(text, parse_mode='Markdown')
+
+
+async def cmd_health(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    agent_id = await _log_incoming(update, 'health')
+    await _reply(update, 'Checking stack health…', agent_id)
+    lines = []
+
+    # Flask health
+    try:
+        data = _fhir_get('health')
+        mode = data.get('mode', '?')
+        lines.append(f'Flask: OK (mode={mode})')
+    except Exception as exc:
+        lines.append(f'Flask: ERROR — {exc}')
+
+    # MCP reachability
+    try:
+        resp = requests.get(f'{MCP_BASE_URL}/health', timeout=5)
+        lines.append(f'MCP: {"OK" if resp.ok else "HTTP " + str(resp.status_code)}')
+    except Exception as exc:
+        lines.append(f'MCP: ERROR — {exc}')
+
+    await _reply(update, '\n'.join(lines), agent_id)
+
+
+async def cmd_conditions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    agent_id = await _log_incoming(update, 'conditions')
+    await _reply(update, 'Fetching conditions…', agent_id)
+    try:
+        result = _rpc('fhir_search', resource_type='Condition', params={})
+        bundle = result.get('bundle', result)
+        entries = bundle.get('entry', [])
+        if not entries:
+            await _reply(update, 'No conditions found.', agent_id)
+            return
+        lines = [_fmt_condition(e) for e in entries[:20]]
+        await _reply(update, '*Conditions*\n' + '\n'.join(lines), agent_id, parse_mode='Markdown')
+    except Exception as exc:
+        logger.error('conditions error: %s', exc)
+        await _reply(update, f'Error: {exc}', agent_id)
+
+
+async def cmd_labs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    agent_id = await _log_incoming(update, 'labs')
+    await _reply(update, 'Fetching lab results…', agent_id)
+    try:
+        result = _rpc(
+            'fhir_search',
+            resource_type='Observation',
+            params={'category': 'laboratory', '_count': '10', '_sort': '-_lastUpdated'},
+        )
+        bundle = result.get('bundle', result)
+        entries = bundle.get('entry', [])
+        if not entries:
+            await _reply(update, 'No lab results found.', agent_id)
+            return
+        lines = [_fmt_observation(e) for e in entries[:20]]
+        await _reply(update, '*Lab Results*\n' + '\n'.join(lines), agent_id, parse_mode='Markdown')
+    except Exception as exc:
+        logger.error('labs error: %s', exc)
+        await _reply(update, f'Error: {exc}', agent_id)
+
+
+async def cmd_curatr(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    args = context.args or []
+    if args and args[0].lower() == 'fix':
+        await _curatr_fix(update, context)
+        return
+
+    agent_id = await _log_incoming(update, 'curatr')
+    await _reply(update, 'Running Curatr evaluation…', agent_id)
+    chat_id = update.effective_chat.id
+    try:
+        # curatr_evaluate targets one resource (resource_type + resource_id);
+        # default to the tenant's most recent Observation.
+        search = _rpc('fhir_search', resource_type='Observation',
+                      params={'_count': 1})
+        entries = (search.get('entry') or search.get('resources') or
+                   (search.get('bundle') or {}).get('entry') or [])
+        if not entries:
+            await _reply(update, 'No Observations to evaluate yet — '
+                                 'connect records first (/connect).', agent_id)
+            return
+        first = entries[0].get('resource', entries[0])
+        rtype = first.get('resourceType', 'Observation')
+        result = _rpc('curatr_evaluate',
+                      resource_type=rtype,
+                      resource_id=first.get('id'))
+        _chat_state.setdefault(chat_id, {})['last_curatr'] = result
+
+        score = result.get('quality_score',
+                           result.get('overall_score', result.get('score', '?')))
+        quality = result.get('overall_quality', '')
+        issues = result.get('issues', [])
+        proposals = result.get('fix_proposals', result.get('proposals', []))
+
+        # One resource was graded, so the score is only ever shown beside the
+        # scope it belongs to (#458). N is the search Bundle's own `total` —
+        # a tenant-wide count. Never len(entries): this page asked for one, so
+        # falling back to it would print "1 of 1" and claim the record holds a
+        # single Observation.
+        total = search.get('total')
+        if not isinstance(total, int):
+            total = (search.get('bundle') or {}).get('total')
+        scope = (f'Checked 1 of {total} {rtype}s (most recent)'
+                 if isinstance(total, int)
+                 else f'Checked 1 of ? {rtype}s (most recent, count unknown)')
+
+        lines = [f'*Curatr Evaluation* — {scope} — '
+                 f'quality: {quality or "?"} (score: {score})']
+        summary = result.get('summary')
+        if summary:
+            lines.append(summary)
+        if issues:
+            lines.append('\n*Issues:*')
+            for iss in issues[:5]:
+                lines.append(f'• {iss.get("description", iss)}')
+        if proposals:
+            lines.append(f'\n{len(proposals)} fix proposal(s) available — use /curatr\\_fix')
+
+        await _reply(update, '\n'.join(lines), agent_id, parse_mode='Markdown')
+    except Exception as exc:
+        logger.error('curatr error: %s', exc)
+        await _reply(update, f'Error: {exc}', agent_id)
+
+
+async def _curatr_fix(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Propose the first suggested fix through the action rail (#413).
+
+    Nothing changes here. The MCP tool stages a 'curatr-fix' action; the
+    person approves it on their own review page, and only that approval
+    carries the fix out. This chat cannot mint that approval and does not
+    try to (#738: /approve was a demo-environment path).
+    """
+    agent_id = await _log_incoming(update, 'curatr_fix')
+    chat_id = update.effective_chat.id
+    state = _chat_state.setdefault(chat_id, {})
+    last = state.get('last_curatr')
+
+    if not last:
+        await _reply(update, 'No Curatr result in memory. Run /curatr first.', agent_id)
+        return
+
+    issues = [i for i in last.get('issues', [])
+              if i.get('field_path') and i.get('suggested_value') is not None]
+    if not issues:
+        await _reply(update, 'The last Curatr result suggested no fix.', agent_id)
+        return
+
+    issue = issues[0]
+    description = issue.get('title') or issue.get('plain_language') or issue['field_path']
+    try:
+        # Both calls are write-tier on the MCP server, which refuses either
+        # without a step-up. A fresh one each, bound to this bot's tenant.
+        result = _rpc(
+            'curatr_apply_fix',
+            resource_type=last.get('resource_type'),
+            resource_id=last.get('resource_id'),
+            fixes=[{'field_path': issue['field_path'],
+                    'new_value': issue['suggested_value']}],
+            patient_intent='requested from Telegram /curatr_fix',
+            reason=description,
+            headers=_write_headers(),
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.error('curatr_fix propose error: %s', exc)
+        await _reply(update, f'Could not propose the fix: {exc}', agent_id)
+        return
+    if result.get('error'):
+        await _reply(update, f"Could not propose the fix: {result['error']}", agent_id)
+        return
+
+    action_id = result.get('id')
+    # A draft nobody submits never reaches "Waiting for you", which lists
+    # only awaiting_confirmation. There is no model here to call
+    # action_commit, so the bot submits what the person just asked for.
+    # Submitting is not approving: that stays on the review page.
+    try:
+        committed = _rpc('action_commit', action_id=action_id,
+                         headers=_write_headers())
+    except Exception as exc:  # noqa: BLE001
+        logger.error('curatr_fix commit error: %s', exc)
+        committed = {'error': 'the request could not be sent'}
+    if committed.get('error') or committed.get('status') != 'awaiting_confirmation':
+        # Plain text, like the propose failure above: an engine error such
+        # as "action_commit failed" breaks Telegram Markdown, and the reply
+        # that says nothing was submitted must not be the one that is lost.
+        await _reply(
+            update,
+            f'Proposed: {description}\n\n'
+            f'Action {action_id} was not submitted for your approval '
+            f'({committed.get("error") or committed.get("status")}). '
+            f'Nothing has changed. Run /curatr_fix again to retry.',
+            agent_id,
+        )
+        return
+
+    state['pending_action'] = action_id
+    await _reply(
+        update,
+        f'Proposed: {description}\n\n'
+        f'Action `{action_id}`. Nothing has changed yet. Open CareAgents: '
+        f'it is under "Waiting for you" on your agent. Approve or decline '
+        f'it there; only that approval carries the fix out.',
+        agent_id,
+        parse_mode='Markdown',
+    )
+
+
+async def cmd_approve(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """This chat is not an approval surface. Say where one is (#215, #413)."""
+    agent_id = await _log_incoming(update, 'approve')
+    chat_id = update.effective_chat.id
+    action_id = _chat_state.get(chat_id, {}).get('pending_action')
+    which = f'Action `{action_id}` is waiting. ' if action_id else ''
+    await _reply(
+        update,
+        f'{which}Approvals do not happen in this chat: a message here cannot '
+        f'prove you read what will change. Open CareAgents: the request '
+        f'is under "Waiting for you" on your agent. Approve or decline it '
+        f'there.',
+        agent_id,
+        parse_mode='Markdown',
+    )
+
+
+async def cmd_token(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    agent_id = await _log_incoming(update, 'token')
+    if not STEP_UP_SECRET:
+        await _reply(update, 'STEP_UP_SECRET not configured.', agent_id)
+        return
+    try:
+        token = _get_step_up_token()
+        await _reply(
+            update,
+            f'Step-up token (valid 5 min):\n`{token}`',
+            agent_id,
+            parse_mode='Markdown',
+        )
+    except Exception as exc:
+        await _reply(update, f'Error: {exc}', agent_id)
+
+
+async def cmd_dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Send a signed, time-limited dashboard URL to the user."""
+    agent_id = await _log_incoming(update, 'dashboard')
+
+    # Need a step-up token so the API trusts the mint request
+    if not STEP_UP_SECRET:
+        await _reply(
+            update,
+            'STEP_UP_SECRET not configured — cannot mint dashboard link.',
+            agent_id,
+        )
+        return
+
+    try:
+        step_up = _get_step_up_token()
+        resp = requests.post(
+            f'{CC_API_BASE}/generate-link',
+            json={
+                'tenant_id': TENANT_ID,
+                'agent_id': agent_id,
+                'base_url': DASHBOARD_BASE_URL,
+            },
+            headers={'X-Step-Up-Token': step_up},
+            timeout=5,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        url = data.get('url')
+        hours = data.get('expires_in_hours', 24)
+
+        text = (
+            '🔐 *Your dashboard link*\n\n'
+            f'{url}\n\n'
+            f'Valid for {hours} hours · Tenant: `{TENANT_ID}`\n'
+            '_Do not share — anyone with this link can view your command center._'
+        )
+        await _reply(update, text, agent_id, parse_mode='Markdown')
+    except Exception as exc:
+        logger.error('dashboard link error: %s', exc)
+        await _reply(update, f'Error generating link: {exc}', agent_id)
+
+
+async def cmd_hbo_connect(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Return the HBO OAuth authorization URL so the user can grant access."""
+    agent_id = await _log_incoming(update, 'hbo_connect')
+
+    if not HBO_AUTHORIZATION_ENDPOINT:
+        await _reply(
+            update,
+            '⚠️ *Health Bank One not configured*\n\n'
+            'Ask your admin to set:\n'
+            '  `HBO_AUTHORIZATION_ENDPOINT`\n'
+            '  `HBO_CLIENT_ID`\n'
+            '  `HBO_SCOPES`\n\n'
+            'Or run `python scripts/healthbankone_oauth.py authorize` locally.',
+            agent_id,
+            parse_mode='Markdown',
+        )
+        return
+
+    import urllib.parse as _up
+    import secrets as _sec
+    import hashlib as _hl
+    import base64 as _b64
+
+    # Build PKCE pair inline (avoids a subprocess just to get the URL)
+    verifier_bytes = _sec.token_bytes(48)
+    verifier = _b64.urlsafe_b64encode(verifier_bytes).rstrip(b'=').decode('ascii')
+    digest = _hl.sha256(verifier.encode('ascii')).digest()
+    challenge = _b64.urlsafe_b64encode(digest).rstrip(b'=').decode('ascii')
+    state = _sec.token_urlsafe(24)
+
+    # Stash verifier in chat state so /hbo-callback (future) can finish exchange
+    chat_id = update.effective_chat.id
+    _chat_state.setdefault(chat_id, {})['hbo_pkce'] = {
+        'verifier': verifier, 'state': state}
+
+    params = {
+        'response_type': 'code',
+        'client_id': HBO_CLIENT_ID,
+        'redirect_uri': HBO_REDIRECT_URI,
+        'scope': HBO_SCOPES,
+        'state': state,
+        'code_challenge': challenge,
+        'code_challenge_method': 'S256',
+    }
+    auth_url = f'{HBO_AUTHORIZATION_ENDPOINT}?{_up.urlencode(params)}'
+
+    text = (
+        '🔑 *Health Bank One authorization*\n\n'
+        'Click the link below, log in with Health Bank One, '
+        'and grant HealthClaw access to your verified records.\n\n'
+        f'{auth_url}\n\n'
+        '_After you authorize, run /hbo\\_pull to fetch your records._'
+    )
+    await _reply(update, text, agent_id, parse_mode='Markdown')
+
+
+async def cmd_hbo_pull(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Pull + redact + ingest Health Bank One records into this tenant."""
+    agent_id = await _log_incoming(update, 'hbo_pull')
+
+    await _reply(
+        update,
+        '⏳ Starting HBO pull for tenant `' + TENANT_ID + '`…\n'
+        '_This runs in the background. I\'ll message you when records land._',
+        agent_id,
+        parse_mode='Markdown',
+    )
+
+    import subprocess
+    import sys as _sys
+    import threading as _thr
+
+    def _run_pull():
+        try:
+            result = subprocess.run(
+                [_sys.executable,
+                 'scripts/export_healthbankone_mcp.py',
+                 '--tenant-id', TENANT_ID,
+                 '--discover',
+                 '--pretty'],
+                capture_output=True,
+                text=True,
+                timeout=300,
+            )
+            if result.returncode == 0:
+                # Best-effort: parse the last line of stdout for summary
+                last_line = (result.stdout.strip().splitlines() or ['done'])[-1]
+                requests.post(
+                    f'{FHIR_BASE_URL.replace("/r6/fhir", "")}/r6/telegram_push/send',
+                    json={'tenant_id': TENANT_ID,
+                          'message': f'✅ *HBO pull complete*\n{last_line}'},
+                    timeout=5,
+                )
+            else:
+                err = (result.stderr.strip().splitlines() or ['unknown error'])[-1]
+                requests.post(
+                    f'{FHIR_BASE_URL.replace("/r6/fhir", "")}/r6/telegram_push/send',
+                    json={'tenant_id': TENANT_ID,
+                          'message': f'❌ HBO pull failed: {err}'},
+                    timeout=5,
+                )
+        except Exception as exc:
+            logger.error('hbo_pull background error: %s', exc)
+
+    _thr.Thread(target=_run_pull, daemon=True).start()
+
+
+# ---------------------------------------------------------------------------
+# Plain text
+# ---------------------------------------------------------------------------
+
+#: A blood-pressure reading in ordinary phrasing: "150/94", "150 over 94",
+#: "my blood pressure this morning was 150 over 94".
+#:
+#: The separator must be `/` or the word `over`, and both numbers must be
+#: plausible cuff readings. A bare `\d+/\d+` also matches "see you on 10/11"
+#: and "9 over 10", and putting a triage band on a date is worse than not
+#: answering.
+_BP_RE = re.compile(
+    r'\b(?P<sys>[6-9]\d|1\d\d|2[0-5]\d)\s*(?:/|\s+over\s+)\s*'
+    r'(?P<dia>[3-9]\d|1[0-5]\d)\b',
+    re.IGNORECASE,
+)
+
+#: Red-flag symptoms in the words a patient actually types, mapped to the
+#: triage module's keys. classify() treats ANY of these as an emergency
+#: regardless of the number, because they are stroke and heart-attack signs.
+_SYMPTOM_PHRASES = (
+    ('chest_pain', ('chest pain', 'chest pressure', 'chest tightness')),
+    ('shortness_of_breath', ('short of breath', 'shortness of breath',
+                             'can\'t breathe', 'trouble breathing')),
+    ('one_sided_weakness', ('one side', 'weakness on', 'face droop',
+                            'arm is weak', 'numb on one')),
+    ('trouble_speaking', ('slurred', 'trouble speaking', 'can\'t speak')),
+    ('vision_change', ('vision change', 'blurred vision', 'lost vision',
+                       'double vision')),
+    ('severe_headache', ('worst headache', 'severe headache',
+                         'terrible headache')),
+    ('confusion', ('confused', 'confusion', 'disoriented')),
+)
+
+
+def _parse_bp(text: str):
+    """Return (systolic, diastolic) from ordinary phrasing, or None.
+
+    None means "this is not a reading", not "this failed" — the caller still
+    answers. Returning None for anything unclear is deliberate: a wrong parse
+    attaches a clinical triage band to a sentence that was never a
+    measurement.
+    """
+    if not text:
+        return None
+    m = _BP_RE.search(text)
+    if not m:
+        return None
+    systolic, diastolic = int(m.group('sys')), int(m.group('dia'))
+    if systolic <= diastolic:
+        return None
+    return systolic, diastolic
+
+
+def _symptoms_in(text: str) -> list:
+    lowered = (text or '').lower()
+    return [key for key, phrases in _SYMPTOM_PHRASES
+            if any(p in lowered for p in phrases)]
+
+
+async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Answer a plain sentence.
+
+    Before this existed, main() registered a single MessageHandler on
+    filters.COMMAND, so typed text reached nothing and the user got silence.
+    The physician advisor hit it rehearsing the launch demo and read it,
+    reasonably, as a phrasing problem — silence cannot tell you which.
+
+    A recognised reading is classified SERVER-SIDE by r6/smbp/triage.py, the
+    shared 2025 AHA/ACC decision logic the clinician report and the flags also
+    use. This container ships only bot.py (see openclaw/Dockerfile), so the
+    thresholds are not importable here — and copying them in is precisely the
+    drift that module exists to prevent. If the server cannot be reached, this
+    says so and stops. It never guesses a band: a made-up "you are fine" is
+    the one output worse than an error.
+    """
+    text = (update.effective_message.text if update and update.effective_message
+            else '') or ''
+    agent_id = 'health-advisor'
+    _persist_turn(update, agent_id, 'user', text)
+
+    reading = _parse_bp(text)
+    if reading is None:
+        await _reply(
+            update,
+            'I can log a blood-pressure reading if you send one — for '
+            'example "150 over 94" or "150/94". For anything else, /start '
+            'lists what I can do.',
+            agent_id,
+        )
+        return
+
+    systolic, diastolic = reading
+    symptoms = _symptoms_in(text)
+
+    try:
+        triage = _smbp_reading(systolic, diastolic, symptoms)
+    except Exception as exc:
+        logger.error('smbp reading failed: %s', exc)
+        await _reply(
+            update,
+            f'I read that as *{systolic}/{diastolic}* but could not reach the '
+            'service that classifies it, so I have not logged it and I will '
+            'not guess. Please try again shortly.',
+            agent_id, parse_mode='Markdown')
+        return
+
+    lines = [f'Recorded: *{systolic}/{diastolic}* mmHg.']
+    if triage.get('emergency'):
+        lines.append(
+            '\U0001F6A8 You mentioned a symptom that needs emergency care now. '
+            '*Call 911.* Do not wait for another reading.')
+    else:
+        lines.append(_BAND_LINES.get(
+            triage.get('band'),
+            'Logged. Your care team will see this in the report.'))
+    lines.append('_This logs and routes; it is not medical advice or a '
+                 'diagnosis._')
+
+    await _reply(update, '\n\n'.join(lines), agent_id, parse_mode='Markdown')
+
+
+def _smbp_reading(systolic: int, diastolic: int, symptoms: list) -> dict:
+    """POST the reading to /r6/smbp/reading and return its triage block.
+
+    The server owns classification, persistence and the audit event. Raises on
+    any failure so the caller can say nothing rather than something wrong.
+    """
+    patient_ref = _first_patient_ref()
+    resp = requests.post(
+        f'{FHIR_BASE_URL.replace("/r6/fhir", "")}/r6/smbp/reading',
+        json={
+            'patient_ref': patient_ref,
+            'systolic': systolic,
+            'diastolic': diastolic,
+            'effective': _now_iso(),
+            'symptoms': symptoms,
+        },
+        headers={
+            'X-Tenant-Id': TENANT_ID,
+            'X-Step-Up-Token': _get_step_up_token(),
+            'X-Agent-Id': 'health-advisor',
+        },
+        timeout=15,
+    )
+    resp.raise_for_status()
+    triage = (resp.json() or {}).get('triage')
+    if not isinstance(triage, dict) or 'band' not in triage:
+        raise RuntimeError('smbp response carried no triage band')
+    return triage
+
+
+def _now_iso() -> str:
+    return time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+
+
+def _first_patient_ref() -> str:
+    """The tenant's Patient, as `Patient/<id>`."""
+    bundle = _fhir_get('Patient?_count=1')
+    entries = bundle.get('entry') or []
+    if not entries:
+        raise RuntimeError('no Patient in this tenant to attach the reading to')
+    return f"Patient/{(entries[0].get('resource') or {}).get('id')}"
+
+
+#: One line per triage band. Navigation only — what happens next, never what
+#: the reading means clinically. The bands themselves are owned by
+#: r6/smbp/triage.py and must not be re-derived here.
+_BAND_LINES = {
+    'at_goal': 'That is within the home target range (under 130/80). '
+               'Keep logging.',
+    'stage1': 'That is Stage 1 (130–139 / 80–89). Worth logging and raising '
+              'at your next visit.',
+    'stage2': 'That is Stage 2 (140 or above / 90 or above). This is a '
+              'timely follow-up with your care team, not the emergency '
+              'department.',
+    'crisis': 'That is in the crisis range (180 or above / 120 or above). '
+              'Rest five minutes and take it again. If it stays this high, '
+              'contact your care team today.',
+}
+
+
+async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    agent_id = 'health-advisor'
+    if update and update.effective_message:
+        _persist_turn(update, agent_id, 'user', update.effective_message.text or '')
+    await _reply(
+        update,
+        'Unknown command. Try /start for the command list.',
+        agent_id,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+def main() -> None:
+    app = Application.builder().token(BOT_TOKEN).build()
+
+    app.add_handler(CommandHandler('start', cmd_start))
+    app.add_handler(CommandHandler('connect', cmd_connect))
+    app.add_handler(CallbackQueryHandler(_connect_callback, pattern='^connect:'))
+    app.add_handler(CommandHandler('health', cmd_health))
+    app.add_handler(CommandHandler('conditions', cmd_conditions))
+    app.add_handler(CommandHandler('labs', cmd_labs))
+    app.add_handler(CommandHandler('curatr', cmd_curatr))
+    # Advertised on /start since it shipped; never registered until now.
+    app.add_handler(CommandHandler('curatr_fix', _curatr_fix))
+    app.add_handler(CommandHandler('approve', cmd_approve))
+    app.add_handler(CommandHandler('token', cmd_token))
+    app.add_handler(CommandHandler('dashboard', cmd_dashboard))
+    app.add_handler(CommandHandler('hbo_connect', cmd_hbo_connect))
+    app.add_handler(CommandHandler('hbo_pull', cmd_hbo_pull))
+    app.add_handler(MessageHandler(filters.COMMAND, unknown_command))
+    # Plain text, registered LAST so it cannot shadow a command. Without this
+    # the bot answered nothing at all to a typed sentence (see
+    # tests/test_bot_answers_what_it_advertises.py).
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+    app.add_error_handler(_on_error)
+
+    _preflight_singleton_check()
+
+    logger.info('openclaw bot starting (tenant=%s)', TENANT_ID)
+    app.run_polling(drop_pending_updates=True)
+
+
+def _preflight_singleton_check() -> None:
+    """Refuse to start a duplicate poller.
+
+    Telegram allows only ONE getUpdates consumer per token; a second poller
+    makes both thrash with 'Conflict: terminated by other getUpdates request'
+    and silently drops/duplicates messages. run_polling retries Conflict
+    internally, so a duplicate limps along invisibly for weeks. Here we probe
+    getUpdates ONCE before starting: on Conflict we exit loudly rather than
+    join the fight. A brief retry tolerates the normal overlap when a
+    platform (e.g. Railway) restarts the service and the old process is still
+    shutting down.
+    """
+    import time
+    api = f'https://api.telegram.org/bot{BOT_TOKEN}/getUpdates'
+    for attempt in range(3):
+        try:
+            resp = requests.get(api, params={'offset': -1, 'timeout': 0},
+                                timeout=10)
+        except requests.RequestException as exc:
+            logger.warning('singleton preflight: network error (%s) — proceeding',
+                           type(exc).__name__)
+            return
+        if resp.status_code == 409:
+            if attempt < 2:
+                time.sleep(3)  # tolerate brief restart overlap
+                continue
+            logger.error(
+                'ANOTHER INSTANCE IS ALREADY POLLING @this bot '
+                '(Telegram 409 Conflict). Refusing to start a duplicate — '
+                'stop the other poller (SSH box / container / systemd) first. '
+                'Exiting.')
+            raise SystemExit(1)
+        return  # 200 (or any non-409): we are the sole poller
+
+
+# ---------------------------------------------------------------------------
+# Mid-run singleton hardening — 409-Conflict storm detection
+# ---------------------------------------------------------------------------
+# _preflight_singleton_check() above only guards startup. If a second poller
+# starts LATER — a stale Railway container that didn't finish shutting down,
+# a forgotten copy left running on the Mac mini or an SSH box — this process
+# keeps polling and Telegram thrashes BOTH pollers with repeated
+# 'Conflict: terminated by other getUpdates request' errors. run_polling
+# retries Conflict internally, so nothing stops on its own: messages are
+# silently dropped or duplicated for as long as nobody notices.
+#
+# Telegram also emits an occasional single Conflict during normal
+# reconnects (network blip, Telegram-side restart), so a lone 409 is not
+# itself a signal — only a STORM (several in quick succession) reliably
+# means a second consumer is holding this token.
+CONFLICT_STORM_THRESHOLD = 3          # this many Conflict errors...
+CONFLICT_STORM_WINDOW_SECONDS = 60.0  # ...within this many seconds = a storm
+
+# Sliding window of Conflict-error timestamps (epoch seconds).
+_conflict_timestamps: deque[float] = deque()
+
+
+def _record_conflict_and_check_storm(now: float | None = None) -> bool:
+    """Record one Conflict-error timestamp; report whether it completes a storm.
+
+    Prunes timestamps older than CONFLICT_STORM_WINDOW_SECONDS, appends
+    `now`, and returns True once CONFLICT_STORM_THRESHOLD or more
+    timestamps remain inside the window. On a storm verdict the window is
+    cleared — the caller is about to exit the process, so there is nothing
+    left to accumulate toward, and a fresh sequence of errors is required
+    before the next verdict (relevant mainly to tests, which call this
+    function directly without actually exiting).
+    """
+    if now is None:
+        now = time.time()
+    cutoff = now - CONFLICT_STORM_WINDOW_SECONDS
+    while _conflict_timestamps and _conflict_timestamps[0] < cutoff:
+        _conflict_timestamps.popleft()
+    _conflict_timestamps.append(now)
+    if len(_conflict_timestamps) >= CONFLICT_STORM_THRESHOLD:
+        _conflict_timestamps.clear()
+        return True
+    return False
+
+
+def _send_admin_alert(message: str) -> None:
+    """Best-effort ops alert for a Conflict storm.
+
+    sendMessage is independent of getUpdates, so this can still reach
+    Telegram even while this process's polling is being rejected with 409s.
+    If TELEGRAM_ADMIN_CHAT_ID isn't configured there is no alerting channel
+    to use — this is a documented no-op and the CRITICAL log line already
+    emitted by the caller is the only signal.
+    """
+    if not TELEGRAM_ADMIN_CHAT_ID:
+        logger.warning(
+            'no TELEGRAM_ADMIN_CHAT_ID configured — skipping admin chat alert '
+            '(the CRITICAL log line above is the only signal for this storm)')
+        return
+    try:
+        requests.post(
+            f'https://api.telegram.org/bot{BOT_TOKEN}/sendMessage',
+            json={'chat_id': TELEGRAM_ADMIN_CHAT_ID, 'text': message},
+            timeout=5,
+        )
+    except requests.RequestException as exc:
+        logger.warning('admin alert send failed: %s', exc)
+
+
+async def _on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Global python-telegram-bot error handler.
+
+    Passes through every error, but watches Conflict (409) errors for a
+    storm (see _record_conflict_and_check_storm). A single Conflict is
+    normal Telegram churn — logged and ignored. A storm means another
+    poller is very likely holding this bot's token: log CRITICAL, send a
+    best-effort admin alert, and exit loudly (SystemExit) so the supervisor
+    (launchd, Railway's restart policy, systemd, ...) surfaces the failure
+    instead of this process quietly thrashing forever.
+    """
+    error = context.error
+    if isinstance(error, Conflict):
+        logger.warning('Telegram Conflict (409) on getUpdates: %s', error)
+        if _record_conflict_and_check_storm():
+            logger.critical(
+                'CONFLICT STORM: %d+ Telegram 409 Conflict errors within '
+                '%.0fs. Another poller is almost certainly holding this bot '
+                'token (stale Railway container, forgotten Mac-mini/SSH '
+                'copy, etc.) — stop it before restarting this one. Exiting '
+                'rather than keep thrashing both pollers.',
+                CONFLICT_STORM_THRESHOLD, CONFLICT_STORM_WINDOW_SECONDS,
+            )
+            _send_admin_alert(
+                '🚨 openclaw poller CONFLICT STORM — exiting.\n'
+                f'tenant={TENANT_ID}\n'
+                'Another process is polling this bot token. Stop it, then '
+                'restart this poller.'
+            )
+            raise SystemExit(1)
+        return
+    logger.error('Unhandled error while processing update: %s', error, exc_info=error)
+
+
+if __name__ == '__main__':
+    main()

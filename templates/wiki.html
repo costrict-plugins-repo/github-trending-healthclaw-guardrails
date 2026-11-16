@@ -1,0 +1,608 @@
+{% extends "base.html" %}
+{% block surface %}surface-paper{% endblock %}
+{% block bstheme %}light{% endblock %}
+
+{% block title %}Wiki — HealthClaw Guardrails{% endblock %}
+
+{% block head %}
+<style>
+/* Wiki — page-specific layout on the shared tokens. Prose was 0.875rem and
+   table text 0.82rem; both are raised to the system's 1rem / 0.9375rem floor.
+   This is the page people read to learn how the guardrails work, so it is the
+   last place to set 14px grey-on-grey. */
+.wiki-head { padding: var(--s7) 0 var(--s4);
+             border-bottom: 2px solid var(--rule-firm); }
+.wiki-head h1 { font-size: clamp(1.75rem, 3.6vw, 2.375rem); }
+.wiki-head__sub { color: var(--ink-soft); font-size: 1.1875rem;
+                  line-height: 1.55; margin: var(--s3) 0 0;
+                  max-width: var(--measure); }
+
+.wiki-layout {
+  display: grid; grid-template-columns: 232px 1fr;
+  gap: var(--s6); align-items: start; margin-top: var(--s5);
+}
+@media (max-width: 860px) {
+  .wiki-layout { grid-template-columns: 1fr; }
+  .wiki-toc { display: none; }
+}
+.wiki-toc {
+  position: sticky; top: calc(var(--s7) + var(--s3));
+  border-left: 1px solid var(--rule); padding-left: var(--s4);
+  font-size: 0.9375rem;
+}
+.wiki-toc-title {
+  font-family: var(--mono); font-size: 0.75rem; text-transform: uppercase;
+  letter-spacing: 0.09em; color: var(--ink-faint); margin-bottom: var(--s3);
+}
+.wiki-toc a {
+  display: block; color: var(--ink-soft); text-decoration: none;
+  padding: var(--s1) 0 var(--s1) var(--s3);
+  border-left: 2px solid transparent; margin-left: calc(-1 * var(--s4) - 1px);
+  transition: color 140ms ease-out, border-color 140ms ease-out;
+}
+.wiki-toc a:hover, .wiki-toc a.active {
+  color: var(--ink); border-left-color: var(--ink);
+}
+.wiki-toc .toc-sub { padding-left: var(--s5); font-size: 0.875rem; }
+
+.wiki-content { max-width: 76ch; }
+.wiki-content h2 {
+  font-size: 1.5rem; font-weight: 600; color: var(--ink);
+  margin: var(--s8) 0 var(--s4);
+  padding-bottom: var(--s2); border-bottom: 2px solid var(--rule-firm);
+}
+.wiki-content h3 { font-size: 1.125rem; font-weight: 600; color: var(--ink);
+                   margin: var(--s6) 0 var(--s3); }
+.wiki-content p, .wiki-content li {
+  color: var(--ink-soft); font-size: 1rem; line-height: 1.7;
+}
+.wiki-content p + p { margin-top: var(--s3); }
+.wiki-content ul, .wiki-content ol { padding-left: var(--s4); margin-block: var(--s3); }
+.wiki-content li { margin-bottom: var(--s2); }
+.wiki-content code {
+  background: var(--signal-wash); color: var(--signal-deep);
+  padding: 0.1em 0.35em; border-radius: var(--radius); font-size: 0.9em;
+}
+.wiki-content pre {
+  background: var(--ink); color: #E7E5DC; border-radius: var(--radius);
+  padding: var(--s4); font-size: 0.875rem; line-height: 1.7;
+  overflow-x: auto; margin: var(--s3) 0 var(--s4);
+}
+.wiki-content pre code { background: none; color: inherit; padding: 0; }
+.wiki-content a { color: var(--signal); }
+
+.wiki-callout {
+  border-left: 3px solid var(--signal); background: var(--signal-wash);
+  padding: var(--s3) var(--s4); border-radius: 0 var(--radius) var(--radius) 0;
+  margin: var(--s4) 0; font-size: 1rem; color: var(--ink-soft);
+}
+.wiki-callout.warn { border-left-color: var(--warn); background: var(--warn-wash); }
+.wiki-callout.success { border-left-color: var(--pass); background: var(--pass-wash); }
+
+.wiki-badge {
+  display: inline-block; font-family: var(--mono); font-size: 0.75rem;
+  padding: 0.1em 0.5em; border-radius: var(--radius);
+  vertical-align: middle; margin-left: var(--s2);
+}
+.wiki-badge.stable { background: var(--pass-wash); color: var(--pass); }
+.wiki-badge.experimental { background: var(--signal-wash); color: var(--signal-deep); }
+
+.wiki-table {
+  width: 100%; border-collapse: collapse;
+  font-size: 0.9375rem; margin: var(--s3) 0 var(--s5);
+}
+.wiki-table th {
+  text-align: left; padding: var(--s2) var(--s3);
+  font-family: var(--mono); font-size: 0.75rem; font-weight: 400;
+  text-transform: uppercase; letter-spacing: 0.07em; color: var(--ink-faint);
+  border-bottom: 2px solid var(--rule-firm);
+}
+.wiki-table td {
+  padding: var(--s2) var(--s3); border-bottom: 1px solid var(--rule);
+  color: var(--ink-soft); vertical-align: top;
+}
+.wiki-table td:first-child { color: var(--ink); font-weight: 600; }
+
+  /* healthclaw.css carries a global reduced-motion override, but the policy
+     is restated where the motion is declared: a style block that gets copied
+     to another page must carry its own guard, and a reviewer reading this
+     block should not have to know a second file exists. */
+  @media (prefers-reduced-motion: reduce) {
+    .wiki-toc a { transition: none; }
+  }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="wiki-head">
+  <h1>
+    Wiki
+  </h1>
+  <p class="wiki-head__sub">
+    Architecture, guardrail patterns, FHIR concepts, and how-tos for HealthClaw Guardrails.
+  </p>
+</div>
+
+<div class="wiki-layout">
+
+<!-- ===== TABLE OF CONTENTS ===== -->
+<nav class="wiki-toc">
+  <div class="wiki-toc-title">Contents</div>
+  <a href="#overview">Overview</a>
+  <a href="#architecture">Architecture</a>
+  <a class="toc-sub" href="#flow">Request Flow</a>
+  <a class="toc-sub" href="#components">Components</a>
+  <a href="#guardrails">Guardrail Stack</a>
+  <a class="toc-sub" href="#phi">PHI Redaction</a>
+  <a class="toc-sub" href="#stepup">Step-up Auth</a>
+  <a class="toc-sub" href="#hitl">Human-in-the-Loop</a>
+  <a class="toc-sub" href="#audit">Audit Trail</a>
+  <a class="toc-sub" href="#tenant">Tenant Isolation</a>
+  <a href="#fhir">FHIR Resources</a>
+  <a class="toc-sub" href="#r4">US Core v9 R4</a>
+  <a class="toc-sub" href="#r6">R6 Experimental</a>
+  <a href="#mcp-tools">MCP Tools</a>
+  <a href="#curatr">Curatr</a>
+  <a href="#fasten">Fasten Connect</a>
+  <a class="toc-sub" href="#fasten-openclaw">OpenClaw</a>
+  <a class="toc-sub" href="#fasten-claude">Claude Code / Desktop</a>
+  <a href="#gateways">Conversational Gateways</a>
+  <a class="toc-sub" href="#gateway-openclaw">OpenClaw (Telegram)</a>
+  <a class="toc-sub" href="#gateway-hermes">Hermes (Nous Research)</a>
+  <a class="toc-sub" href="#hermes-quickstart">Hermes Quick Start</a>
+  <a class="toc-sub" href="#gateway-promptopinion">PromptOpinion Marketplace</a>
+  <a href="#proxy">Upstream Proxy</a>
+  <a href="#deploy">Deployment</a>
+  <a href="#limitations">Limitations</a>
+</nav>
+
+<!-- ===== CONTENT ===== -->
+<div class="wiki-content">
+
+<h2 id="overview">Overview</h2>
+<p>HealthClaw Guardrails is a vendor-neutral guardrail proxy that sits between any AI agent and any FHIR health data server. It is a <a href="https://healthclaw.io" target="_blank" rel="noopener noreferrer">healthclaw.io</a> open source project.</p>
+<div class="wiki-callout success">
+  <strong>The core problem it solves:</strong> FHIR standardized how health data is structured. MCP standardized how AI connects to tools. Nobody standardized the guardrails in between — who can see what data, who can write what, what gets logged, and when a human must be involved. That's what HealthClaw Guardrails does.
+</div>
+
+<h2 id="architecture">Architecture</h2>
+<pre>AI Agent ──▶ MCP Server ──▶ Guardrail Proxy ──▶ Any FHIR Server
+(Claude,       (Node.js)       (Flask Python)       (HAPI, Epic,
+ GPT-4, etc)                       ↓                Medplum, etc.)
+                             PHI redaction
+                             Audit trail
+                             Step-up auth
+                             Tenant isolation
+                             Human-in-the-loop</pre>
+
+<h3 id="flow">Request Flow</h3>
+<ol>
+  <li>AI agent calls an MCP tool (e.g. <code>fhir.read</code>)</li>
+  <li>MCP Server translates the tool call to an HTTP request to the Flask guardrail proxy</li>
+  <li>Flask checks: tenant header present? Step-up token valid (for writes)? Human-confirmed (for clinical writes)?</li>
+  <li>Resource fetched from local DB or upstream FHIR server</li>
+  <li>PHI redacted from the response</li>
+  <li>AuditEvent written (append-only)</li>
+  <li>Medical disclaimer injected</li>
+  <li>Redacted response + MCP summary returned to agent</li>
+</ol>
+
+<h3 id="components">Components</h3>
+<table class="wiki-table">
+  <thead><tr><th>Component</th><th>Tech</th><th>Purpose</th></tr></thead>
+  <tbody>
+    <tr><td>Flask App</td><td>Python / Flask</td><td>FHIR REST facade at <code>/r6/fhir/*</code>, guardrail enforcement</td></tr>
+    <tr><td>MCP Server</td><td>Node.js / TypeScript</td><td>29 MCP tools (incl. SDC $populate/$extract + labs $interpret + care-gaps $care-gaps + ChatGPT-connector search/fetch), Streamable HTTP + SSE + stdio transports</td></tr>
+    <tr><td>Database</td><td>SQLite (dev) / PostgreSQL (prod)</td><td>Resource storage, audit trail, context envelopes</td></tr>
+    <tr><td>Redis</td><td>Optional</td><td>Per-tenant rate limiting, session storage</td></tr>
+    <tr><td>Upstream FHIR</td><td>Any FHIR R4/R5/R6 server</td><td>Real clinical data source (proxy mode)</td></tr>
+  </tbody>
+</table>
+
+<h2 id="guardrails">Guardrail Stack</h2>
+<p>All guardrails are always active — they cannot be disabled per-request. They apply in local mode and upstream proxy mode identically.</p>
+
+<h3 id="phi">PHI Redaction</h3>
+<p>Applied on every read path, including upstream FHIR server responses, before data reaches the AI agent.</p>
+<table class="wiki-table">
+  <thead><tr><th>Field</th><th>What happens</th><th>Example</th></tr></thead>
+  <tbody>
+    <tr><td>Name</td><td>Truncated to initials</td><td>Maria Elena Rivera → M. E. Rivera</td></tr>
+    <tr><td>Identifier</td><td>Masked to last 4 chars</td><td>MRN12345678 → ***5678</td></tr>
+    <tr><td>Address</td><td>Stripped to city/state/country</td><td>123 Main St, Boston, MA → Boston, MA</td></tr>
+    <tr><td>Birth date</td><td>Truncated to year</td><td>1985-03-15 → 1985</td></tr>
+    <tr><td>Telecom</td><td>Fully removed</td><td>617-555-0198 → [removed]</td></tr>
+    <tr><td>Photo</td><td>Fully removed</td><td>—</td></tr>
+  </tbody>
+</table>
+
+<h3 id="stepup">Step-up Authorization</h3>
+<p>Reads require only <code>X-Tenant-Id</code>. All write operations additionally require an <code>X-Step-Up-Token</code> header.</p>
+<ul>
+  <li>Tokens are HMAC-SHA256 signed with <code>STEP_UP_SECRET</code></li>
+  <li>Each token includes a 128-bit cryptographically random nonce</li>
+  <li>Tokens expire after 5 minutes</li>
+  <li>Tokens are tenant-bound — cross-tenant replay is rejected</li>
+</ul>
+<p>Tokens are issued at <code>GET /r6/fhir/internal/step-up-token</code> (with tenant header).</p>
+
+<h3 id="hitl">Human-in-the-Loop</h3>
+<p>Clinical resource writes return <strong>HTTP 428 Precondition Required</strong> unless the request includes <code>X-Human-Confirmed: true</code>.</p>
+<p>Clinical types: Observation, Condition, MedicationRequest, DiagnosticReport, AllergyIntolerance, Procedure, CarePlan, Immunization, NutritionIntake, DeviceAlert.</p>
+<div class="wiki-callout warn">
+  <strong>Current limitation:</strong> This is header-based, not cryptographic. Anyone with API access can set the header. It enforces intent in automated pipelines, but a determined attacker with API access could bypass it. A future version will use signed human-confirmation tokens.
+</div>
+
+<h3 id="audit">Audit Trail</h3>
+<p>Every resource access writes an AuditEvent record. Records are append-only — SQLAlchemy event listeners raise <code>RuntimeError</code> on any <code>UPDATE</code> or <code>DELETE</code>.</p>
+<p>Each AuditEvent records: event type, resource type + ID, tenant ID, agent ID, outcome (success/failure), timestamp, and optional detail.</p>
+<p>Export via <code>GET /r6/fhir/AuditEvent/$export</code> in NDJSON or Bundle format.</p>
+
+<h3 id="tenant">Tenant Isolation</h3>
+<p>Every database query is scoped by <code>tenant_id</code>. Resources created by tenant A are invisible to tenant B. The <code>X-Tenant-Id</code> header is required on all non-public endpoints and validated against <code>[a-zA-Z0-9_-]{1,64}</code>.</p>
+
+<h2 id="fhir">FHIR Resources</h2>
+
+<h3 id="r4">US Core v9 R4 <span class="wiki-badge stable">Stable</span></h3>
+<p>Standard FHIR R4 resources conforming to the US Core Implementation Guide v9. Widely deployed in US healthcare.</p>
+<table class="wiki-table">
+  <thead><tr><th>Resource</th><th>US Core required fields</th><th>Curatr evaluates</th></tr></thead>
+  <tbody>
+    <tr><td>Condition</td><td>code, subject</td><td>Yes — ICD-10, SNOMED, deprecated code detection</td></tr>
+    <tr><td>AllergyIntolerance</td><td>clinicalStatus, verificationStatus, patient</td><td>Yes — RxNorm/SNOMED, status validation</td></tr>
+    <tr><td>Immunization</td><td>status, vaccineCode, patient, occurrence[x]</td><td>Yes — CVX/SNOMED, occurrence date</td></tr>
+    <tr><td>MedicationRequest</td><td>status, intent, medication[x], subject</td><td>Yes — RxNorm code quality</td></tr>
+    <tr><td>Procedure</td><td>status, code, subject</td><td>Yes — SNOMED/CPT code quality</td></tr>
+    <tr><td>DiagnosticReport</td><td>status, code, subject</td><td>Yes — LOINC code quality</td></tr>
+    <tr><td>CarePlan</td><td>status, intent, subject</td><td>No — CRUD only</td></tr>
+    <tr><td>Goal</td><td>lifecycleStatus, description, subject</td><td>No — CRUD only</td></tr>
+    <tr><td>Coverage</td><td>status, beneficiary, payor</td><td>No — CRUD only</td></tr>
+    <tr><td>ServiceRequest</td><td>status, intent, subject</td><td>No — CRUD only</td></tr>
+    <tr><td>DocumentReference</td><td>status, subject, content</td><td>No — CRUD only</td></tr>
+    <tr><td>Location, Organization, Practitioner, PractitionerRole, RelatedPerson, CareTeam, Specimen, FamilyMemberHistory</td><td>Varies</td><td>No — CRUD only</td></tr>
+  </tbody>
+</table>
+
+<h3 id="r6">R6 Experimental <span class="wiki-badge experimental">Ballot3</span></h3>
+<p>FHIR R6 v6.0.0-ballot3 resources. These are experimental and may change before R6 final release.</p>
+<table class="wiki-table">
+  <thead><tr><th>Resource</th><th>What's new in R6</th></tr></thead>
+  <tbody>
+    <tr><td>Permission</td><td>Access control separate from Consent. <code>$evaluate</code> with human-readable reasoning.</td></tr>
+    <tr><td>SubscriptionTopic</td><td>Restructured pub/sub. Storage + discovery — notifications not dispatched.</td></tr>
+    <tr><td>DeviceAlert</td><td>ISO/IEEE 11073 device alarms.</td></tr>
+    <tr><td>NutritionIntake</td><td>Dietary consumption tracking.</td></tr>
+    <tr><td>DeviceAssociation, NutritionProduct, Requirements, ActorDefinition</td><td>CRUD only.</td></tr>
+  </tbody>
+</table>
+
+<h2 id="mcp-tools">MCP Tools</h2>
+<p>The MCP server exposes 12 tools in two tiers. All read tools include an <code>_mcp_summary</code> field with reasoning, clinical context, and limitations to help the AI agent understand what it received and what it should tell the user.</p>
+
+<h3>Two-Phase Write Pattern</h3>
+<ol>
+  <li><strong>Propose</strong>: Call <code>fhir.propose_write</code>. Validates the resource and returns a preview. Nothing is written.</li>
+  <li><strong>Review</strong>: Check <code>requires_human_confirmation</code> (true for clinical types) and <code>proposal_status</code>.</li>
+  <li><strong>Commit</strong>: Call <code>fhir.commit_write</code> with <code>X-Step-Up-Token</code> and <code>X-Human-Confirmed: true</code> for clinical resources.</li>
+</ol>
+
+<h3>Permission Evaluation</h3>
+<p><code>fhir.permission_evaluate</code> evaluates stored R6 Permission resources against a subject + action + resource combination. Returns permit/deny with a human-readable reasoning string explaining which rule matched (or why default deny applied). This separates access control from consent records.</p>
+
+<h2 id="curatr">Curatr — Patient-Owned Data Quality</h2>
+<p>Curatr is the patient-facing skill within HealthClaw. It gives patients visibility into the quality of their own health records and the ability to correct them.</p>
+
+<h3>How it works</h3>
+<ol>
+  <li>Call <code>curatr.evaluate</code> on a resource</li>
+  <li>Issues returned with severity (critical/warning/info/suggestion), plain language description, clinical impact, and suggested fix</li>
+  <li>Present issues to the patient — explain what's wrong, why it matters, what can be done</li>
+  <li>Patient approves specific fixes</li>
+  <li>Call <code>curatr.apply_fix</code> — resource updated + linked Provenance resource created</li>
+</ol>
+
+<h3>Terminology services used</h3>
+<table class="wiki-table">
+  <thead><tr><th>Service</th><th>Validates</th><th>Auth needed</th></tr></thead>
+  <tbody>
+    <tr><td>tx.fhir.org (HL7 public)</td><td>SNOMED CT, LOINC, ICD-10</td><td>None</td></tr>
+    <tr><td>NLM Clinical Tables API</td><td>ICD-10-CM codes + descriptions</td><td>None</td></tr>
+    <tr><td>RXNAV API (NLM)</td><td>RxNorm drug codes</td><td>None</td></tr>
+    <tr><td>Local lookup</td><td>Deprecated systems (ICD-9-CM, etc.)</td><td>None</td></tr>
+  </tbody>
+</table>
+
+<h3>Provenance tracking</h3>
+<p>Every approved fix creates a FHIR Provenance resource recording: target resource, recorded timestamp, patient intent as free text, agent attribution (curatr), and exact field changes (before/after values).</p>
+
+<h2 id="fasten">Fasten Connect — Patient Health Record Ingestion</h2>
+<p><a href="https://docs.connect.fastenhealth.com" target="_blank" rel="noopener noreferrer">Fasten Connect</a> is the ingestion layer for HealthClaw Guardrails. Patients authorize access to their EHR systems via the Fasten Stitch widget; records arrive as FHIR R4 NDJSON and flow through the full guardrail stack once ingested.</p>
+
+<div class="wiki-callout success">
+  <strong>Two modes:</strong> Standard mode connects to individual EHR portals (Epic, Cerner, Athena). TEFCA IAS mode uses a single identity verification (CLEAR or ID.me) to pull longitudinal records across all QHINs — no per-provider logins required.
+</div>
+
+<h3>Required environment variables</h3>
+<table class="wiki-table">
+  <thead><tr><th>Variable</th><th>Where to get it</th><th>Required</th></tr></thead>
+  <tbody>
+    <tr><td><code>FASTEN_PUBLIC_KEY</code></td><td>Fasten Developer Portal — starts with <code>public_test_</code> or <code>public_live_</code></td><td>Yes</td></tr>
+    <tr><td><code>FASTEN_PRIVATE_KEY</code></td><td>Same portal — never expose client-side</td><td>Yes</td></tr>
+    <tr><td><code>FASTEN_WEBHOOK_SECRET</code></td><td>Portal → Delivery Logs → Signing secret (starts with <code>whsec_</code>)</td><td>Recommended</td></tr>
+    <tr><td><code>FASTEN_CURATR_SCAN</code></td><td>Set <code>true</code> to auto-run Curatr after each import</td><td>No</td></tr>
+  </tbody>
+</table>
+
+<h3 id="fasten-openclaw">Quick Start — OpenClaw</h3>
+
+<p><strong>Step 1: Start the stack</strong></p>
+<pre>export FASTEN_PUBLIC_KEY=public_test_XXX
+export FASTEN_PRIVATE_KEY=private_test_XXX
+export FASTEN_WEBHOOK_SECRET=whsec_XXX
+export STEP_UP_SECRET=$(openssl rand -hex 32)
+export FASTEN_CURATR_SCAN=true
+
+docker-compose up -d --build</pre>
+
+<p><strong>Step 2: Enable the skill in OpenClaw</strong></p>
+<p>Place the skill in your workspace skills folder or install from the project:</p>
+<pre># Copy the skill to your OpenClaw workspace skills folder
+cp -r skills/fasten-connect ~/.openclaw/skills/
+
+# Or run from this project directory — OpenClaw picks up workspace skills automatically</pre>
+<p>OpenClaw reads <code>FASTEN_PUBLIC_KEY</code> from your environment (declared in <code>metadata.openclaw.requires.env</code>). The skill gates itself — it won't appear active until the key is set.</p>
+
+<p><strong>Step 3: Embed the Stitch widget in your web app</strong></p>
+<pre>&lt;!-- Add to any HTML page your patients use --&gt;
+&lt;link rel="stylesheet" href="https://stitch.fastenhealth.com/v0.4/bundle.css"&gt;
+&lt;script src="https://stitch.fastenhealth.com/v0.4/bundle.js"&gt;&lt;/script&gt;
+
+&lt;fasten-stitch-element public-id="public_test_XXX"&gt;&lt;/fasten-stitch-element&gt;
+
+&lt;!-- TEFCA mode: single identity verification for all QHINs --&gt;
+&lt;!-- &lt;fasten-stitch-element public-id="public_test_XXX" tefca-mode="true"&gt;&lt;/fasten-stitch-element&gt; --&gt;
+
+&lt;script&gt;
+document.querySelector('fasten-stitch-element')
+  .addEventListener('widget.complete', async (event) =&gt; {
+    const { org_connection_id, endpoint_id, tefca_directory_id, platform_type } = event.detail;
+    // Register the connection with HealthClaw
+    await fetch('/fasten/connections', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Tenant-Id': 'YOUR_TENANT_ID' },
+      body: JSON.stringify({ org_connection_id, endpoint_id, tefca_directory_id, platform_type }),
+    });
+  });
+&lt;/script&gt;</pre>
+
+<p><strong>Step 4: Configure your webhook</strong></p>
+<p>In the <a href="https://app.connect.fastenhealth.com" target="_blank" rel="noopener noreferrer">Fasten Developer Portal</a>, set your webhook delivery URL to:</p>
+<pre>https://your-domain.com/fasten/webhook</pre>
+<p>For local development, use <a href="https://ngrok.com" target="_blank" rel="noopener noreferrer">ngrok</a> or the <a href="https://docs.connect.fastenhealth.com/guides/webhook-debugging-simulator.md" target="_blank" rel="noopener noreferrer">Fasten Webhook Simulator</a>.</p>
+
+<p><strong>Step 5: Use OpenClaw to work with ingested data</strong></p>
+<p>Once an import completes, the <code>fhir-r6-guardrails</code> and <code>curatr</code> skills expose all ingested data through MCP. In OpenClaw Messenger:</p>
+<pre>You: "Show me my recent conditions"
+→ fhir.search(patient, Condition) — returns redacted conditions
+
+You: "Check my diabetes diagnosis for quality issues"
+→ curatr.evaluate(Condition, cond-001) — checks ICD-10, SNOMED, required fields
+
+You: "Update the code to ICD-10-CM E11.9"
+→ Patient approves → curatr.apply_fix() — writes fix + Provenance record</pre>
+
+<p><strong>Check import status:</strong></p>
+<pre>curl /fasten/jobs -H "X-Tenant-Id: your-tenant-id"
+# Returns: [{"task_id": "...", "status": "complete", "ingested_resources": 847, ...}]</pre>
+
+<div class="wiki-callout warn">
+  <strong>Production note:</strong> Fasten exports can be 30MB–3GB. Vercel's 60-second function timeout will cut off large downloads. Deploy to Railway (see <code>railway.toml</code>) or any persistent server for production use.
+</div>
+
+<h3 id="fasten-claude">Quick Start — Claude Code / Claude Desktop</h3>
+
+<p><strong>Step 1: Start the HealthClaw stack</strong></p>
+<pre>export FASTEN_PUBLIC_KEY=public_test_XXX
+export FASTEN_PRIVATE_KEY=private_test_XXX
+export FASTEN_WEBHOOK_SECRET=whsec_XXX
+export STEP_UP_SECRET=$(openssl rand -hex 32)
+
+# Start Flask + MCP server
+docker-compose up -d --build
+
+# Or manually:
+uv sync && python main.py &amp;
+cd services/agent-orchestrator &amp;&amp; npm ci &amp;&amp; npm start</pre>
+
+<p><strong>Step 2: Point Claude at the MCP server</strong></p>
+<p>Add to <code>~/.claude/settings.json</code> (Claude Code) or your Claude Desktop MCP config:</p>
+<pre>{
+  "mcpServers": {
+    "healthclaw-guardrails": {
+      "url": "http://localhost:3001/mcp",
+      "headers": {
+        "X-Tenant-Id": "my-tenant"
+      }
+    }
+  }
+}</pre>
+
+<p><strong>Step 3: Register a test connection</strong></p>
+<p>Use Fasten's test credentials to connect a synthetic patient, then register the <code>org_connection_id</code>:</p>
+<pre># After patient authenticates via Stitch widget, register the connection:
+curl -X POST http://localhost:5000/fasten/connections \
+  -H "Content-Type: application/json" \
+  -H "X-Tenant-Id: my-tenant" \
+  -d '{"org_connection_id": "org-conn-test-001", "platform_type": "epic"}'
+
+# Trigger the export via Fasten API:
+curl -X POST https://api.connect.fastenhealth.com/v1/bridge/fhir/ehi-export \
+  -u "public_test_XXX:private_test_XXX" \
+  -H "Content-Type: application/json" \
+  -d '{"org_connection_id": "org-conn-test-001"}'</pre>
+
+<p><strong>Step 4: Ask Claude to work with the data</strong></p>
+<p>Once the import webhook fires and ingestion completes, Claude has full access via MCP:</p>
+<pre># In Claude Code (claude.ai/code) or Claude Desktop:
+
+"Check the import status"
+→ (uses curl or direct) GET /fasten/jobs
+
+"Search for my conditions"
+→ fhir.search with resourceType=Condition, patient filter
+
+"Evaluate this condition for data quality issues"
+→ curatr.evaluate on the Condition resource
+
+"What guardrails apply to writing a new observation?"
+→ fhir.propose_write to see validation + HITL requirements before committing</pre>
+
+<p><strong>Step 5: Load the skill files for context</strong></p>
+<p>In Claude Code, the skill files provide authoritative reference without token overhead:</p>
+<pre># The skills are in the workspace — Claude Code loads them automatically.
+# Or reference them directly:
+cat skills/fasten-connect/SKILL.md     # Fasten integration reference
+cat skills/fhir-r6-guardrails/SKILL.md # MCP tool reference
+cat skills/curatr/SKILL.md             # Curatr evaluation reference</pre>
+
+<div class="wiki-callout">
+  <strong>TEFCA IAS (Claude platform):</strong> Enable TEFCA mode by setting <code>tefca-mode="true"</code> on the Stitch widget. For test mode, use synthetic patients from the Fasten test credentials page. Use <code>tefca_directory_id</code> (not <code>endpoint_id</code>) as the stable identifier when registering TEFCA connections.
+</div>
+
+<h2 id="gateways">Conversational Gateways</h2>
+<p>HealthClaw Guardrails is the data + compliance layer. Conversational gateways are how a human <em>talks</em> to it. The MCP server is the same in every case — every gateway connects to it, sends tool calls, and renders the redacted responses back to the user in chat.</p>
+
+<table class="wiki-table">
+  <thead><tr><th>Gateway</th><th>Where you chat</th><th>Auth model</th><th>Self-improving?</th></tr></thead>
+  <tbody>
+    <tr><td>OpenClaw</td><td>Telegram bot</td><td>JSON-RPC HTTP bridge (<code>/mcp/rpc</code>)</td><td>No — fixed slash commands</td></tr>
+    <tr><td>Hermes</td><td>Telegram · Discord · Slack · WhatsApp · Signal · CLI · HTTP</td><td>Native MCP Streamable HTTP</td><td>Yes — learns skills from conversation</td></tr>
+    <tr><td>PromptOpinion</td><td>Marketplace agent in browser</td><td>Native MCP + SHARP-on-MCP headers</td><td>No (platform-level evaluations only)</td></tr>
+    <tr><td>Claude Desktop / Code</td><td>Anthropic clients</td><td>Native MCP stdio or HTTP</td><td>No</td></tr>
+  </tbody>
+</table>
+
+<h3 id="gateway-openclaw">OpenClaw (Telegram)</h3>
+<p>The original integration — a Python Telegram bot in <code>openclaw/</code> that translates slash commands into MCP tool calls via the HTTP bridge. Best when you want exactly one chat channel with predictable commands and zero ambiguity.</p>
+<p>Setup is documented in the <a href="#fasten-openclaw">Fasten quick-start above</a> — same install path applies for any data source.</p>
+
+<h3 id="gateway-hermes">Hermes (Nous Research)</h3>
+<p><a href="https://github.com/nousresearch/hermes-agent" target="_blank" rel="noopener noreferrer">Hermes</a> is Nous Research's self-improving agent. It supports seven execution backends (local, Docker, SSH, Singularity, Modal, Daytona, Vercel Sandbox) and six messaging gateways (Telegram, Discord, Slack, WhatsApp, Signal, plus CLI / HTTP), and is a native MCP client over Streamable HTTP. No JSON-RPC bridge needed on the HealthClaw side.</p>
+
+<div class="wiki-callout success">
+  <strong>The learning loop is the point.</strong> Hermes captures every conversation, builds memory across sessions, and lets you save working tool-call patterns as new skills. The 10 skills HealthClaw ships are starting points — Hermes refines them in <code>~/.hermes/skills/healthclaw/</code> based on how you actually use them. The repo copy stays canonical.
+</div>
+
+<h3 id="hermes-quickstart">Hermes Quick Start</h3>
+
+<p><strong>Step 1 — Install Hermes</strong></p>
+<p>Follow the upstream instructions at <a href="https://github.com/nousresearch/hermes-agent" target="_blank" rel="noopener noreferrer">github.com/nousresearch/hermes-agent</a>. At the end you have a <code>hermes</code> CLI on PATH and a <code>~/.hermes/</code> directory.</p>
+
+<p><strong>Step 2 — Wire HealthClaw into Hermes</strong></p>
+<pre>git clone https://github.com/aks129/HealthClawGuardrails
+cd HealthClawGuardrails
+./hermes/install.sh</pre>
+<p>The installer is idempotent and does three things:</p>
+<ul>
+  <li>Copies every skill from <code>skills/</code> to <code>~/.hermes/skills/healthclaw/</code></li>
+  <li>Installs the HealthClaw <code>SOUL.md</code> persona at <code>~/.hermes/personas/healthclaw.md</code></li>
+  <li>Merges three MCP server entries (hosted demo, local Docker, SHARP-on-MCP) into <code>~/.hermes/config.json</code> via <code>jq</code></li>
+</ul>
+<p>Flags: <code>--dry-run</code> previews actions without touching anything; <code>--skills-only</code> refreshes just the skills if Hermes has edited them and you want the repo copy back.</p>
+
+<p><strong>Step 3 — Start a session</strong></p>
+<pre>hermes
+&gt; /persona healthclaw
+&gt; /mcp list                       # confirms healthclaw-hosted connected
+&gt; show me my conditions
+&gt; what's my last HbA1c?
+&gt; propose adding peanut allergy, moderate severity</pre>
+
+<p><strong>Step 4 — Pick a mode</strong></p>
+<table class="wiki-table">
+  <thead><tr><th>Mode</th><th>When to use</th><th>How to enable</th></tr></thead>
+  <tbody>
+    <tr><td><code>healthclaw-hosted</code></td><td>Try everything against synthetic Grover Keeling sample data — no install of HealthClaw stack needed</td><td>Default — installer enables</td></tr>
+    <tr><td><code>healthclaw-local</code></td><td>Your own data on your own machine</td><td><code>docker-compose up -d --build</code>, then rename <code>_healthclaw-local</code> → <code>healthclaw-local</code> in <code>~/.hermes/config.json</code></td></tr>
+    <tr><td><code>healthclaw-sharp</code></td><td>Hermes is the SMART-launched agent and you want HealthClaw guarding a real EHR (Epic, Cerner, MEDITECH, athenahealth, eClinicalWorks, HAPI, SMART Health IT)</td><td>Rename <code>_healthclaw-sharp</code> → <code>healthclaw-sharp</code>, fill in <code>X-FHIR-Server-URL</code>, <code>X-FHIR-Access-Token</code>, <code>X-Patient-ID</code></td></tr>
+  </tbody>
+</table>
+
+<p><strong>Step 5 — Let it learn</strong></p>
+<p>Save working patterns: <code>/skill save</code> after a good answer. Refine SOUL on misfires: tell Hermes <em>"that should have called <code>fhir_search</code> first"</em> and it'll update the persona for next time. Your <code>~/.hermes/skills/healthclaw/</code> directory drifts toward your usage pattern; the repo copy stays as the canonical seed.</p>
+
+<div class="wiki-callout">
+  <strong>Already have OpenClaw?</strong> Run both. They share the same MCP server, the same skills library, and the same guardrails. Hermes' built-in OpenClaw migration drops imported skills at <code>~/.hermes/skills/openclaw-imports/</code> — sitting alongside HealthClaw's skills at <code>~/.hermes/skills/healthclaw/</code>. Hermes surfaces whichever skill matches the user's question.
+</div>
+
+<h3 id="gateway-promptopinion">PromptOpinion Marketplace</h3>
+<p>HealthClaw is published on the <a href="https://app.promptopinion.ai/marketplace" target="_blank" rel="noopener noreferrer">PromptOpinion Marketplace</a> as both a Superpower (MCP server) and an Agent. PromptOpinion is a healthcare AI assembly platform built on MCP, A2A, and FHIR; HealthClaw was the FHIR IQ team's entry for the <a href="https://agents-assemble.devpost.com/" target="_blank" rel="noopener noreferrer">Agents Assemble Challenge</a>.</p>
+
+<table class="wiki-table">
+  <thead><tr><th>Listing</th><th>What it is</th><th>URL</th></tr></thead>
+  <tbody>
+    <tr>
+      <td>Agent</td>
+      <td>HealthClaw Clinical Reviewer — A2A-compatible agent that orchestrates the MCP tools and narrates the guardrails</td>
+      <td><a href="https://app.promptopinion.ai/marketplace/agent/019e183d-c819-733f-9a91-6cf6756d4bed" target="_blank" rel="noopener noreferrer">Open in Marketplace</a></td>
+    </tr>
+    <tr>
+      <td>Superpower (MCP)</td>
+      <td>The raw HealthClaw MCP server — 16 tools, declared scopes, full guardrail stack</td>
+      <td><a href="https://app.promptopinion.ai/marketplace/mcp/019e1831-3d6f-7f72-99c2-cb8f2efab57e" target="_blank" rel="noopener noreferrer">Open in Marketplace</a></td>
+    </tr>
+  </tbody>
+</table>
+
+<p>The PromptOpinion listing is "Open Access" — no credentials needed to add it to a workspace. The MCP server advertises both ecosystems' FHIR-context shapes in its <code>initialize</code> response:</p>
+
+<table class="wiki-table">
+  <thead><tr><th>Spec</th><th>Where in capabilities</th><th>Purpose</th></tr></thead>
+  <tbody>
+    <tr><td>SHARP-on-MCP</td><td><code>capabilities.experimental.{fhir_context_required, sharp}</code></td><td>Vendor-neutral header-forwarding contract — agent host obtains a SMART access token and forwards it on every call. No OAuth dance in HealthClaw itself.</td></tr>
+    <tr><td><a href="https://docs.promptopinion.ai/fhir-context/mcp-fhir-context" target="_blank" rel="noopener noreferrer">PromptOpinion FHIR Extension</a></td><td><code>capabilities.extensions["ai.promptopinion/fhir-context"]</code></td><td>Declares the SMART-on-FHIR scope manifest PromptOpinion should request from the agent host (<code>patient/*.read</code> required, <code>patient/*.write</code> and <code>offline_access</code> optional).</td></tr>
+  </tbody>
+</table>
+
+<p>Both specs land on the same headers — <code>X-FHIR-Server-URL</code>, <code>X-FHIR-Access-Token</code>, <code>X-Patient-ID</code>, plus optional <code>X-FHIR-Refresh-Token</code> / <code>X-FHIR-Refresh-Url</code> when <code>offline_access</code> is granted — so a single HealthClaw deployment satisfies both marketplaces.</p>
+
+<h2 id="proxy">Upstream FHIR Proxy</h2>
+<p>Set <code>FHIR_UPSTREAM_URL</code> to enable proxy mode. All guardrails remain active.</p>
+<ul>
+  <li><strong>Reads</strong>: Fetched from upstream, redacted, audited, disclaimers added</li>
+  <li><strong>Searches</strong>: All query parameters forwarded; results redacted per entry</li>
+  <li><strong>Writes</strong>: Validated locally first, then forwarded with step-up auth enforcement</li>
+  <li><strong>URL rewriting</strong>: Upstream URLs never appear in client responses</li>
+</ul>
+<div class="wiki-callout warn">
+  Proxy mode does not cache responses, does not translate between FHIR versions, and does not forward SMART-on-FHIR auth to upstream (uses upstream's native auth model).
+</div>
+
+<h2 id="deploy">Deployment</h2>
+<pre>uv sync
+STEP_UP_SECRET=your-secret python main.py
+
+# With upstream FHIR server
+FHIR_UPSTREAM_URL=https://hapi.fhir.org/baseR4 STEP_UP_SECRET=secret python main.py
+
+# Docker Compose (Flask + MCP server + Redis)
+docker-compose up -d --build
+
+# MCP server only
+cd services/agent-orchestrator && npm ci && npm start</pre>
+
+<h2 id="limitations">Known Limitations</h2>
+<ul>
+  <li><strong>Local mode storage</strong>: SQLite JSON blobs — table scans for filtering, no indexed search fields</li>
+  <li><strong>Structural validation only</strong>: No StructureDefinition conformance, cardinality checks, or terminology binding validation</li>
+  <li><strong>SubscriptionTopic</strong>: Stored and discoverable, but notifications are not dispatched</li>
+  <li><strong>Human-in-the-loop</strong>: Header-based, not cryptographic — enforces intent in pipelines, not against a determined attacker</li>
+  <li><strong>No historical versioning</strong>: version_id increments but old versions are not retrievable</li>
+  <li><strong>Context envelope consent</strong>: Always set to 'permit' (consent decision not evaluated)</li>
+  <li><strong>De-identification</strong>: Applied at read time, not storage time</li>
+  <li><strong>Upstream proxy</strong>: No response caching, no cross-version translation, no upstream auth forwarding</li>
+</ul>
+
+</div><!-- /wiki-content -->
+</div><!-- /wiki-layout -->
+{% endblock %}
