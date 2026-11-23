@@ -1,0 +1,209 @@
+# r6/labs/routes.py
+"""FHIR Observation/$interpret — Flask handler.
+
+Registered on r6_blueprint (under /r6/fhir). Read-shaped: tenant-read-
+authenticated + AuditEvent (PHI-free detail). Interprets a single Observation,
+a Bundle, or the tenant's stored Observations for ?subject=Patient/<id>.
+"""
+import copy
+import logging
+
+from flask import request, jsonify
+
+from r6.access import TenantSource, tenant_from_request
+from models import db
+from r6.models import R6Resource
+from r6.audit import add_audit_event
+from r6.labs.interpret import interpret_observation
+from r6.labs.trend import evaluate_creatinine_aki
+from r6.redaction import apply_redaction
+from r6.safe_read import strict_dumps, subject_reference
+from r6.labs.report import (
+    annotate_observation, build_interpretation_summary, build_consumer_summary,
+)
+
+logger = logging.getLogger(__name__)
+
+# Upper bound on the no-input fallback below. Matches the search route's
+# _count ceiling so one surface cannot quietly read more than the other.
+STORED_OBSERVATION_CAP = 200
+
+_DISCLAIMER = ("Advisory decision support, not a diagnosis. Reference ranges are "
+               "adult population defaults and vary by lab, age, sex, and clinical "
+               "context. The performing lab's own reference range takes precedence.")
+
+
+def register_labs_routes(blueprint, deps):
+    authenticate_tenant_read = deps["authenticate_tenant_read"]
+
+    def _stored_observations(tenant_id):
+        """The tenant's own live Observations, newest first, capped.
+
+        Every read in this module skips soft-deleted rows (is_deleted=False):
+        a tombstoned result must not be interpreted back to the patient, and
+        a tombstoned Patient must not choose a reference range. Filtered
+        before the cap, so tombstones cannot take a live row's slot.
+        """
+        rows = (R6Resource.query
+                .filter_by(resource_type="Observation", tenant_id=tenant_id,
+                           is_deleted=False)
+                .order_by(R6Resource.last_updated.desc(),
+                          R6Resource.id.desc())
+                .limit(STORED_OBSERVATION_CAP)
+                .all())
+        return [row.to_fhir_json() for row in rows]
+
+    def _observations_from_request(tenant_id):
+        """Return (observations, ignored_count, subject). Tolerates
+        malformed input. `subject` is set only on the ?subject branch, the
+        one input guaranteed to hold a single patient's results.
+
+        Four inputs, in precedence order: an explicit ?subject (or Parameters
+        subject), a Bundle, a single Observation, or NOTHING — in which case
+        the tenant's own stored Observations are interpreted.
+
+        That last branch is the one CareAgents uses: get_labs posts an empty
+        body and no subject (careagents/healthclaw.py:interpret_labs). It
+        previously matched no branch at all, so the agent interpreted zero
+        observations and told patients their labs were not in their records
+        while the tenant held hundreds.
+
+        COMMITTED BEHAVIOUR, not an accident of that fix (ruling Q1,
+        docs/2026-08-04-shakeout-rulings.md). The empty form means "interpret
+        everything I am allowed to see", and it is safe to leave implicit
+        only because the caller already passed tenant read-auth and this
+        selects WHERE tenant_id = ? — there is no wider set it could reach.
+        Do not make the same argument for a write path or a cross-tenant
+        search. Three obligations come with the ruling and are enforced
+        below and in tests: junk input is ignored rather than widened, the
+        fallback is capped, and the response reports how much it interpreted.
+
+        "Nothing supplied" is deliberately NOT the same as "something
+        unusable". A junk body (a bare array, a Parameters with an
+        unparseable subject) still counts as ignored input rather than
+        falling through to the whole record set — a malformed request must
+        not silently widen into a full read.
+        """
+        raw = request.get_json(silent=True)
+        body = raw if isinstance(raw, dict) else {}
+        supplied = raw is not None and raw != {}
+        subject = request.args.get("subject")
+        if body.get("resourceType") == "Parameters":
+            for p in body.get("parameter", []):
+                if isinstance(p, dict) and p.get("name") == "subject":
+                    ref = p.get("valueReference")
+                    if isinstance(ref, dict):
+                        subject = ref.get("reference") or subject
+        observations, ignored = [], 0
+        if subject:
+            # The reader care gaps and the brief use, so the three agree
+            # about whose result a row is: relative, absolute and urn:uuid
+            # references all resolve, and on a one-Patient tenant a result
+            # with no subject is that patient's (#867). A subject we cannot
+            # read is counted in `ignored`, never a 500 for the tenant
+            # (#869). Capped like the fallback below, in the same order, so
+            # with one Patient the two branches read the same rows.
+            from r6.caregaps.routes import subject_rows
+            observations, ignored = subject_rows(
+                "Observation", subject, tenant_id,
+                limit=STORED_OBSERVATION_CAP)
+        elif body.get("resourceType") == "Bundle":
+            for e in body.get("entry", []):
+                res = e.get("resource", {}) if isinstance(e, dict) else {}
+                if isinstance(res, dict) and res.get("resourceType") == "Observation":
+                    observations.append(res)
+                else:
+                    ignored += 1
+        elif body.get("resourceType") == "Observation":
+            observations.append(body)
+        elif supplied:
+            ignored += 1
+        else:
+            observations = _stored_observations(tenant_id)
+        return observations, ignored, (subject or None)
+
+    def _patient_for(obs, tenant_id, cache):
+        # Resolved the way the ?subject branch matches (#867), so an
+        # absolute or urn:uuid reference still selects the sex-specific
+        # range rather than the non-specific one.
+        from r6.caregaps.routes import referenced_patient_id
+        pid = referenced_patient_id(subject_reference(obs))
+        if not pid:
+            return None
+        if pid in cache:
+            return cache[pid]
+        row = R6Resource.query.filter_by(
+            resource_type="Patient", id=pid,
+            tenant_id=tenant_id, is_deleted=False).first()
+        cache[pid] = row.to_fhir_json() if row else None
+        return cache[pid]
+
+    @blueprint.route("/Observation/$interpret", methods=["POST"])
+    def interpret_labs():
+        # enforce_tenant_id already refused an absent or malformed id.
+        tenant_id = tenant_from_request(sources=(TenantSource.HEADER,)).id
+        auth_err = authenticate_tenant_read(tenant_id)
+        if auth_err is not None:
+            return auth_err[0], auth_err[1]
+
+        observations, ignored, subject = _observations_from_request(tenant_id)
+        cache, results, annotated = {}, [], []
+        for obs in observations:
+            patient = _patient_for(obs, tenant_id, cache)
+            res = interpret_observation(obs, patient)
+            results.append(res)
+            # Interpret from the stored resource, return a REDACTED copy.
+            # Interpretation needs the performing lab's own referenceRange,
+            # which redaction is free to touch; the caller needs a resource
+            # with no upstream free text in it. Those are different objects,
+            # and `apply_redaction` already returns a new dict — it deep-copies
+            # its argument through a JSON round-trip (r6/redaction.py) rather
+            # than rewriting it. The explicit copy here is belt-and-braces, not
+            # the thing that keeps `obs` intact.
+            #
+            # This path had no redaction at all (#282). CareAgents' get_labs
+            # drives it for "what do my labs say?", so an upstream `display`
+            # or `CodeableConcept.text` went straight into a patient's chat —
+            # the two fields CLAUDE.md singles out because real feeds put
+            # names in them. apply_redaction strips them and re-labels from
+            # r6/terminology.py keyed by code, so the result stays readable
+            # without any of it coming from the feed.
+            safe = apply_redaction(copy.deepcopy(obs))
+            annotated.append({"resource": annotate_observation(safe, res)})
+
+        # Trend checks need one patient's history, so they run on the
+        # ?subject branch only. A Bundle or the stored fallback can hold
+        # several people, and a creatinine "rise" across two of them is
+        # arithmetic on the wrong person. Computed from the stored
+        # resources, before redaction; the result carries values, times and
+        # ids, never upstream display or text.
+        trends = []
+        if subject:
+            aki = evaluate_creatinine_aki(observations)
+            if aki is not None:
+                trends.append(aki)
+
+        summary = build_interpretation_summary(results)
+        summary["ignored"] = ignored
+        if trends:
+            summary["trends"] = trends
+        consumer = build_consumer_summary(results, trends=trends)
+
+        add_audit_event(
+            "read", resource_type="Observation", resource_id=None,
+            agent_id=request.headers.get("X-Agent-Id"), tenant_id=tenant_id,
+            detail=(f"labs $interpret; interpreted={summary['total']} "
+                    f"flagged={len(summary['flagged'])} critical={summary['critical']}"))
+        db.session.commit()
+
+        return jsonify({
+            "resourceType": "Parameters",
+            "parameter": [
+                {"name": "return",
+                 "resource": {"resourceType": "Bundle", "type": "collection",
+                              "entry": annotated}},
+                {"name": "summary", "valueString": strict_dumps(summary)},
+                {"name": "consumerSummary", "valueString": strict_dumps(consumer)},
+                {"name": "disclaimer", "valueString": _DISCLAIMER},
+            ],
+        }), 200

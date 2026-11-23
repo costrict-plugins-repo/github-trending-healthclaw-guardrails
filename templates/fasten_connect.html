@@ -1,0 +1,571 @@
+{#- patient_view: opened from CareAgents with a valid tag (app.py,
+    _opened_from_careagents, #937). That view has no HealthClaw nav, no
+    tenant id, and no agent-access path at all — the read token is never
+    minted or shown from it — and it links back to the CareAgents hub. Every
+    other caller gets the developer page as it was. #}
+{% extends "connect_patient_base.html" if patient_view else "base.html" %}
+
+{% block title %}Connect your records{% if not patient_view %} · HealthClaw{% endif %}{% endblock %}
+
+{% block head %}
+<style>
+  .connect-shell {
+    max-width: 760px;
+    margin: 60px auto 80px;
+    padding: 0 24px;
+    color: var(--white);
+  }
+  .connect-eyebrow {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--cyan);
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    margin-bottom: 14px;
+  }
+  .connect-title {
+    font-size: 32px;
+    line-height: 1.18;
+    font-weight: 700;
+    margin: 0 0 16px;
+  }
+  .connect-sub {
+    color: var(--gray-dim);
+    font-size: 15px;
+    line-height: 1.55;
+    margin: 0 0 28px;
+  }
+  .connect-tenant {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    background: rgba(34, 211, 238, 0.10);
+    border: 1px solid rgba(34, 211, 238, 0.30);
+    padding: 6px 12px;
+    border-radius: 6px;
+    font-family: var(--font-mono);
+    font-size: 12px;
+    color: var(--cyan);
+    margin-bottom: 28px;
+  }
+  .stitch-card {
+    background: rgba(13, 17, 23, 0.6);
+    border: 1px solid rgba(34, 211, 238, 0.18);
+    border-radius: 12px;
+    padding: 28px 28px 24px;
+    margin-bottom: 24px;
+  }
+  .stitch-card h3 {
+    font-size: 16px;
+    font-weight: 600;
+    margin: 0 0 10px;
+    color: var(--white);
+  }
+  .stitch-card p {
+    color: var(--gray-dim);
+    font-size: 13.5px;
+    line-height: 1.6;
+    margin: 0 0 18px;
+  }
+  .stitch-status {
+    margin-top: 18px;
+    padding: 14px 16px;
+    border-radius: 8px;
+    background: rgba(34, 211, 238, 0.08);
+    border: 1px solid rgba(34, 211, 238, 0.20);
+    color: var(--cyan);
+    font-size: 13px;
+    line-height: 1.55;
+    display: none;
+  }
+  .stitch-status.error {
+    background: rgba(248, 113, 113, 0.10);
+    border-color: rgba(248, 113, 113, 0.35);
+    color: #fda4a4;
+  }
+  .stitch-status.success {
+    background: rgba(52, 211, 153, 0.10);
+    border-color: rgba(52, 211, 153, 0.35);
+    color: var(--green);
+  }
+  .next-steps {
+    font-size: 13px;
+    color: var(--gray-dim);
+    line-height: 1.7;
+  }
+  .next-steps code {
+    color: var(--cyan);
+    font-family: var(--font-mono);
+    font-size: 12px;
+    background: rgba(34, 211, 238, 0.08);
+    padding: 1px 6px;
+    border-radius: 4px;
+  }
+  .config-warn {
+    margin-top: 18px;
+    padding: 16px 18px;
+    border-radius: 10px;
+    background: rgba(251, 191, 36, 0.10);
+    border: 1px solid rgba(251, 191, 36, 0.35);
+    color: var(--amber);
+    font-size: 13px;
+    line-height: 1.55;
+  }
+  .connect-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    background: #22d3ee;
+    color: #0d1117;
+    font-weight: 700;
+    font-size: 15px;
+    padding: 13px 28px;
+    border-radius: 8px;
+    border: 2px solid #22d3ee;
+    cursor: pointer;
+    transition: background 0.15s, color 0.15s;
+    letter-spacing: 0.01em;
+  }
+  .connect-btn:hover {
+    background: #fff;
+    border-color: #fff;
+    color: #0d1117;
+  }
+  .fasten-modal-backdrop {
+    display: none;
+    position: fixed;
+    inset: 0;
+    background: rgba(0,0,0,0.72);
+    z-index: 1000;
+    align-items: center;
+    justify-content: center;
+    /* Keep the dialog clear of the notch and home indicator, and give it room
+       to breathe on a phone. */
+    padding: 12px;
+    padding-top: max(12px, env(safe-area-inset-top));
+    padding-bottom: max(12px, env(safe-area-inset-bottom));
+  }
+  .fasten-modal-backdrop.open { display: flex; }
+  .fasten-modal {
+    background: #161b22;
+    border-radius: 14px;
+    border: 1px solid rgba(34,211,238,0.2);
+    width: min(680px, 100%);
+    /* Was `height: min(640px, 90vh)`, which clipped the widget's own consent
+       checkbox and Continue button with no way to reach them (reported on
+       iPad). `max-height: 100%` resolves against the backdrop, which is
+       `position: fixed; inset: 0` and therefore already the visible viewport
+       minus its safe-area padding — more reliable here than `90vh`, which iOS
+       measures against the viewport with browser chrome EXPANDED. */
+    height: min(1000px, 100%);
+    max-height: 100%;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    position: relative;
+  }
+  .fasten-modal-close {
+    position: absolute;
+    top: 4px;
+    right: 4px;
+    /* 44px minimum tap target (design.md). The glyph stays 22px. */
+    width: 44px;
+    height: 44px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: none;
+    border: none;
+    color: var(--gray-dim);
+    font-size: 22px;
+    cursor: pointer;
+    z-index: 10;
+    line-height: 1;
+  }
+  /* iOS and iPadOS expand an iframe to its content height and will not scroll
+     it internally, whatever the iframe's own overflow says. So the WRAPPER is
+     the scroll container — this is what actually makes the bottom of the
+     Fasten widget reachable on an iPad. */
+  .fasten-modal-body {
+    flex: 1 1 auto;
+    min-height: 0;          /* a flex child defaults to min-height:auto and
+                               refuses to shrink, which re-creates the clip */
+    overflow-y: auto;
+  }
+  .fasten-modal-body iframe {
+    display: block;
+    width: 100%;
+    /* NOT `height: 100%`. That made the iframe exactly fill .fasten-modal-body,
+       so the wrapper never overflowed, `overflow-y: auto` had nothing to
+       scroll, and the widget's own content stayed clipped — iOS will not
+       scroll an iframe's internals, which is the whole reason the wrapper
+       exists. A scroll container whose only child always fits is not a scroll
+       container.
+       A fixed height taller than any phone or tablet viewport is what makes
+       the wrapper actually scroll. The content is cross-origin so we cannot
+       measure it; 1000px covers the Fasten flow through its Continue button
+       with room to spare, and over-reserving costs only a little scroll on a
+       tall desktop window. */
+    height: 1000px;
+    border: none;
+  }
+</style>
+{% endblock %}
+
+{% block content %}
+{% if patient_view %}
+<div class="patient-top">
+  <a href="{{ careagents_home }}">&larr; Back to CareAgents</a>
+</div>
+{% endif %}
+<div class="connect-shell">
+  {#- Plain words only (#326): the patient sees Fasten's provider search by
+      default, and CLEAR / ID.me only when FASTEN_TEFCA_MODE=true. Network
+      names (TEFCA, QHIN) mean nothing to them, so neither mode shows them. #}
+  <div class="connect-eyebrow">{% if patient_view %}CareAgents{% else %}Fasten Connect{% endif %}</div>
+{% if tefca_mode %}
+  <h1 class="connect-title">Verify once. Records arrive automatically.</h1>
+  <p class="connect-sub">
+    Confirm who you are once, with CLEAR or ID.me, and your records can be
+    found at the health systems that have them. You won't be asked to log in
+    to each one. After that, records arrive over the next 5–45 minutes and
+    HealthClaw applies the full guardrail stack (PHI redaction, audit,
+    step-up, human-in-the-loop) before any AI agent sees them.
+  </p>
+{% elif patient_view %}
+  <h1 class="connect-title">Connect your health records.</h1>
+  <p class="connect-sub">
+    Find your doctor's office or health system and sign in to its patient
+    portal, the same way you would to see your records there. You sign in
+    on their site, and CareAgents never sees your password.
+  </p>
+{% else %}
+  <h1 class="connect-title">Connect your health records.</h1>
+  <p class="connect-sub">
+    Find your doctor's office or health system and sign in to its patient
+    portal, the same way you would to see your records there. After that,
+    records arrive over the next 5–45 minutes and HealthClaw applies the full
+    guardrail stack (PHI redaction, audit, step-up, human-in-the-loop) before
+    any AI agent sees them.
+  </p>
+{% endif %}
+
+{% if not patient_view %}
+  <span class="connect-tenant">Tenant: <strong>{{ tenant_id }}</strong></span>
+{% endif %}
+
+  <div class="stitch-card">
+{% if tefca_mode %}
+    <h3>Step 1 — Verify your identity</h3>
+    <p>{{ 'Tap' if patient_view else 'Click' }} the button below. A window will open where you confirm who you are with CLEAR or ID.me.</p>
+{% else %}
+    <h3>Step 1 — Find your health system</h3>
+    <p>{{ 'Tap' if patient_view else 'Click' }} the button below. A window will open where you search for your health system and sign in.</p>
+{% endif %}
+
+    {% if fasten_public_key %}
+      <button type="button" class="connect-btn" id="open-stitch">Share Records</button>
+    {% else %}
+      <div class="config-warn">
+        <strong>FASTEN_PUBLIC_KEY is not set on this deployment.</strong><br>
+        Set it on the Railway service so the Stitch widget can render.
+      </div>
+    {% endif %}
+
+    <div id="stitch-status" class="stitch-status"></div>
+  </div>
+
+{% if fasten_public_key %}
+<div class="fasten-modal-backdrop" id="stitch-backdrop">
+  <div class="fasten-modal">
+    <button type="button" class="fasten-modal-close" id="close-stitch"
+            title="Close" aria-label="Close">&times;</button>
+    <div class="fasten-modal-body">
+      <iframe
+        id="stitch-iframe"
+        title="Fasten Connect"
+        src="https://embed.connect.fastenhealth.com/?public-id={{ fasten_public_key }}{% if tefca_mode %}&tefca-mode=true&search-only=false{% endif %}&external-id={{ tenant_id }}"
+        allow="camera; microphone; clipboard-write"
+      ></iframe>
+    </div>
+  </div>
+</div>
+{% endif %}
+
+{% if patient_view %}
+  <div class="stitch-card">
+    <h3>Step 2 — Your records arrive on your hub</h3>
+    <p>
+      Records usually arrive within 5 to 45 minutes. Sometimes it takes
+      longer. You can close this page while you wait.
+    </p>
+    <p>
+      We don't send a message when they arrive. Your CareAgents hub shows
+      them: the card changes from "Connecting…" to "Connected".
+    </p>
+    <a class="back-btn" id="back-to-careagents" href="{{ careagents_home }}">Back to CareAgents</a>
+    <p style="margin:18px 0 0">
+      Nothing there after a day? Write to
+      <a href="mailto:contactus@healthclaw.io">contactus@healthclaw.io</a>.
+    </p>
+  </div>
+{% else %}
+  <div class="stitch-card">
+    <h3>Step 2 — Records flow in the background</h3>
+    <p>
+      Once you finish, your records are copied into a private space that only
+      you control. They arrive over the next 5–45 minutes, and each one is
+      checked for obvious gaps or errors as it lands.
+    </p>
+    <div class="next-steps">
+      Nothing notifies you when records land, so there is no message to wait
+      for. What to expect on this page instead:<br>
+      &nbsp;&nbsp;<strong>Within a minute or two</strong> — the connection is
+      verified and your assistant setup appears in Step 1, under the Share
+      Records button.<br>
+      &nbsp;&nbsp;<strong>5–45 minutes</strong> — records keep arriving in the
+      background.<br>
+      &nbsp;&nbsp;<strong>Nothing appears</strong> — email
+      <a href="mailto:support@healthclaw.io" style="color:var(--cyan)">support@healthclaw.io</a>
+      with your tenant id and we will check the connection.
+    </div>
+  </div>
+{% endif %}
+</div>
+
+<script>
+(function () {
+  var backdrop = document.getElementById('stitch-backdrop');
+  var openBtn  = document.getElementById('open-stitch');
+  var closeBtn = document.getElementById('close-stitch');
+  var statusEl = document.getElementById('stitch-status');
+  if (!openBtn || !backdrop) return;
+
+  function showStatus(message, kind) {
+    statusEl.textContent = message;
+    statusEl.className = 'stitch-status' + (kind ? ' ' + kind : '');
+    statusEl.style.display = 'block';
+  }
+
+  openBtn.addEventListener('click', function () {
+    backdrop.classList.add('open');
+  });
+
+  closeBtn.addEventListener('click', function () {
+    backdrop.classList.remove('open');
+  });
+
+  backdrop.addEventListener('click', function (e) {
+    if (e.target === backdrop) backdrop.classList.remove('open');
+  });
+
+  async function _registerConnection(data) {
+    // Runs in both modes; only TEFCA mode verifies identity, so say neither.
+    showStatus('Connected. Saving the connection…', '');
+    try {
+      var resp = await fetch('/fasten/connections', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json', 'X-Tenant-Id': {{ tenant_id | tojson }} },
+        body: JSON.stringify({
+          org_connection_id: data.org_connection_id || null,
+          endpoint_id: data.endpoint_id || null,
+          tefca_directory_id: data.tefca_directory_id || null,
+          platform_type: data.platform_type || null,
+          brand_id: data.brand_id || null,
+          portal_id: data.portal_id || null
+        })
+      });
+{% if patient_view %}
+      {#- No agent-access poll here: the patient view never mints or shows
+          the read token (#937). Their hub is where the records show up. #}
+      showStatus(
+        resp.ok
+          ? 'Connected. Your records are on their way. Go back to CareAgents: your hub shows them when they arrive.'
+          : 'Saving the connection did not work. Please try again, or write to contactus@healthclaw.io.',
+        resp.ok ? 'success' : 'error'
+      );
+{% else %}
+      showStatus(
+        resp.ok
+          ? 'Connection registered. Records will stream in over the next 5–45 minutes. Nothing will notify you when they land.'
+          : 'Connection registration failed (HTTP ' + resp.status + ').',
+        resp.ok ? 'success' : 'error'
+      );
+      if (resp.ok && data.org_connection_id) {
+        // Token is minted only after Fasten's SIGNED webhook verifies the
+        // connection (usually seconds). Poll briefly.
+        _pollAgentAccess(data.org_connection_id, 30);
+      }
+{% endif %}
+    } catch (err) {
+      showStatus('Network error: ' + err.message, 'error');
+    }
+  }
+
+{% if not patient_view %}
+  async function _pollAgentAccess(orgConnectionId, attemptsLeft) {
+    if (attemptsLeft <= 0) {
+      showStatus('Connection made — your assistant key is still being verified. ' +
+                 'Email support@healthclaw.io and we will send it to you.', '');
+      return;
+    }
+    try {
+      var r = await fetch('/fasten/connections/' + encodeURIComponent(orgConnectionId) + '/agent-access', {
+        credentials: 'same-origin'
+      });
+      if (r.status === 200) { _showAgentAccess(await r.json()); return; }
+      if (r.status !== 202) return;  // 409/410/404: nothing to show
+    } catch (e) {}
+    setTimeout(function () { _pollAgentAccess(orgConnectionId, attemptsLeft - 1); }, 3000);
+  }
+
+  function _showAgentAccess(access) {
+    // One-time handoff of the read-scoped connect token. Shown once, never
+    // stored client-side beyond this page render, never sent anywhere else.
+    //
+    // It told the tester to paste these into Claude, Perplexity or any MCP
+    // agent. The hosted MCP endpoint refuses every credential but the
+    // operator's (#290), so each hosted assistant it named turned the tester
+    // away with no next step (#600). The card stays — the token is mint-once and would be lost —
+    // but says who will refuse it before showing it.
+    var el = document.createElement('div');
+    el.className = 'stitch-card';
+    el.style.marginTop = '18px';
+    el.innerHTML =
+      '<h3 style="margin:0 0 10px">Connect your AI assistant</h3>' +
+      '<p style="margin:0 0 10px"><strong>Before you copy anything:</strong> ' +
+      'assistants you use in a browser or app — Claude.ai, ChatGPT, ' +
+      'Perplexity — cannot connect to HealthClaw during the beta, and will ' +
+      'refuse these values. They work only with a HealthClaw MCP server you ' +
+      'run on your own computer.</p>' +
+      '<p style="margin:0 0 10px">These two values let that assistant read ' +
+      '<strong>your</strong> records. The token is read-only — it can never change anything — ' +
+      'and expires in 30 days. Treat it like a password and save it now: ' +
+      'it is shown only once.</p>' +
+      '<p style="margin:0 0 6px"><strong>Tenant:</strong> <code></code></p>' +
+      '<p style="margin:0 0 10px"><strong>Read token:</strong> ' +
+      '<code style="word-break:break-all"></code></p>' +
+      '<p style="margin:0 0 10px">Then tell your assistant:</p>' +
+      '<pre style="white-space:pre-wrap;background:#f6f8fa;border-radius:8px;padding:10px;font-size:13px"></pre>' +
+      '<button type="button" style="padding:8px 14px;border-radius:8px;cursor:pointer">Copy setup message</button>';
+    var codes = el.querySelectorAll('code');
+    codes[0].textContent = access.tenant_id;
+    codes[1].textContent = access.read_token;
+    var setupMsg = 'For every HealthClaw tool call in our conversations, ' +
+      'include _tenantId: "' + access.tenant_id + '" and _stepUpToken: "' +
+      access.read_token + '". This is my personal read-only health record ' +
+      'access; never include these values in anything you write publicly.';
+    el.querySelector('pre').textContent = setupMsg;
+    el.querySelector('button').addEventListener('click', function () {
+      navigator.clipboard.writeText(setupMsg).then(function () {
+        showStatus('Setup message copied — paste it into your assistant.', 'success');
+      });
+    });
+    statusEl.parentNode.insertBefore(el, statusEl.nextSibling);
+  }
+
+{% endif %}
+  window.addEventListener('message', async function (event) {
+    var data = event.data || {};
+    var type = data.type || data.event || data.action || '';
+
+    // Accept messages only from fastenhealth.com or its subdomains — parse the
+    // origin's host and check the domain properly (includes() would also match
+    // a spoofed origin like https://fastenhealth.com.evil.com).
+    var originHost;
+    try { originHost = new URL(event.origin).hostname; } catch (e) { return; }
+    if (originHost !== 'fastenhealth.com' &&
+        !originHost.endsWith('.fastenhealth.com')) return;
+
+    // Debug: surface every widget message shape in the console so a renamed
+    // completion event is diagnosable from the browser, not the server.
+    try { console.log('[fasten-widget]', type || '(untyped)', JSON.stringify(data).slice(0, 500)); } catch (e) {}
+
+    // Robust completion detection: Fasten event names have drifted across
+    // widget versions, so ALSO treat any fasten-origin message that carries
+    // an org_connection_id (at any common nesting) as completion.
+    var oid = data.org_connection_id ||
+              (data.data && data.data.org_connection_id) ||
+              (data.payload && data.payload.org_connection_id) ||
+              (data.detail && data.detail.org_connection_id) || null;
+    var payload = oid && data.org_connection_id ? data
+                : (data.data && data.data.org_connection_id) ? data.data
+                : (data.payload && data.payload.org_connection_id) ? data.payload
+                : (data.detail && data.detail.org_connection_id) ? data.detail
+                : data;
+
+    // The embed posts JSON.stringify(event) and names it in `event_type`
+    // (read out of embed.connect.fastenhealth.com's main bundle), so the
+    // `data.type` lookup above never matches a real failure. Failures are
+    // read off a parsed copy; `data` stays as it was for completion.
+    var evt = data;
+    if (typeof evt === 'string') {
+      try { evt = JSON.parse(evt); } catch (e) { evt = {}; }
+    }
+    var evtType = (evt && evt.event_type) || type;
+
+    // Fasten Stitch widget completion (standard + TEFCA mode variants)
+    if (type === 'widget.complete' || type === 'complete' ||
+        type === 'tefca.complete' || type === 'connection.complete' ||
+        type === 'authorization.complete' || oid) {
+      backdrop.classList.remove('open');
+      await _registerConnection(payload);
+    } else if (evtType === 'widget.config_error' ||
+               evtType === 'patient.connection_failed') {
+      // widget.config_error is the widget refusing our configuration (#326)
+      // and carries only {api_mode, event_type}. patient.connection_failed
+      // carries the error code and Fasten's request_id in `data` — the id
+      // FAS-864 asked for — beside error_description and our external id.
+      // Only the code and the request id leave this handler, shown or sent,
+      // and only when token-shaped: the payload is not a published contract.
+      // We cannot say WHY it failed (that lives in Fasten's account), so the
+      // message says what we know and what to do, never a guessed cause.
+      // Close the modal: #stitch-status sits under the backdrop, so the id
+      // is unreadable while the widget is still covering the page.
+      backdrop.classList.remove('open');
+      var failed = (evt.data && typeof evt.data === 'object') ? evt.data : evt;
+      var token = /^[A-Za-z0-9._:-]{1,128}$/;
+      var code = token.test(failed.error || failed.error_type || '')
+                 ? (failed.error || failed.error_type) : null;
+      var requestId = token.test(failed.request_id || '')
+                      ? failed.request_id : null;
+      var report = {event_type: evtType};
+      if (code) report.error = code;
+      if (requestId) report.request_id = requestId;
+
+      // Record it BEFORE showing anything, so the reference we show exists.
+      var reference = null;
+      try {
+        var diag = await fetch('/r6/fhir/internal/connect-diagnostic', {
+          method: 'POST',
+          credentials: 'same-origin',
+          headers: {'Content-Type': 'application/json',
+                    'X-Tenant-Id': {{ tenant_id | tojson }}},
+          body: JSON.stringify({payload: report})
+        });
+        if (diag.ok) reference = (await diag.json()).reference;
+      } catch (e) {
+        // Reporting the failure must never itself become the failure the
+        // patient sees. They still get the message below.
+      }
+
+      var quote = [];
+      if (requestId) quote.push('request id ' + requestId);
+      if (reference) quote.push('reference ' + reference);
+      // No vendor code on screen (#326); support reads it off the reference.
+      showStatus(
+        'Connecting your records did not finish. ' +
+        'The problem is in the connection, not with your records. ' +
+        'Please email ' +
+        'support@healthclaw.io' +
+        (quote.length ? ' and quote ' + quote.join(' and ') : '') +
+        ' so we can chase it.', 'error');
+    } else if (type === 'widget.close') {
+      // Dismissal is not failure and must not be reported as one.
+      backdrop.classList.remove('open');
+    }
+  });
+})();
+</script>
+{% endblock %}

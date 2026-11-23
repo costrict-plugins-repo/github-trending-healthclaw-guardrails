@@ -1,0 +1,361 @@
+"""
+Rate limiting middleware for R6 FHIR routes.
+
+Per-tenant rate limiting using an in-memory token bucket.
+Production deployments should use Redis-backed rate limiting.
+"""
+
+import hashlib
+import logging
+import os
+import threading
+import time
+from typing import Any
+from flask import g, request, jsonify, session
+from r6 import constant_time
+from r6.access import Scope, Tenant, TenantSource, has_grant
+from r6.actions.confirmations import ACTION_APPROVAL_AUDIENCE
+from r6.read_auth import TENANT_SESSION_KEY
+from r6.runtime_config import internal_mint_secret, resolve_app_env
+
+logger = logging.getLogger(__name__)
+
+# Configuration
+DEFAULT_RATE_LIMIT = 120  # requests per minute
+DEFAULT_WINDOW_SECONDS = 60
+
+# In-memory store: tenant_id -> {count, reset_at}
+_rate_limits: dict[str, dict[str, Any]] = {}
+_rate_limits_lock = threading.Lock()
+_redis_client = None
+_MAX_MEMORY_BUCKETS = 10_000
+
+_RATE_LIMIT_SCRIPT = """
+local count = redis.call('INCR', KEYS[1])
+if count == 1 then
+  redis.call('EXPIRE', KEYS[1], ARGV[1])
+end
+local ttl = redis.call('TTL', KEYS[1])
+return {count, ttl}
+"""
+
+
+def _get_redis_client():
+    """Return the shared Redis client when REDIS_URL is configured."""
+    global _redis_client
+    if _redis_client is not None:
+        return _redis_client
+    redis_url = os.environ.get('REDIS_URL', '').strip()
+    if not redis_url:
+        return None
+    import redis
+    _redis_client = redis.Redis.from_url(redis_url, decode_responses=True)
+    return _redis_client
+
+
+def _is_production():
+    return resolve_app_env() == 'production'
+
+
+def _prune_memory_buckets(now):
+    expired = [key for key, entry in _rate_limits.items()
+               if now >= entry['reset_at']]
+    for key in expired:
+        _rate_limits.pop(key, None)
+    overflow = len(_rate_limits) - _MAX_MEMORY_BUCKETS
+    if overflow > 0:
+        oldest = sorted(_rate_limits,
+                        key=lambda key: _rate_limits[key]['reset_at'])[:overflow]
+        for key in oldest:
+            _rate_limits.pop(key, None)
+
+
+#: How many trusted proxies append to X-Forwarded-For before the request
+#: reaches this process. Railway is 1. Vercel is 2 — its edge appends the
+#: client and a second internal hop appends the edge. Configured rather than
+#: sniffed on purpose: every header that could reveal the platform is one the
+#: caller can also send, and trusting one would reopen #339.
+_DEFAULT_TRUSTED_PROXY_HOPS = 1
+
+#: The bucket for "the proxy chain is not the shape we were told it is". A
+#: real key would be a guess; sharing one bucket across every such request is
+#: the honest cost of not knowing, and it is visibly named so an operator can
+#: see it in Redis rather than inferring it from a throttling report.
+_UNIDENTIFIED_CLIENT = 'unidentified'
+
+
+def _trusted_proxy_hops():
+    """Configured proxy depth, never below 1 and never a crash."""
+    raw = os.environ.get('TRUSTED_PROXY_HOPS', '').strip()
+    try:
+        hops = int(raw)
+    except ValueError:
+        return _DEFAULT_TRUSTED_PROXY_HOPS
+    return hops if hops >= 1 else _DEFAULT_TRUSTED_PROXY_HOPS
+
+
+def _client_ip():
+    """
+    Best-effort client IP for rate-limit keying. Used only as a rate-limit
+    bucket key — never for auth.
+
+    Each trusted proxy APPENDS the peer it saw, so with N trusted proxies the
+    real client is the Nth entry from the right. The leftmost entries are
+    attacker-controllable: a client can inject "X-Forwarded-For: spoofed" and
+    split the bucket arbitrarily, which is why we never read from the left.
+
+    This used to hardcode N=1 and describe it as correct for "Railway/Vercel
+    edge". It is correct for Railway and wrong for Vercel, where the rightmost
+    hop is Vercel's own internal address — a CONSTANT. Measured in production
+    on 2026-08-06, that collapsed every untenanted request on the internet
+    into one 120/min bucket and throttled the liveness probe along with
+    everyone else. A key resolver that cannot identify the client must say so
+    rather than return a value that reads like an identity.
+    """
+    fwd = request.headers.get('X-Forwarded-For', '')
+    if fwd:
+        hops = [h.strip() for h in fwd.split(',') if h.strip()]
+        depth = _trusted_proxy_hops()
+        if len(hops) < depth:
+            # Shorter than the topology we were configured for: something
+            # other than the expected chain delivered this request. Guessing
+            # here hands the caller a key it controls.
+            return _UNIDENTIFIED_CLIENT
+        return hops[-depth]
+    return request.remote_addr or 'unknown'
+
+
+def _tenant_claim_is_authenticated(tenant_id):
+    """True iff this request PROVED the tenant it claims.
+
+    Deliberately narrow, and deliberately not `authorize_tenant_read`: that
+    helper returns the tenant unchanged when READ_AUTH_ENABLED is unset, which
+    would hand the bucket key straight back to an unauthenticated header on
+    any deployment that has not flipped the flag. A rate limiter must not
+    inherit a rollout switch.
+
+    Any failure to verify answers False — an unverifiable claim is treated
+    exactly like no claim at all.
+
+    The internal check here is STRICTER than `internal_secret_authorized()`,
+    which answers True outside production when no secret is configured. That
+    dev-open default is right for operator surfaces (it keeps local work and
+    the test harness usable) and wrong here: it would silently restore
+    header-keying on every non-production deployment, and — worse — make this
+    guard untestable, since the suite runs with no secret set. A limiter that
+    is only armed in production is a limiter nobody can prove works.
+    """
+    mint_secret = internal_mint_secret()
+    if mint_secret and constant_time.equal(
+            request.headers.get('X-Internal-Secret', ''), mint_secret):
+        return True
+    if session.get(TENANT_SESSION_KEY) == tenant_id:
+        return True
+    # Kernel slice 20: the last direct site that was a predicate. has_grant
+    # reads X-Step-Up-Token and then the bearer alias in the same order and
+    # with the same stripping, accepts read-scoped tokens (TENANT_BOUND), and
+    # answers None in exactly the cases require_grant would refuse. It does
+    # NOT catch a validator that raises (by design: an outage is not an
+    # authorization result), so the try/except stays here, at the one site
+    # that has a reason to survive it. The tenant is the raw X-Tenant-Id the
+    # caller claimed, exactly what the validator bound the token to before.
+    #
+    # Confirm and decline are the two endpoints whose credential is the
+    # action-approval token, which every audience-free question now refuses
+    # (#962). Asked first here, and only here, with that audience, so a
+    # legitimate approval keys by its tenant (not the shared CareAgents
+    # egress IP) and logs no refusal. Nowhere else does an approval token
+    # prove a tenant.
+    tenant = Tenant(id=tenant_id, source=TenantSource.HEADER)
+    try:
+        if (request.endpoint in _APPROVAL_ENDPOINTS
+                and has_grant(scope=Scope.TENANT_BOUND, tenant=tenant,
+                              audience=ACTION_APPROVAL_AUDIENCE,
+                              also_bearer=True) is not None):
+            return True
+        return has_grant(scope=Scope.TENANT_BOUND, tenant=tenant,
+                         also_bearer=True) is not None
+    except Exception:  # noqa: BLE001 — never fail a request from the limiter
+        return False
+
+
+#: The endpoints that take the action-approval credential (r6/actions/routes.py).
+_APPROVAL_ENDPOINTS = frozenset({'actions.confirm_action',
+                                 'actions.decline_action'})
+
+
+def rate_limit_key():
+    """
+    Resolve the bucket key for the current request.
+
+    Per tenant ONLY when the request proved that tenant; otherwise per client
+    IP. X-Tenant-Id is caller-chosen, so keying on it unconditionally meant
+    the limit was opt-out: measured on a live deployment (#339), 150 requests
+    with a constant tenant header got 30 throttled, and the same 150 with a
+    varying header got ZERO throttled while opening 150 buckets. The limiter
+    both failed to limit and became its own memory-growth vector.
+
+    Authenticated per-tenant keying is kept because it is the useful case and
+    is now safe: a caller that proved the tenant cannot forge a different one.
+    It also protects the legitimate high-volume caller — CareAgents reads
+    /r6/fhir for many tenants from a single egress IP, and collapsing that to
+    one IP bucket would throttle real users to fix an attacker.
+
+    Untenanted traffic (provider webhook callbacks at
+    /r6/actions/callback/<provider>) keys by IP for the original reason: a
+    shared 'anonymous' bucket would let one source exhaust the limit for
+    every other untenanted caller. The IP key stays prefixed so it can never
+    collide with a real tenant id.
+    """
+    tenant_id = (request.headers.get('X-Tenant-Id') or '').strip()
+    if tenant_id and _tenant_claim_is_authenticated(tenant_id):
+        return tenant_id
+    return f'ip:{_client_ip()}'
+
+
+class RateLimitUnavailable(Exception):
+    """The production limiter store could not answer. Not "over budget".
+
+    Its message is the store exception's type name and nothing else, and it
+    is raised `from None`, so logging it cannot carry a Redis URL or host.
+    """
+
+
+def _redis_check(client, tenant_id, max_requests, window_seconds, now):
+    digest = hashlib.sha256(tenant_id.encode('utf-8')).hexdigest()
+    key = f'healthclaw:rate-limit:{digest}'
+    count, ttl = client.eval(
+        _RATE_LIMIT_SCRIPT, 1, key, int(window_seconds)
+    )
+    count = int(count)
+    ttl = max(0, int(ttl))
+    remaining = max(0, max_requests - count)
+    return count <= max_requests, remaining, now + ttl
+
+
+def check_rate_limit(tenant_id, max_requests=DEFAULT_RATE_LIMIT,
+                     window_seconds=DEFAULT_WINDOW_SECONDS):
+    """
+    Check if a tenant has exceeded their rate limit.
+
+    In production a Redis failure is answered as a deny — the same tuple as
+    an exhausted budget. A caller that must tell the two apart uses
+    check_rate_limit_or_raise.
+
+    Returns:
+        tuple: (allowed: bool, remaining: int, reset_at: float)
+    """
+    now = time.time()
+    try:
+        return _check(tenant_id, max_requests, window_seconds, now)
+    except RateLimitUnavailable as exc:
+        logger.error('Redis rate-limit check failed: %s', exc)
+        return False, 0, now + window_seconds
+
+
+def check_rate_limit_or_raise(tenant_id, max_requests=DEFAULT_RATE_LIMIT,
+                              window_seconds=DEFAULT_WINDOW_SECONDS):
+    """
+    check_rate_limit, except that a production Redis failure raises
+    RateLimitUnavailable instead of answering "over budget" (#648).
+
+    Every other answer is check_rate_limit's tuple. That includes a Redis
+    failure outside production, which is logged and falls back to the memory
+    store in both. The raising case is not logged here: the caller decides
+    what an outage means for its budget, and says so once.
+    """
+    return _check(tenant_id, max_requests, window_seconds, time.time())
+
+
+def _check(tenant_id, max_requests, window_seconds, now):
+    client = _get_redis_client()
+    if client is not None:
+        try:
+            return _redis_check(client, tenant_id, max_requests,
+                                window_seconds, now)
+        except Exception as exc:  # noqa: BLE001 - Redis client errors vary
+            if _is_production():
+                raise RateLimitUnavailable(type(exc).__name__) from None
+            logger.error('Redis rate-limit check failed: %s',
+                         type(exc).__name__)
+    return _memory_check(tenant_id, max_requests, window_seconds, now)
+
+
+def check_rate_limit_in_process(tenant_id, max_requests=DEFAULT_RATE_LIMIT,
+                                window_seconds=DEFAULT_WINDOW_SECONDS):
+    """
+    The bounded in-memory store alone, never Redis: the budget a caller of
+    check_rate_limit_or_raise can still enforce when Redis is unavailable.
+    Per process, so N workers allow up to N budgets per client.
+    """
+    return _memory_check(tenant_id, max_requests, window_seconds, time.time())
+
+
+def _memory_check(tenant_id, max_requests, window_seconds, now):
+    # Development/testing fallback is bounded and protected from thread races.
+    with _rate_limits_lock:
+        _prune_memory_buckets(now)
+        entry = _rate_limits.get(tenant_id)
+        if not entry:
+            reset_at = now + window_seconds
+            _rate_limits[tenant_id] = {'count': 1, 'reset_at': reset_at}
+            return True, max_requests - 1, reset_at
+
+        entry['count'] += 1
+        remaining = max(0, max_requests - entry['count'])
+        return entry['count'] <= max_requests, remaining, entry['reset_at']
+
+
+def rate_limit_middleware(blueprint):
+    """
+    Register rate limiting as a before_request hook on the blueprint.
+    Adds X-RateLimit-* headers to responses.
+    """
+
+    @blueprint.after_request
+    def add_rate_limit_headers(response):
+        """Add rate limit headers to every response."""
+        state = getattr(g, 'rate_limit_state', None)
+        if state:
+            remaining, reset_at = state
+            response.headers['X-RateLimit-Limit'] = str(DEFAULT_RATE_LIMIT)
+            response.headers['X-RateLimit-Remaining'] = str(remaining)
+            response.headers['X-RateLimit-Reset'] = str(int(reset_at))
+        return response
+
+    @blueprint.before_request
+    def enforce_rate_limit():
+        """Block requests that exceed the rate limit."""
+        # Skip rate limiting for metadata (discovery)
+        if request.path.endswith('/metadata'):
+            return None
+        # Liveness is exempt. prod_watch asks /health whether the process is
+        # alive; throttling it converts load into a false outage report, and
+        # on 2026-08-06 it did exactly that — the monitor read "busy" as
+        # "down" and paged on a system that was serving. A liveness probe
+        # that can be throttled is not a liveness probe.
+        if request.path.endswith('/health'):
+            return None
+        if request.path.endswith('/oauth-authorization-server'):
+            return None
+        if request.path.endswith('/smart-configuration'):
+            return None
+
+        allowed, remaining, reset_at = check_rate_limit(rate_limit_key())
+        g.rate_limit_state = (remaining, reset_at)
+
+        if not allowed:
+            response = jsonify({
+                'resourceType': 'OperationOutcome',
+                'issue': [{
+                    'severity': 'error',
+                    'code': 'throttled',
+                    'diagnostics': 'Rate limit exceeded. Try again later.'
+                }]
+            })
+            response.status_code = 429
+            response.headers['X-RateLimit-Limit'] = str(DEFAULT_RATE_LIMIT)
+            response.headers['X-RateLimit-Remaining'] = '0'
+            response.headers['X-RateLimit-Reset'] = str(int(reset_at))
+            response.headers['Retry-After'] = str(int(reset_at - time.time()))
+            return response

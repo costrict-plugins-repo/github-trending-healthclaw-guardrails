@@ -1,0 +1,366 @@
+"""
+SmartHealthConnect Bridge Blueprint.
+
+Receives FHIR R4 bundles pushed by SmartHealthConnect after a successful
+Flexpa, Health Skillz (Epic), or generic SMART on FHIR pull.  Applies the
+full HealthClaw guardrail stack (redaction, audit, tenant isolation) and
+emits a Telegram notification.
+
+Routes (prefix: /shc):
+  POST /ingest      Accept a FHIR transaction bundle from SHC
+  GET  /health      Liveness probe for SHC to verify HealthClaw is reachable
+
+Authentication:
+  Bearer token in Authorization header, matched against SHC_WEBHOOK_SECRET
+  env var.  SHC must set the same secret as HEALTHCLAW_WEBHOOK_SECRET.
+
+SmartHealthConnect side (TypeScript / data-connections-routes.ts):
+
+  After a successful Flexpa or Health Skillz pull, POST the FHIR bundle:
+
+    await fetch(`${process.env.HEALTHCLAW_WEBHOOK_URL}/shc/ingest`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${process.env.HEALTHCLAW_WEBHOOK_SECRET}`,
+        'X-Tenant-Id': tenantId,
+        'X-Source': 'flexpa' | 'healthskillz' | 'smart',
+      },
+      body: JSON.stringify({ resourceType: 'Bundle', type: 'transaction', entry: [...] }),
+    });
+
+Environment variables:
+  SHC_WEBHOOK_SECRET    Shared secret — must match HEALTHCLAW_WEBHOOK_SECRET in SHC
+  SHC_BASE_URL          Where SmartHealthConnect is deployed (for Telegram links)
+"""
+
+import collections
+import logging
+import os
+import threading
+import uuid
+from datetime import datetime, timezone
+
+from flask import Blueprint, request, jsonify, current_app
+from markupsafe import escape
+
+from models import db
+from r6 import constant_time
+from r6.access import (TenantRejected, TenantSource, require_open_tenant,
+                       tenant_from_request)
+from r6.audit import add_audit_event
+from r6.log_safety import loggable_id
+
+logger = logging.getLogger(__name__)
+
+shc_blueprint = Blueprint('shc', __name__, url_prefix='/shc')
+
+# In-memory pending code store: state -> {code, received_at}
+# Short-lived — the Mac mini polls within CALLBACK_TIMEOUT seconds.
+_pending_codes: dict = {}
+
+_CURATR_ELIGIBLE = frozenset({
+    'Condition', 'AllergyIntolerance', 'MedicationRequest',
+    'Immunization', 'Procedure', 'DiagnosticReport',
+})
+
+
+# ── Auth ──────────────────────────────────────────────────────────────────────
+
+def _verify_secret() -> bool:
+    expected = os.environ.get('SHC_WEBHOOK_SECRET', '').strip()
+    if not expected:
+        logger.warning('SHC_WEBHOOK_SECRET not set — rejecting all /shc/ingest requests')
+        return False
+    auth = request.headers.get('Authorization', '')
+    if not auth.startswith('Bearer '):
+        return False
+    token = auth[len('Bearer '):]
+    return constant_time.equal(token, expected)
+
+
+# ── Routes ────────────────────────────────────────────────────────────────────
+
+@shc_blueprint.route('/health', methods=['GET'])
+def health():
+    return jsonify({'status': 'ok', 'service': 'healthclaw-shc-bridge'}), 200
+
+
+# ── MEDENT OAuth callback broker ──────────────────────────────────────────────
+# MEDENT validates redirect_uris must be publicly reachable.
+# The Mac mini runs a local server but MEDENT can't reach it.
+# Solution: Railway acts as the callback broker.
+#   1. Mac mini starts authorize flow with redirect_uri=https://app.healthclaw.io/medent/callback
+#   2. After patient portal login, MEDENT redirects browser to this endpoint
+#   3. This endpoint stores code keyed by state
+#   4. Mac mini polls GET /medent/code?state=<state> to pick up the code
+#   5. Mac mini exchanges code for tokens locally
+
+@shc_blueprint.route('/medent/callback', methods=['GET'])
+def medent_callback():
+    """OAuth callback broker — captures MEDENT authorization code for Mac mini to pick up."""
+    code = request.args.get('code', '')
+    state = request.args.get('state', '')
+    error = request.args.get('error', '')
+
+    if error:
+        logger.warning('MEDENT callback error (len=%d)', len(error))
+        return f"""
+        <html><body style="font-family:sans-serif;max-width:500px;margin:60px auto;color:#d1d5db;background:#0d1117">
+        <h2 style="color:#f87171">Authorization error: {escape(error)}</h2>
+        <p>You can close this tab.</p>
+        </body></html>
+        """, 400
+
+    if not code or not state:
+        return 'Missing code or state', 400
+
+    _pending_codes[state] = {
+        'code': code,
+        'received_at': datetime.now(timezone.utc).isoformat(),
+    }
+    logger.info('MEDENT callback: stored code for state=%s...', state[:8])
+
+    return """
+    <html><body style="font-family:sans-serif;max-width:500px;margin:60px auto;color:#d1d5db;background:#0d1117">
+    <h2 style="color:#34d399">Authorization successful!</h2>
+    <p>You can close this tab and return to Telegram.<br>
+    Your records will start pulling in a moment.</p>
+    </body></html>
+    """, 200
+
+
+@shc_blueprint.route('/medent/code', methods=['GET'])
+def medent_poll_code():
+    """Mac mini polls this to pick up the authorization code after browser redirect."""
+    state = request.args.get('state', '')
+    if not state:
+        return jsonify({'error': 'state required'}), 400
+    entry = _pending_codes.pop(state, None)
+    if not entry:
+        return jsonify({'pending': True}), 202
+    return jsonify({'code': entry['code'], 'state': state}), 200
+
+
+# ── Health Bank One OAuth callback broker ─────────────────────────────────────
+# Same pattern as MEDENT broker above — Railway captures the code so any
+# browser (phone, laptop, VPS) can complete the flow without localhost:8742.
+#   1. Script builds auth URL with redirect_uri=https://app.healthclaw.io/shc/hbo/callback
+#   2. User opens URL, approves in HBO app
+#   3. Browser redirects here — code stored keyed by state
+#   4. Script polls GET /shc/hbo/code?state=<state> to pick up the code
+#   5. Script exchanges code for tokens locally
+
+@shc_blueprint.route('/hbo/callback', methods=['GET'])
+def hbo_callback():
+    """OAuth callback broker — captures HBO authorization code."""
+    code = request.args.get('code', '')
+    state = request.args.get('state', '')
+    error = request.args.get('error', '')
+
+    if error:
+        logger.warning('HBO callback error (len=%d)', len(error))
+        return f"""
+        <html><body style="font-family:sans-serif;max-width:500px;margin:60px auto;color:#d1d5db;background:#0d1117">
+        <h2 style="color:#f87171">Authorization error: {escape(error)}</h2>
+        <p>You can close this tab.</p>
+        </body></html>
+        """, 400
+
+    if not code or not state:
+        return 'Missing code or state', 400
+
+    _pending_codes[f'hbo:{state}'] = {
+        'code': code,
+        'received_at': datetime.now(timezone.utc).isoformat(),
+    }
+    logger.info('HBO callback: stored code for state=%s...', state[:8])
+
+    return """
+    <html><body style="font-family:sans-serif;max-width:500px;margin:60px auto;color:#d1d5db;background:#0d1117">
+    <h2 style="color:#34d399">Health Bank One connected!</h2>
+    <p>You can close this tab and return to Telegram.<br>
+    Your records will start pulling in a moment.</p>
+    </body></html>
+    """, 200
+
+
+@shc_blueprint.route('/hbo/code', methods=['GET'])
+def hbo_poll_code():
+    """Script polls this to pick up the HBO authorization code after browser redirect."""
+    state = request.args.get('state', '')
+    if not state:
+        return jsonify({'error': 'state required'}), 400
+    entry = _pending_codes.pop(f'hbo:{state}', None)
+    if not entry:
+        return jsonify({'pending': True}), 202
+    return jsonify({'code': entry['code'], 'state': state}), 200
+
+
+@shc_blueprint.route('/ingest', methods=['POST'])
+def ingest():
+    """Accept a FHIR R4 transaction Bundle from SmartHealthConnect."""
+    if not _verify_secret():
+        return jsonify({'error': 'Unauthorized'}), 401
+
+    # Access kernel, slice 9 (docs/2026-08-03-access-kernel-spec.md §1.1). The
+    # id below is the tenant every resource in the bundle is written under and
+    # the id that lands in audit detail; until this slice it was whatever
+    # string the header carried. The absent-header answer is unchanged; a
+    # MALFORMED id raises out to the app-wide handler, which is the refusal
+    # this route did not make before.
+    try:
+        tenant_id = tenant_from_request(sources=(TenantSource.HEADER,)).id
+    except TenantRejected as exc:
+        if exc.reason == TenantRejected.MALFORMED:
+            raise
+        return jsonify({'error': 'X-Tenant-Id header required'}), 400
+    # Disconnected or deleted in CareAgents: no new records (409, audited).
+    require_open_tenant(tenant_id)
+
+    source = request.headers.get('X-Source', 'shc').strip()
+
+    try:
+        bundle = request.get_json(force=True, silent=True)
+    except Exception:
+        bundle = None
+    if not bundle:
+        return jsonify({'error': 'Invalid JSON body'}), 400
+
+    if bundle.get('resourceType') != 'Bundle':
+        return jsonify({'error': 'Expected a FHIR Bundle'}), 400
+
+    entries = [e.get('resource', e) for e in bundle.get('entry', [])]
+    if not entries:
+        return jsonify({'received': True, 'ingested': 0, 'message': 'empty bundle'}), 200
+
+    job_id = str(uuid.uuid4())[:8]
+    logger.info('SHC ingest: source=%s tenant=%s entries=%d job=%s',
+                loggable_id(source), loggable_id(tenant_id), len(entries),
+                job_id)
+
+    app = current_app._get_current_object()
+    t = threading.Thread(
+        target=_ingest_bundle,
+        args=(app, entries, tenant_id, source, job_id),
+        daemon=True,
+    )
+    t.start()
+
+    return jsonify({'received': True, 'job_id': job_id, 'entries': len(entries)}), 200
+
+
+# ── Background ingest ─────────────────────────────────────────────────────────
+
+def _ingest_bundle(app, entries: list, tenant_id: str, source: str,
+                   job_id: str) -> dict:
+    """Ingest a bundle in the background. Returns the outcome counts.
+
+    Returned rather than only logged so the counts are assertable — the
+    silence around a refusal was the defect (#293), and a count no test can
+    read is the next version of it.
+    """
+    import r6.fasten.ingester as ingester
+
+    with app.app_context():
+        ingested = skipped = refused = failed = 0
+        skipped_types: collections.Counter = collections.Counter()
+        curatr_eligible_ids: list[tuple[str, str]] = []
+
+        for resource in entries:
+            try:
+                result, rid = ingester._ingest_one(
+                    resource, tenant_id, source='connected-app')
+                if result == 'ok':
+                    ingested += 1
+                    rt = resource.get('resourceType', '')
+                    if rt in _CURATR_ELIGIBLE and rid:
+                        curatr_eligible_ids.append((rt, rid))
+                elif result in ingester.REFUSED_OUTCOMES:
+                    refused += 1
+                    ingester.log_refusal(logger, f'SHC job {job_id}',
+                                         tenant_id, resource, result)
+                else:
+                    skipped += 1
+                    skipped_types[ingester.safe_skipped_type(resource)] += 1
+            except Exception as exc:
+                failed += 1
+                # CRITICAL: roll back the failed flush so the session isn't
+                # poisoned. Without this, one bad resource makes every
+                # SUBSEQUENT resource fail with "transaction has been rolled
+                # back", wedging the rest of the batch — found live on the
+                # Fasten path 2026-07-08, where a single over-length id cost
+                # all 250 resources. This path is the one that never got the
+                # fix (#306, S-4).
+                try:
+                    db.session.rollback()
+                except Exception:
+                    pass
+                # Log the exception CLASS only — str(exc) on a DBAPIError
+                # serialises the failing statement and bound parameters (the
+                # FHIR record), leaking PHI into logs (#306, S-4).
+                logger.warning('SHC ingest error (job=%s): %s',
+                               job_id, type(exc).__name__)
+
+        # `dict(...)` so a caller reading the counts cannot mutate the
+        # Counter, and so the returned shape is plain JSON-able data.
+        counts = {'ingested': ingested, 'skipped': skipped,
+                  'refused': refused, 'failed': failed,
+                  'skipped_types': dict(skipped_types)}
+        types_summary = ingester.skipped_type_summary(skipped_types)
+        add_audit_event(
+            event_type='shc_import_complete',
+            agent_id=f'shc-{source}',
+            tenant_id=tenant_id,
+            outcome='success',
+            detail=(
+                f'job={job_id} source={source} '
+                f'ingested={ingested} skipped={skipped} '
+                f'refused={refused} failed={failed}'
+                + (f' skipped_types={types_summary}' if types_summary else '')
+            ),
+        )
+        db.session.commit()
+        logger.info(
+            'SHC job %s complete: source=%s ingested=%d skipped=%d '
+            'refused=%d failed=%d skipped_types=%s',
+            job_id, loggable_id(source), ingested, skipped, refused, failed,
+            types_summary or '-',
+        )
+
+        curatr_issues = 0
+        if os.environ.get('FASTEN_CURATR_SCAN', '').lower() == 'true':
+            try:
+                from r6.fasten.ingester import _run_curatr_scan
+                curatr_issues = _run_curatr_scan(curatr_eligible_ids, tenant_id, job_id) or 0
+            except Exception as exc:
+                logger.warning('SHC curatr scan failed: %s', type(exc).__name__)
+
+        try:
+            from r6.telegram_push import notify_tenant
+            source_label = {
+                'flexpa': 'Flexpa (insurance/payer)',
+                'healthskillz': 'Health Skillz (Epic/patient portal)',
+                'smart': 'SMART on FHIR',
+            }.get(source, source)
+            msg_lines = [
+                f'📥 *Records imported* — {source_label}',
+                f'• {ingested} resources ingested',
+            ]
+            if skipped:
+                msg_lines.append(f'• {skipped} skipped')
+            # A refusal is data the person did NOT get. Folding it into
+            # "skipped" told them a record they are missing was a record we
+            # were never going to store.
+            if refused:
+                msg_lines.append(f'• {refused} refused (unreadable id)')
+            if failed:
+                msg_lines.append(f'• {failed} failed')
+            if curatr_issues:
+                msg_lines.append(f'• {curatr_issues} data-quality issues flagged')
+            msg_lines += ['', 'Try `/summary`, `/conditions`, or `/dashboard`.']
+            notify_tenant(tenant_id, '\n'.join(msg_lines))
+        except Exception as exc:
+            logger.warning('SHC notify push failed: %s', type(exc).__name__)
+
+        return counts

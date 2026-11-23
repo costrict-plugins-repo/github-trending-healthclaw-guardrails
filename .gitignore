@@ -1,0 +1,59 @@
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.coverage
+.coverage.*
+coverage.json
+htmlcov/
+instance/
+*.db
+
+# Build provenance stamp — written at deploy time (deploy/careagents/deploy.sh)
+# and shipped with the tree. A committed one would go stale silently, which is
+# the exact failure it exists to catch (#258).
+careagents/BUILD_SHA
+node_modules/
+dist/
+.env
+*.egg-info/
+.vercel/
+
+# Local-only Claude Code settings
+.claude/settings.local.json
+
+# Personal health bundles (never commit real PHI)
+healthclaw-bundle-*.json
+exports/
+
+.vercel
+
+# --- security-baseline additions ---
+# Claude Code / agent workspace state (never commit)
+.claude/
+.superpowers/
+claude-*.tmp
+
+# Strategy + outreach drafts (gitignored — local-only)
+.private/
+
+# Environment files (use .env.example for templates instead)
+.env
+.env.local
+.env.*.local
+
+# GCP/GitHub Actions service-account creds written by google-github-actions/auth
+gha-creds-*.json
+
+# --- Local-only: personal strategy docs + AI-session artifacts (kept on disk, not published) ---
+private/
+/CLAUDE.md
+.claude/
+
+# Playwright MCP session artifacts
+.playwright-mcp/
+.codex/
+
+# LinkedIn digest pending drafts (local queue)
+.digest/
+graphify-out/

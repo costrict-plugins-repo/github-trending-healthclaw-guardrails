@@ -1,0 +1,315 @@
+{# ═══════════════════════════════════════════════════════════════════════════
+   /r6-dashboard — the live guardrail measurement.
+
+   What this replaced: fifteen panels of buttons, each POSTing to /r6/… , plus
+   a "Security Posture" panel of nine hand-written rows reading Enforced /
+   Required / Immutable beside green checkmarks. Two things were wrong with
+   that page and only one of them was visible.
+
+   1. The nine rows were prose. No test could fail them. They are
+      docs/defect-catalogue.md §1 — a reassuring word doing a check's job —
+      on the most-linked page the project has.
+   2. Every button was dead where the page is served. healthclaw.io runs on
+      Vercel with ephemeral storage, and api/index.py refuses mutating
+      requests to /r6/ with 405. "Run 6-Step Guardrail Demo" POSTs to
+      /r6/demo/agent-loop. Anyone who clicked it on the public site got a 405.
+
+   So the page now shows the measurement instead of claiming the result, and
+   states plainly which host it is on and what that host can do.
+
+   Division of labour with /security: that page is the prose posture and
+   deliberately prints no grade, because a copied number goes stale and a
+   stale copy always reads as the better one. This page prints one because it
+   is not a copy — it renders the endpoint's own output at request time and
+   shows when the run happened and where it came from.
+   ═══════════════════════════════════════════════════════════════════════════ #}
+{% extends "base.html" %}
+{% block surface %}surface-paper{% endblock %}
+{% block bstheme %}light{% endblock %}
+
+{% block title %}Guardrail conformance — live report — HealthClaw{% endblock %}
+
+{% block head %}
+<meta name="description" content="The live guardrail conformance report for a running HealthClaw deployment: seven properties, every named check, what each probe observed, and what the grade does not cover.">
+<link rel="stylesheet" href="{{ url_for('static', filename='css/conformance.css') }}">
+{% endblock %}
+
+{% block mainclass %}wrap{% endblock %}
+
+{% block content %}
+{% set report = snapshot.report %}
+
+<header class="cf-mast">
+  <div class="cf-mast__eyebrow">
+    <span>Guardrail conformance</span>
+    <span>·</span>
+    <span>Live self-test</span>
+  </div>
+  {# No hard break. It set the desktop rag nicely and produced a four-line
+     heading with a one-word last line on a phone; text-wrap: balance handles
+     both widths. #}
+  <h1 class="cf-mast__title">What the guardrails actually did, the last time anyone checked</h1>
+  <p class="cf-mast__deck">
+    A probe creates a synthetic patient, drives real requests through the
+    running stack, and records what comes back. Every line below is something
+    it <strong>observed</strong>. Nothing here is asserted by hand, and the
+    failures are printed at the same weight as the passes.
+  </p>
+
+  {% if snapshot.measured %}
+  <div class="cf-prov">
+    <div class="cf-prov__cell">
+      <div class="cf-prov__k">Measured against</div>
+      {# NOT report.target. That field says 'local(test-client)' because the
+         harness drives the app in-process, which is true and useless once the
+         report crosses a host boundary: healthclaw.io rendered "measured
+         against local(test-client)", local to a machine the reader cannot
+         identify. The deployment is the fact a reader needs. #}
+      <div class="cf-prov__v">{{ snapshot.origin if snapshot.remote else 'this deployment' }}</div>
+    </div>
+    <div class="cf-prov__cell">
+      <div class="cf-prov__k">This page</div>
+      <div class="cf-prov__v">{{ 'fetched that report' if snapshot.remote else 'ran the report itself' }}</div>
+    </div>
+    <div class="cf-prov__cell">
+      <div class="cf-prov__k">Tenant</div>
+      <div class="cf-prov__v">{{ report.tenant or '—' }}</div>
+    </div>
+    <div class="cf-prov__cell">
+      <div class="cf-prov__k">Run at (UTC)</div>
+      {# Absent when the reporting deployment predates the measured_at stamp.
+         Saying so beats printing a plausible time nobody measured. #}
+      <div class="cf-prov__v">{{ report.measured_at or 'not stamped' }}</div>
+    </div>
+    <div class="cf-prov__cell">
+      <div class="cf-prov__k">Served from</div>
+      <div class="cf-prov__v">{{ 'cache (10 min TTL)' if report.cached else 'a fresh run' }}</div>
+    </div>
+    <div class="cf-prov__cell">
+      <div class="cf-prov__k">Source</div>
+      <div class="cf-prov__v"><a href="/r6/fhir/$conformance">/r6/fhir/$conformance</a></div>
+    </div>
+  </div>
+  {% endif %}
+</header>
+
+{% if snapshot.measured %}
+<section class="cf-verdict" aria-label="Result">
+  <div>
+    <div class="cf-grade {{ '' if report.passed else 'cf-grade--fail' }}">{{ report.grade }}</div>
+    <span class="cf-grade__cap">Grade</span>
+  </div>
+  <div class="cf-figures">
+    <div>
+      <span class="cf-fig__n">{{ summary.properties_passed }}/{{ summary.properties_total }}</span>
+      <span class="cf-fig__l">Properties passed</span>
+    </div>
+    <div>
+      <span class="cf-fig__n">{{ summary.checks_total }}</span>
+      <span class="cf-fig__l">Individual checks run</span>
+    </div>
+    <div>
+      <span class="cf-fig__n {{ 'cf-fig__n--fail' if summary.checks_failed }}">{{ summary.checks_failed }}</span>
+      <span class="cf-fig__l">Checks failed</span>
+    </div>
+    <div>
+      <span class="cf-fig__n {{ 'cf-fig__n--warn' if summary.partial_coverage }}">{{ summary.partial_coverage | length }}</span>
+      <span class="cf-fig__l">Properties graded on partial coverage</span>
+    </div>
+  </div>
+</section>
+
+{% if writes_here %}
+{# The page's only control, and it exists only where it works. On the
+   read-only host a re-run button would return 405 — which is precisely the
+   defect this rebuild removed, so it is not rendered there at all. #}
+<p>
+  <a class="cf-rerun" href="{{ url_for('r6_dashboard', fresh=1) }}">Run a fresh check now</a>
+  <span class="cf-rerun__note">
+    Re-runs the harness against this deployment instead of serving the cached
+    result. Takes a second or two.
+  </span>
+</p>
+{% endif %}
+{% else %}
+{# The state this page exists to get right. An empty report rendered as a
+   blank scorecard reads as a clean bill of health — "examined nothing" and
+   "found nothing" have to look different (docs/defect-catalogue.md §0). #}
+<section class="cf-unmeasured" role="status">
+  <h2 class="cf-unmeasured__h">No measurement. This is not a pass.</h2>
+  <p class="cf-unmeasured__b">
+    The report could not be obtained, so this page has nothing to show you and
+    will not imply otherwise. An empty scorecard is not a clean one. Until
+    this section is replaced by a grade, treat every guardrail claim about
+    this deployment as unverified.
+  </p>
+  <p class="cf-unmeasured__d">{{ snapshot.error }}</p>
+</section>
+{% endif %}
+
+{% if snapshot.measured %}
+<section class="cf-sec">
+  <div class="cf-sec__n">The results</div>
+  <h2 class="cf-sec__h">Seven properties, {{ summary.checks_total }} checks</h2>
+  <p class="cf-sec__lede">
+    Open a property to see every check inside it and what the probe observed.
+    The bars are one mark per check, so a property resting on two probes looks
+    thinner than one resting on seventeen. It is thinner.
+    <a href="{{ url_for('security') }}">What each property means →</a>
+  </p>
+
+  <div class="cf-props">
+    {% for row in summary.rows %}
+    {# Failing properties start open. A reader should not have to click to
+       find the thing that went wrong. #}
+    <details class="cf-prop" {{ 'open' if not row.passed }}>
+      <summary class="cf-prop__sum">
+        <span class="cf-prop__i">{{ '%02d' | format(loop.index) }}</span>
+        <span>
+          <span class="cf-prop__name">{{ row.name }}</span>
+          <span class="cf-prop__meta">
+            <span class="chip {{ 'chip--pass' if row.passed else 'chip--fail' }}">{{ 'pass' if row.passed else 'fail' }}</span>
+            {% if row.grade %}<span class="chip">grade {{ row.grade }}</span>{% endif %}
+            {% if row.partial %}
+            <span class="chip chip--warn">coverage: {{ row.coverage }}</span>
+            {% endif %}
+            <span class="cf-prop__count">
+              {{ row.checks | length }} check{{ '' if row.checks | length == 1 else 's' }}{% if row.checks_failed %}, {{ row.checks_failed }} failed{% endif %}
+            </span>
+            <span class="cf-tape">
+              {% for c in row.checks %}
+              <span class="cf-tape__m {{ '' if c.passed else 'cf-tape__m--fail' }}"></span>
+              {% endfor %}
+            </span>
+          </span>
+        </span>
+        <span class="cf-prop__more">detail</span>
+      </summary>
+      <div class="cf-prop__body">
+        {% if row.caveat %}
+        <div class="cf-note">
+          <span class="cf-note__k">Limit recorded by the harness</span>
+          <span class="cf-note__t">{{ row.caveat }}</span>
+        </div>
+        {% endif %}
+        {% if row.reference %}
+        <p class="cf-ref">Probed <code>{{ row.reference }}</code> in the self-test tenant.</p>
+        {% endif %}
+        <ul class="cf-checks">
+          {% for c in row.checks %}
+          <li class="cf-check {{ '' if c.passed else 'cf-check--fail' }}">
+            <span class="cf-check__mark">{{ 'PASS' if c.passed else 'FAIL' }}</span>
+            <span>
+              <span class="cf-check__name">{{ c.name }}</span>
+              {# `detail` is the derived field: the observation on a pass, the
+                 observation plus the failure sentence on a fail. Reading it
+                 rather than `observed` is what keeps a failure's reason on the
+                 page instead of only in the JSON. #}
+              {% if c.detail %}<span class="cf-check__obs">{{ c.detail }}</span>{% endif %}
+            </span>
+          </li>
+          {% endfor %}
+        </ul>
+      </div>
+    </details>
+    {% endfor %}
+  </div>
+</section>
+{% endif %}
+
+<section class="cf-sec">
+  <div class="cf-sec__n">Scope</div>
+  <h2 class="cf-sec__h">What this grade does not cover</h2>
+  <p class="cf-sec__lede">
+    Listed at the same weight as the result, because you would find them
+    anyway and finding them yourself is worse.
+  </p>
+
+  <div class="cf-limits">
+    {% if snapshot.measured %}
+      {% for row in summary.partial_coverage %}
+      <div class="cf-limit">
+        <h3 class="cf-limit__h">{{ row.name }} was graded on partial coverage</h3>
+        <p class="cf-limit__b">
+          Coverage is <code>{{ row.coverage }}</code>, not <code>full</code>.
+          The grade for this property describes only the surface named there.
+        </p>
+      </div>
+      {% endfor %}
+      {% for row in summary.caveats %}
+      <div class="cf-limit">
+        <h3 class="cf-limit__h">{{ row.name }}</h3>
+        <p class="cf-limit__b">{{ row.caveat }}</p>
+      </div>
+      {% endfor %}
+    {% endif %}
+
+    {# Not conditional on snapshot.measured: these hold on every run. #}
+    {% for name, why in ungraded %}
+    <div class="cf-limit">
+      {# "Not graded:" rather than "{{ name }} is not graded": the entries
+         are a mix of singular and plural ("read authentication" vs "step-up
+         refusals"), and one verb cannot agree with both. #}
+      <h3 class="cf-limit__h">Not graded: {{ name }}</h3>
+      <p class="cf-limit__b">{{ why }}</p>
+    </div>
+    {% endfor %}
+
+    <div class="cf-limit">
+      <h3 class="cf-limit__h">It is a self-test, not an audit</h3>
+      <p class="cf-limit__b">
+        The deployment grades itself. There is no SOC 2 and no HITRUST report
+        behind this number. It says the controls fired on a synthetic record a
+        moment ago; it says nothing about the organisation running the
+        deployment, its hosting, or its staff.
+        <a href="{{ url_for('security') }}">The full posture, including what is missing →</a>
+      </p>
+    </div>
+    <div class="cf-limit">
+      <h3 class="cf-limit__h">It ran against synthetic data only</h3>
+      <p class="cf-limit__b">
+        Writes land in a dedicated <code>conformance-selftest</code> tenant.
+        No real record is read or written to produce this page.
+      </p>
+    </div>
+  </div>
+</section>
+
+<section class="cf-sec">
+  <div class="cf-sec__n">Verify</div>
+  <h2 class="cf-sec__h">Do not take this page's word for it</h2>
+  <p class="cf-sec__lede">
+    The endpoint is public and unauthenticated. Run it yourself; the harness
+    runs on request, so what you get is what is true when you ask.
+  </p>
+  <div class="code-block">
+    <pre class="code"><span class="c"># the same report this page rendered, as JSON</span>
+<span class="p">curl</span> <span class="v">{{ stateful_host }}/r6/fhir/$conformance</span>
+
+<span class="c"># a human-readable scorecard, and a fresh run rather than the cache</span>
+<span class="p">curl</span> <span class="v">'{{ stateful_host }}/r6/fhir/$conformance?format=text&amp;fresh=1'</span>
+
+<span class="c"># 200 at grade A, 503 below it — so an uptime check can watch the guardrails</span>
+<span class="p">curl</span> <span class="v">-o /dev/null -w '%{http_code}\n' {{ stateful_host }}/r6/fhir/$conformance</span></pre>
+  </div>
+</section>
+
+<div class="cf-host">
+  <div class="cf-host__h">About this host</div>
+  {% if writes_here %}
+  <p class="cf-host__b">
+    You are on the stateful deployment. It has a database, it accepts writes,
+    and it ran the report above itself.
+  </p>
+  {% else %}
+  <p class="cf-host__b">
+    You are on the read-only deployment. It serves the site from ephemeral
+    serverless storage and refuses every write to a clinical path with a
+    <code>405</code>, so it cannot run the harness — the report above was
+    fetched from <a href="{{ stateful_host }}">{{ stateful_host }}</a>, which
+    can. That is also where the interactive demo runs; buttons here would
+    return 405, so there are none.
+  </p>
+  {% endif %}
+</div>
+{% endblock %}

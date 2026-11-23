@@ -1,0 +1,712 @@
+"""Architecture ratchets — the counts that define HealthClaw 2.0.
+
+Every guardrail guarantee in this codebase is currently a *convention*
+repeated at N call sites rather than a *structure* enforced at one: audit is
+called from 88 places, the tenant header is read raw in dozens, step-up is
+validated directly at 23. That is the generator behind the week of
+"a guardrail produced nothing and the caller read it as an answer" defects
+(`docs/2026-08-02-retro.md`), and driving those counts to zero is what
+`docs/2026-08-05-healthclaw-2.0-playbook.md` means by 2.0.
+
+A ratchet is a pin on a count that may only go DOWN. Each migration PR
+lowers its pin in the same commit that lowers the count — the §6 rule from
+`docs/agent-task-guide.md` applied to architecture instead of behavior. A PR
+that adds a new call site goes red, which is the point: the old path stops
+being a thing you can quietly reach for.
+
+These tests assert nothing about behavior. They are the architecture spec,
+made executable so that backsliding is a red build rather than a review
+comment somebody has to notice.
+
+WHEN YOU MIGRATE: lower the number, keep the comment honest about what is
+left. Never raise a pin to make a build pass — that is the one edit that
+turns this file into decoration.
+"""
+
+import ast
+import pathlib
+
+import pytest
+
+REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
+
+_PRODUCTION_DIRS = ('r6', 'careagents', 'adapters', 'api', 'services',
+                    'scripts', 'openclaw', 'hermes', 'migrations')
+_PRODUCTION_ROOT_FILES = ('main.py', 'app.py', 'models.py')
+
+#: A scan that walks nothing passes every ratchet forever — the false green
+#: that is this repo's own defect shape pointed at its own test suite. Every
+#: counter asserts this floor, so a broken path list fails loudly instead of
+#: reporting perfect compliance. 172 production modules exist today.
+_SCAN_FLOOR = 100
+
+
+def _production_python_files():
+    for name in _PRODUCTION_ROOT_FILES:
+        path = REPO_ROOT / name
+        if path.exists():
+            yield path
+    for folder in _PRODUCTION_DIRS:
+        base = REPO_ROOT / folder
+        if not base.exists():
+            continue
+        for path in sorted(base.rglob('*.py')):
+            if '__pycache__' in path.parts:
+                continue
+            yield path
+
+
+def _rel(path):
+    return str(path.relative_to(REPO_ROOT))
+
+
+def _scan(collect, *, skip=()):
+    """Walk production modules, collecting `collect(tree, path) -> [str]`.
+
+    Returns (sites, scanned). Counting is AST-based on purpose: grep counts
+    the word in a docstring that *describes* the old primitive and reports a
+    migration as incomplete when it is done, or counts a commented-out line
+    and hides one that is not.
+    """
+    sites, scanned = [], 0
+    for path in _production_python_files():
+        rel = _rel(path)
+        if rel in skip:
+            continue
+        scanned += 1
+        tree = ast.parse(path.read_text(encoding='utf-8'), filename=str(path))
+        sites.extend(collect(tree, path))
+    assert scanned > _SCAN_FLOOR, (
+        f'the ratchet scan only walked {scanned} files — the path list is '
+        f'broken, and every count below is meaningless until it is fixed')
+    return sites, scanned
+
+
+def _called_name(node):
+    """The bare name of a call target: f(), obj.f(), a.b.f() -> 'f'."""
+    func = node.func
+    if isinstance(func, ast.Name):
+        return func.id
+    if isinstance(func, ast.Attribute):
+        return func.attr
+    return None
+
+
+def _calls_to(name):
+    def collect(tree, path):
+        found = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and _called_name(node) == name:
+                found.append(f'{_rel(path)}:{node.lineno}')
+        return found
+    return collect
+
+
+def _report(sites, pin, what):
+    """A failure message that names the sites, so the fix is obvious."""
+    listing = '\n  '.join(sites[:40])
+    more = '' if len(sites) <= 40 else f'\n  ... and {len(sites) - 40} more'
+    return (f'{what}\n'
+            f'  pinned at {pin}, found {len(sites)}\n  {listing}{more}')
+
+
+# ---------------------------------------------------------------------------
+# A — the kernel becomes the only path
+# ---------------------------------------------------------------------------
+
+#: Direct step-up validation. `r6/access.require_grant` is the replacement:
+#: it raises rather than returning a (bool, str) tuple that a truthiness test
+#: silently misreads as authorized (#307). r6/access.py itself is excluded —
+#: it is the one module that is *supposed* to call this.
+#: Playbook chunks A2, A3, A6.
+#:
+#: 20 -> 19: kernel slice 4 migrated `/wearables/sync-now`. That slice's job
+#: was to prove the MINORITY 403 dialect survives migration without being
+#: normalized, so require_grant carries absent_status=403 and
+#: rejected_status=403 and the wire behaviour is byte-identical.
+#: 19 -> 16: kernel slice 5 migrated three of the four actions gates —
+#: rx-transfer propose (also_bearer), commit, and review's _require_step_up.
+#: The fourth, `confirm`, is deliberately NOT migrated: its wire contract
+#: includes the REASON a token was refused, and the kernel's uniform
+#: OperationOutcome does not carry it. See the comment at that call site.
+#: 16 -> 13: kernel slice 6 migrated the three r6/routes.py write gates —
+#: create, update and $share-bundle. Those three also carried the #478 leak:
+#: they interpolated the validator's raw reason into the response, including
+#: 'Token tenant mismatch', which the kernel withholds.
+#: 13 -> 12: slice 5d took the actions `confirm` gate, the one slice 5 left
+#: behind. It was blocked on whether a refusal may state its reason; the
+#: owner ruled yes (#475), so the three reasons its contract pins survive
+#: the kernel.
+#: 12 -> 10 (kernel slice 7): $curatr-apply-fix's two-phase gate now goes
+#: through require_grant, both phases. r6/routes.py keeps two direct sites
+#: ($ingest-context at its flag-conditional gate, bind-telegram).
+#: 10 -> 9 (kernel slice 7c): bind-telegram, the body-tenant site, through
+#: require_grant with also_body_field. One direct site left in r6/routes.py:
+#: $ingest-context, waiting on #648.
+#: 9 -> 8 (kernel slice 16): agent_runs' session-or-token predicate asks
+#: has_grant; no direct validator call is left in r6/agent_runs/.
+#: 4 -> 3 (#648 PR 2): $ingest-context through require_grant, behind the same
+#: READ_AUTH_ENABLED flag, keeping its own refusal sentence (denied_message).
+#: No direct validator call is left in r6/routes.py.
+#: 3 -> 2 (#655): $extract asks decide_grant. Its two refusal sentences stay
+#: byte-identical; the missing-header one is still decided at the site.
+#: 2 -> 1 (#655): the command centre's _authz_write asks decide_grant and
+#: keeps its JSON refusal, byte-identical, reason included.
+#: 1 -> 0 (#655): the dashboard-link mint the same way; the public-tenant
+#: exemption stays ahead of it.
+#:
+#: The count is ZERO, so this is no longer a ratchet but a tripwire
+#: (playbook A7's shape, per test_no_ratchet_is_already_at_zero): a direct
+#: validate_step_up_token() call anywhere outside r6/access.py is red on
+#: arrival. A gate asks require_grant; a predicate asks has_grant; a site
+#: that publishes the refusal reason asks decide_grant.
+
+
+def test_no_direct_step_up_validation_outside_the_kernel():
+    """MUTATION: add a validate_step_up_token() call anywhere -> red."""
+    sites, _ = _scan(_calls_to('validate_step_up_token'),
+                     skip=('r6/access.py',))
+    assert not sites, _report(
+        sites, 0,
+        'Direct step-up validation is forbidden outside r6/access.py: use '
+        'require_grant, has_grant or decide_grant.')
+
+
+#: Modules that reach into r6/routes.py for a symbol. Every one of these is a
+#: utility that leaked out of a 3,900-line module because there was nowhere
+#: else to put it.
+#:
+#: A1 moved the two that formed import cycles — the env predicates now live in
+#: r6/runtime_config, the body guard in r6/body_guard — and
+#: tests/test_import_acyclicity.py holds that line directly.
+#:
+#: 4 -> 1: the three imports of `authenticate_tenant_read` (r6/actions,
+#: r6/smbp twice) went when the function moved next to the
+#: `authorize_tenant_read` it wraps, in r6/read_auth.py. What is left is
+#: main.py importing the blueprint, which is the point. Ratchet reaches 1,
+#: not 0.
+_ROUTES_IMPORTERS = 1
+
+
+def test_imports_out_of_the_god_module_only_decrease():
+    """MUTATION: add `from r6.routes import x` anywhere -> red."""
+    def collect(tree, path):
+        found = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and node.module == 'r6.routes':
+                found.append(f'{_rel(path)}:{node.lineno}')
+        return found
+    sites, _ = _scan(collect)
+    assert len(sites) <= _ROUTES_IMPORTERS, _report(
+        sites, _ROUTES_IMPORTERS,
+        'Nothing but main.py should import from r6/routes.py.')
+
+
+# ---------------------------------------------------------------------------
+# B — audit correctness
+# ---------------------------------------------------------------------------
+
+#: `record_audit_event` commits the audit row in its own SAVEPOINT *after*
+#: the caller has already committed the data, and its db.session.commit()
+#: also commits whatever else the caller had pending. A failed audit
+#: therefore 500s the request with the resource already persisted and
+#: unaudited: fail-closed on the response, fail-open on the data.
+#:
+#: `add_audit_event` flushes inside the caller's transaction and never
+#: commits — same transaction, genuinely fail-closed. Playbook B3-B9 moves
+#: these one blueprint per PR; B9 deletes the old primitive when this is 0.
+#: 88 -> 89: the BP trend route (r6/smbp/trend_routes.py). A new READ
+#: route must audit — "every FHIR resource access emits an
+#: AuditEvent" — and the kernel's audit() is not usable on a read
+#: path yet: it never commits, and a GET that commits trips
+#: test_no_new_get_route_mutates_the_store. Slice 12 takes read
+#: audits as a group; adding one shim call site now is the honest
+#: cost of not shipping an unaudited read.
+#: 89 -> 87: r6/curatr.py apply_fix (#413 P1-A) — the record, the
+#: Provenance and both audit rows now commit in one transaction.
+#: 87 -> 86 (#648 PR 2): $ingest-context's refusal row is the kernel's now,
+#: written by the StepUpDenied renderer, not by the route.
+#: 86 -> 83: r6/sdc — $populate, $extract and the intake PDF write their
+#: row in the caller's transaction. The signed-link download is a GET.
+#: 83 -> 79: r6/smbp — enroll, reading, the report and its PDF. The
+#: report is a GET, but a declared mutator already; reminders-due and the
+#: BP trend are undeclared GETs and stay.
+#: 79 -> 71: r6/fasten — the webhook handlers, the ingest worker, the
+#: quality scan and the boot reaper.
+#: 71 -> 69: r6/wearables — the OAuth callback (a declared GET mutator)
+#: stores the connection and its row together; manual sync audits after
+#: the poller's own commit.
+#: 69 -> 68: r6/shc — the import summary.
+#: 68 -> 67: r6/seed.py — each seeded resource commits with its row.
+#: 67 -> 66: r6/ops — the reaper's row, after transition_action's commit.
+#: 66 -> 65: r6/labs — $interpret (a POST) adds its read row and commits.
+#: 65 -> 64: r6/caregaps — $care-gaps answers GET and POST, so the GET
+#: tripwire (GET-only routes) does not scan it; it adds and commits.
+#: 64 -> 63: r6/quality — the measure $evaluate-measure, GET and POST too.
+#: 63 -> 45: r6/actions — proposals, the emergency refusal, the approval-token
+#: mint and the review submit commit with their row. Sites after
+#: transition_action (which commits the move itself) add and commit next,
+#: the idiom confirm already used; making those one transaction needs an
+#: audit hook in r6/actions/state.py. The review page is an undeclared GET.
+#: 45 -> 23: r6/routes.py — every write and every non-GET read. Local create
+#: and update, ingest-bundle and the demo loop now commit the record and its
+#: row in one transaction.
+#:
+#: ALL 23 LEFT are reads in GET-only handlers that are not declared GET
+#: mutators: 18 in r6/routes.py, plus brief, the signed PDF download,
+#: the review page, reminders-due and the BP trend. Their inline
+#: add-then-commit would put db.session.commit() in a GET, which
+#: test_no_new_get_route_mutates_the_store flags; the shim's commit is
+#: the one it does not see. They wait on a read-audit ruling (slice 12),
+#: not on more migration of this kind.
+_POST_COMMIT_AUDIT_CALLSITES = 23
+
+
+def test_post_commit_audit_callsites_only_decrease():
+    """MUTATION: add a record_audit_event() call anywhere -> red."""
+    sites, _ = _scan(_calls_to('record_audit_event'), skip=('r6/audit.py',))
+    assert len(sites) <= _POST_COMMIT_AUDIT_CALLSITES, _report(
+        sites, _POST_COMMIT_AUDIT_CALLSITES,
+        'New audit calls must use add_audit_event (same transaction).')
+
+
+#: Packages that mutate the store and emit no audit events at all — an
+#: authenticated write with no trail, the worst shape in the codebase for a
+#: system whose constitution says every resource access emits an AuditEvent.
+#: Playbook B1, B2. The set is now EMPTY, which makes this a tripwire rather
+#: than a ratchet (playbook A7's shape): a new silent mutator goes red on
+#: arrival instead of being counted.
+#:
+#: r6/command_center left the set on 2026-08-10 (B1) and r6/agent_runs on
+#: 2026-09-04 (B2).
+#:
+#: TWO THINGS THIS TEST DOES NOT PROVE, and both were true of the version
+#: that pinned agent_runs, so read them before trusting a green here:
+#:
+#: 1. It is a PRESENCE check per package, not per mutation. One audit call
+#:    anywhere in a package satisfies it while every other write stays
+#:    silent. The per-endpoint pin is
+#:    tests/test_agent_run_writes_are_audited.py, which classifies all
+#:    fourteen agent-run routes and proves each audited one at the wire;
+#:    tests/test_command_center_writes_are_audited.py is B1's equivalent. A
+#:    package arriving here needs one of those, not just an import.
+#: 2. Until 2026-09-04 it qualified a package as a mutator only if the
+#:    package validated STEP-UP. agent_runs gates ten of its fourteen
+#:    endpoints on a shared secret instead, so the guard's own subject was
+#:    mostly outside its scope — it caught this package by ONE call site,
+#:    the step-up check inside `_tenant_authorized`, and would have missed a
+#:    package that used no step-up at all (verified by mutation: with that
+#:    one call renamed, the old predicate does not flag this package).
+#:    The predicate below now also counts a package that
+#:    calls db.session.commit(): if it commits, it mutates. Measured before
+#:    the widening (2026-09-04): the commit predicate adds r6/fasten to the
+#:    mutator set and NOTHING to the silent set — every other committing
+#:    package already audits. So the widening is inert today and is a trap
+#:    laid for tomorrow, which is what a tripwire is for.
+_UNAUDITED_MUTATOR_PACKAGES = set()
+
+
+def test_no_new_package_mutates_without_auditing():
+    """MUTATION: rename the audit CALLS in a mutating package -> red.
+
+    Not the import: this walks the AST for call names, so deleting
+    `from r6.access import audit` while leaving `audit(...)` in place stays
+    green (verified 2026-09-04). The import is not what is measured.
+
+    A package qualifies as a mutator if it validates step-up (it guards a
+    write) or commits a transaction (it performs one). If it does either and
+    never calls any audit primitive, its writes are invisible.
+    """
+    gates, stepup_gates, audits = {}, {}, {}
+    scanned = 0
+    for path in _production_python_files():
+        rel = _rel(path)
+        if not rel.startswith('r6/') or rel == 'r6/access.py':
+            continue
+        package = '/'.join(rel.split('/')[:2]) if '/' in rel[3:] else 'r6'
+        scanned += 1
+        tree = ast.parse(path.read_text(encoding='utf-8'), filename=str(path))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            name = _called_name(node)
+            if name in ('validate_step_up_token', 'require_grant', 'commit'):
+                gates.setdefault(package, []).append(f'{rel}:{node.lineno}')
+                if name != 'commit':
+                    stepup_gates.setdefault(package, []).append(
+                        f'{rel}:{node.lineno}')
+            elif name in ('record_audit_event', 'add_audit_event', 'audit'):
+                audits.setdefault(package, []).append(f'{rel}:{node.lineno}')
+    assert scanned > 40, f'the mutator scan only walked {scanned} r6 files'
+    #: A predicate that matched nothing would pass this forever, and the
+    #: widening above is exactly the edit that could break it silently.
+    assert len(gates) > 5, (
+        f'the mutator predicate matched only {len(gates)} packages — it is '
+        f'broken, and an empty silent set below means nothing')
+    #: The floor above does NOT pin the widening: deleting 'commit' from the
+    #: tuple drops the mutator set from 8 packages to 7, which still clears
+    #: `> 5`, so the 2026-09-04 strengthening could be reverted green
+    #: (verified by mutation). This is the pin for it — the commit half has to
+    #: still be reaching a package the step-up half does not, which is the
+    #: whole reason it was added. If this ever goes empty the widening has
+    #: become redundant and may be deleted, but that is then a deliberate
+    #: edit here rather than a silent one above.
+    commit_only = sorted(set(gates) - set(stepup_gates))
+    assert commit_only, (
+        "the 'commit' half of the mutator predicate now catches nothing the "
+        "step-up half does not — it has been neutered, or every committing "
+        "package has since adopted step-up. Do not delete this assertion to "
+        "go green; decide which it is.")
+    silent = {pkg for pkg in gates if pkg not in audits}
+    assert silent <= _UNAUDITED_MUTATOR_PACKAGES, _report(
+        sorted(silent - _UNAUDITED_MUTATOR_PACKAGES),
+        len(_UNAUDITED_MUTATOR_PACKAGES),
+        'A package that mutates the store must audit its writes. Presence '
+        'here is not enough: add a per-endpoint pin like '
+        'tests/test_agent_run_writes_are_audited.py in the same PR.')
+
+
+# ---------------------------------------------------------------------------
+# C — soft-delete consistency (#422)
+# ---------------------------------------------------------------------------
+
+#: Files that query R6Resource without ever mentioning is_deleted. r6/routes.py
+#: filters at all 18 of its query sites; the feature modules added since filter
+#: at none of theirs. Nothing has detonated because no DELETE route exists and
+#: only Permission-revoke sets the flag — it is a loaded gun, not a fire.
+#: Playbook F5 introduces one shared live-resource selector and takes this to 0.
+#:
+#: Re-verified 2026-08-16 while fixing #422, and the gun is even less loaded
+#: than this said: `is_deleted = True` is written on exactly ONE line in the
+#: repository (r6/routes.py:2824), inside the demo walkthrough, clearing
+#: Permission rows. No route accepts DELETE. So no Patient, Observation or
+#: Procedure row can carry a tombstone today by any path — which is why the
+#: #422 class has never been seen in production and is also why it will land
+#: silently the day a delete path ships. Fix the readers before the writer.
+#:
+#: 12 -> 11: #422 filtered all three queries in r6/caregaps/routes.py — the
+#: ambiguity count that decides whether $care-gaps may pick a subject, the
+#: demographics a supplied subject resolves to, and the clinical rows that
+#: CLOSE a gap.
+#: 11 -> 10: #509 filtered r6/actions/rails/form_fill.py. Its own comment
+#: named deletion as the case it handled and the query did not, so a
+#: tombstoned QuestionnaireResponse was rendered into a form submitted on a
+#: patient's behalf.
+#: 10 -> 9: council ruling D10 filtered both queries in r6/sdc/routes.py —
+#: the Questionnaire/Patient resolution (_load_stored) and the auto-loaded
+#: clinical content ($populate's Observation / MedicationRequest /
+#: AllergyIntolerance / Condition sweep). A tombstoned row reaching an
+#: intake form is the form_fill shape again, one hop upstream.
+#: 9 -> 8 (#630, measured 2026-09-23): the count had already fallen to 8 and
+#: the pin never followed it. That one unit of slack meant a file newly
+#: dropping its only filter stayed green — verified by stripping
+#: r6/smbp/trend_routes.py's `is_deleted=False` against the old pin.
+#: 8 -> 7: r6/actions/review.py filters all four of its queries — the
+#: Questionnaire and Patient that a review draft is built from, and the
+#: clinical sweep populated into it (D10's shape, one hop downstream).
+#: 7 -> 6: r6/labs/routes.py filters all three reads behind $interpret — the
+#: stored fallback CareAgents' get_labs drives, the ?subject sweep, and the
+#: Patient whose sex picks a reference range.
+#: 6 -> 5: r6/smbp/routes.py filters the clinician report's readings, so a
+#: deleted blood pressure is not a row, an average or a flag in it.
+#: 5 -> 4: r6/quality/routes.py filters the one loader behind NQF 0018's
+#: $evaluate-measure — Patients, Conditions and Observations alike.
+#: 4 -> 3: r6/sdc/documents.py filters the intake-PDF getter, so a signed
+#: download link minted before the delete stops serving the PDF.
+#: 3 -> 2: r6/actions/routes.py filters rx-transfer/propose's
+#: MedicationRequest sweep, so a deleted medication is never drafted into a
+#: transfer call awaiting approval. Its other queries read ProposedAction.
+#: 2 -> 1: r6/smbp/scheduler_routes.py filters the readings behind
+#: /reminders/due, so a deleted reading neither counts toward the course nor
+#: passes for the latest one and silences a due reminder.
+#: 1 -> 0: main.py's seed_demo_tenant gate counts live rows only, matching
+#: seed_demo_data's per-resource check, so a tenant holding nothing but
+#: tombstones is seeded rather than skipped as "already has data".
+#:
+#: At 0 the pin is gone and this is a tripwire (playbook A7's shape, per
+#: test_no_ratchet_is_already_at_zero): a file that queries R6Resource and
+#: never mentions is_deleted is red on arrival. A query that must see
+#: tombstones goes in _SOFT_DELETE_EXEMPT with its reason, as purge does.
+
+#: r6/purge.py hard-deletes a tenant's rows. It must NOT filter is_deleted —
+#: a purge that skipped soft-deleted rows would leave exactly the records the
+#: caller asked to destroy. Exempt on purpose, so nobody "fixes" it.
+_SOFT_DELETE_EXEMPT = ('r6/purge.py',)
+
+
+def test_no_resource_query_file_ignores_soft_delete():
+    """MUTATION: strip `is_deleted=False` from r6/smbp/trend_routes.py, its
+    only mention -> red. Executed 2026-09-23 (#630) against the old ratchet,
+    and again at the tripwire.
+
+    This is a per-FILE presence check, not per-query: any mention of
+    `is_deleted` anywhere in a file counts it clean — a comment, the column
+    declaration (r6/models.py), a write (r6/context_builder.py). So this
+    docstring used to say "strip is_deleted from a query in r6/routes.py ->
+    red", and that stays GREEN here: 22 other mentions remain. That read path
+    is pinned by behaviour instead, in tests/test_context_builder.py's
+    test_a_revived_row_is_readable_again_through_the_read_path.
+    """
+    def collect(tree, path):
+        source = path.read_text(encoding='utf-8')
+        if 'R6Resource' not in source or 'query' not in source:
+            return []
+        queries = [n for n in ast.walk(tree)
+                   if isinstance(n, ast.Attribute) and n.attr == 'query']
+        if not queries:
+            return []
+        if 'is_deleted' in source:
+            return []
+        return [f'{_rel(path)}:{queries[0].lineno}']
+    sites, _ = _scan(collect, skip=_SOFT_DELETE_EXEMPT)
+    assert not sites, _report(
+        sites, 0,
+        'A resource query that ignores is_deleted reads deleted rows: filter '
+        'is_deleted=False, or add the file to _SOFT_DELETE_EXEMPT with the '
+        'reason it must see tombstones.')
+
+
+#: r6/routes.py, in lines. The 08-02 audit's Workstream B is to decompose it
+#: into a package; that work is sequenced after the access kernel and has not
+#: started. In the meantime the file has been going the wrong way — 3,762
+#: lines at the audit, 3,905 at the 08-05 pattern review, 3,930 today, against
+#: a plan whose whole purpose is to shrink it.
+#:
+#: Nobody decided to grow it. Each PR added twenty lines to the only module
+#: where the thing they needed already lived, which is exactly how it reached
+#: 3,900 in the first place. A number that can only go down makes that visible
+#: in the PR that does it rather than in the next audit.
+#:
+#: This is a CEILING, not a target. Lower it when Workstream B lands a module;
+#: raising it needs a reason in the diff.
+#: Playbook chunk B (docs/2026-08-05-healthclaw-2.0-playbook.md).
+#: 3930 -> 3931: slice 10a swapped four raw tenant reads 1:1 and added the
+#: module's first `from r6.access import ...` line. A ratchet that only
+#: shrinks cannot tell decomposition from growth, and the honest move is to
+#: record the one line and why rather than to smuggle it in. The following
+#: batches remove code from this module; this is the only batch that adds a
+#: line to it.
+#: 3931 -> 3922: slice 6 replaced three nine-line hand-rolled step-up gates
+#: with a two-line require_grant call each. The module shrinks for the first
+#: time since the kernel migration began.
+#: 3922 -> 3927: the /internal/seed bundle gate. Raised deliberately, and the
+#: only kind of raise this file permits — the guard has to sit at that call
+#: site, and extracting seed_tenant into its own module is a refactor that
+#: should not ride along with a security fix that was exploitable in prod.
+#: 3927 -> 3928 (#583): one entry in the tenant-exemption table for the
+#: published privacy policy (#574). The table is the guard, so the line
+#: has to sit here; nothing else in that change touches this file.
+#: 3928 -> 3917 (kernel slice 7): eleven lines of hand-rolled gate removed.
+#: 3917 -> 3916 (kernel slice 7c).
+#: 3915 -> 3870: the exempt discovery paths moved to r6/discovery_paths.py, then
+#: the resource routes stopped being candidates for them (#591).
+#: 3870 -> 3761: path ids moved to r6/resource_ids.py (#726) and the search
+#: error-fidelity contract to r6/search_fidelity.py (#730); the _id filter
+#: and the proxy write redaction came back in (#380).
+#: 3761 -> 3750 (#648 PR 2): $ingest-context's hand-rolled gate and its
+#: audit call replaced by one require_grant.
+#: 3750 -> 3749 (#655): the validator no longer rides into the SDC routes
+#: as a dependency, so neither the entry nor its import is left.
+#: 3749 -> 3730: authenticate_tenant_read moved to r6/read_auth.py.
+#: 3730 -> 3711: enforce_tenant_id asks the kernel for the tenant, and three
+#: operations stopped taking an OperationOutcome builder they no longer use.
+#: 3711 -> 3707: the shim migration folded three post-commit audit blocks into
+#: the commit they describe and dropped the demo loop's interim commits.
+#: 3707 -> 3729: POST /internal/fasten-revoke, the engine half of a CareAgents
+#: Disconnect. Raised deliberately: the route sits beside purge-tenant and
+#: needs this module's _internal_ingest_authorized gate, so only the gate and
+#: the tenant read live here; the transaction is in r6/fasten/revoke.py.
+#: 3729 -> 3733 (#913 security review F3): one require_open_tenant call on
+#: each of create, update, $ingest-context and /internal/ingest-bundle. The
+#: check is a kernel primitive; only its call has to sit at each site.
+#: 3733 -> 3736 (CTO ruling on #913): the revoke route refuses a public
+#: tenant with 422 before any write, matching purge. 3736 -> 3739: the
+#: same call on /internal/seed, $curatr-apply-fix and /demo/agent-loop
+#: (security re-check of #913, R3-R5). 3739 -> 3733 (#922 B5): $stats takes
+#: its unit in the loop that filters by code; the second loop is gone.
+#: 3733 -> 3728 (#954): both search self links come from search_self_link
+#: in r6/search_fidelity.py, not two copies of the builder here. 3728 ->
+#: 3727 (#954): a proxied entry's fullUrl comes from upstream_entry there.
+#: 3727 -> 3728 (#861): normalize_patient_ref joins that import list, which
+#: wraps onto one more line; the normalizing itself lives in search_fidelity.
+#: 3728 -> 3738 (FHI-53): the check-in branch of /internal/step-up-token and
+#: of $share-bundle. Only the dispatch is here; the handlers are r6/checkin.py.
+#: 3738 -> 3744 (FHI-60): connect-diagnostic's key allowlist and the comment
+#: on why it no longer writes its payload. Hashing and the payload summary
+#: live in r6/log_safety.py; the six log calls here only wrap their ids.
+#: 3744 -> 3747 (FHI-60): purge and Fasten revoke log the exception class
+#: instead of a traceback, and connect-diagnostic logs Fasten's request id
+#: under the security ruling (r6/log_safety.py vendor_request_id).
+_GOD_MODULE_LINES = 3747
+
+
+def test_the_god_module_only_shrinks():
+    """MUTATION: add a line to r6/routes.py -> red.
+
+    The one ratchet that fires on ordinary feature work, deliberately. If a
+    change genuinely belongs in routes.py the pin moves up in the same PR
+    with the reason; the point is that it is a decision rather than a drift.
+    """
+    lines = len((REPO_ROOT / 'r6/routes.py').read_text(encoding='utf-8').splitlines())
+    assert lines <= _GOD_MODULE_LINES, (
+        f'r6/routes.py is {lines} lines, pinned at {_GOD_MODULE_LINES}.\n'
+        f'  Workstream B exists to shrink this file. If the change truly '
+        f'belongs here, raise the pin in this PR and say why; if it belongs '
+        f'in a new module, that is the refactor starting.')
+
+
+# ---------------------------------------------------------------------------
+# The ratchets themselves
+# ---------------------------------------------------------------------------
+
+
+#: Call sites that read the tenant straight off the header instead of asking
+#: the access kernel, across all of r6/. 31 -> 27 -> 9: slice 10a took create,
+#: read, update and search; slice 10b took the remaining seventeen in
+#: r6/routes.py. 9 -> 5: slice 11a took the four MCP App pages, the first
+#: multi-source sites and the first ones NOT protected by the paragraph below
+#: — they sit on the exempt /mcp-apps/ prefix, so absence is real there and
+#: is caught rather than raised.
+#:
+#: Every one of the seventeen was checked against the exempt-path list before
+#: it moved, by walking each read back to the route decorator that owns it.
+#: The first version of that walker matched only single-line decorators, fell
+#: back to an earlier unrelated route, and reported three curatr endpoints as
+#: sitting on the exempt /demo/ prefix. They are not — they are
+#: /<resource_type>/<resource_id>/$curatr-*. The walker was fixed and re-run
+#: before anything moved. A migration tool that is wrong in the SAFE
+#: direction on Tuesday is wrong in the other direction on Wednesday.
+#:
+#: This counts the whole package, not just r6/routes.py. The first draft
+#: scanned only the god module and pinned 20; the scan then reported 27 and
+#: the pin was corrected to the measurement rather than the scan narrowed to
+#: the pin. r6/fasten/routes.py and r6/rate_limit.py each hold one, and they
+#: are real instances of the same thing.
+#:
+#: The floor IS zero. `enforce_tenant_id`, the before_request hook that
+#: requires and validates the header for the whole blueprint, was once
+#: counted as the one read that belongs here. It asks the kernel now
+#: (HEADER, then SHARP), and TenantRejected renders the same two 400s the
+#: hook wrote by hand, so the enforcement point and the reader are one.
+#:
+#: Why this is safe to do in batches, and why the batches are small: every one
+#: of these sits behind `enforce_tenant_id`, the before_request hook that
+#: already requires the header and format-checks it with the SAME pattern the
+#: kernel uses (`[a-zA-Z0-9_-]{1,64}`, fullmatch, unstripped, compared before
+#: the swap). The hook also writes the synthesized SHARP tenant back into
+#: request.environ, so a downstream read sees it too. A migrated call
+#: therefore re-validates a value that cannot fail — inert by construction,
+#: which is what a migration slice should be.
+#:
+#: The exception is any handler on an EXEMPT discovery path, where the hook
+#: returns early and the header may legitimately be absent. There the kernel
+#: would raise TenantRejected where the old code got None, and that is a
+#: behaviour change, not a refactor. Check _is_exempt_discovery_path before
+#: moving a call site, per site — that is the whole reason this is 6 PRs and
+#: not one sed.
+#:
+#: Corrected 2026-09-04: this was a single-quote, no-default-arg substring
+#: needle (`"request.headers.get('X-Tenant-Id')"` matched against the raw
+#: line) on a codebase where most call sites are double-quoted or carry a
+#: default — `request.headers.get("X-Tenant-Id")` and
+#: `request.headers.get('X-Tenant-Id', 'default')` both evaded it. The pin
+#: read 5; an AST-based recount (any quote style, with or without a
+#: default, plus the subscript form `request.headers['X-Tenant-Id']`) found
+#: 27, including r6/agent_runs/routes.py:98 — the kernel spec's own open
+#: slice 11j — and r6/wearables/routes.py:233, a call split across two
+#: lines that no single-line text needle could ever have matched regardless
+#: of quoting. This was decoration, not a ratchet: a migration touching
+#: only double-quoted single-line call sites could have lowered the count
+#: while the true number stayed flat.
+#: 27 -> 24, 23 Sep: measured 24 on main (kernel slices moved three), so the
+#: pin had three units of slack and its own MUTATION line stayed green.
+#: 24 -> 14, 24 Sep: both before_request hooks, the four operations behind
+#: them (brief, care gaps, labs, quality), the command-center tenant
+#: resolver, wearables /sync-status and the connect-diagnostic log line.
+#: tests/test_raw_tenant_reads_pinned.py holds their answers unchanged.
+#: The fourteen left would each answer differently through the kernel, so
+#: each is a behaviour change for its own PR, not a refactor:
+#:   - a looser id pattern: r6/agent_runs/routes.py (`[A-Za-z0-9._:-]{1,128}`)
+#:   - a live .strip() off the hook: r6/fasten/routes.py (x2; it picks the
+#:     enrollment branch), /internal/ingest-bundle,
+#:     r6/smbp/scheduler_routes.py, r6/rate_limit.py (the bucket key)
+#:   - a malformed id that dev-open mode accepts today and the kernel would
+#:     400: /internal/step-up-token, /internal/purge-tenant, /internal/seed,
+#:     /demo/agent-loop, r6/oauth.py auto-approve
+#:   - a malformed or non-string id that reaches a token binding:
+#:     command-center POST /api/conversations and /api/tasks
+#:   - a malformed id echoed into the command-center login form
+_RAW_TENANT_READS = 14
+
+
+def _is_tenant_header_read(node):
+    """`request.headers.get('X-Tenant-Id', ...)` or `request.headers['X-Tenant-Id']`.
+
+    Structural match, not source text: quote style and a default argument
+    are call-site style choices with no bearing on the property this pin
+    exists to hold — a handler reading the tenant header directly instead
+    of through the kernel. A needle that requires exact source text is a
+    guard that certifies whatever shape happened to exist when the needle
+    was written, and nothing else — see the correction above.
+    """
+    def is_request_headers(expr):
+        return (isinstance(expr, ast.Attribute) and expr.attr == 'headers'
+                and isinstance(expr.value, ast.Name) and expr.value.id == 'request')
+
+    if isinstance(node, ast.Call):
+        func = node.func
+        if (isinstance(func, ast.Attribute) and func.attr == 'get'
+                and is_request_headers(func.value) and node.args
+                and isinstance(node.args[0], ast.Constant)
+                and node.args[0].value == 'X-Tenant-Id'):
+            return True
+    if isinstance(node, ast.Subscript) and isinstance(node.ctx, ast.Load):
+        if is_request_headers(node.value):
+            key = node.slice
+            if isinstance(key, ast.Constant) and key.value == 'X-Tenant-Id':
+                return True
+    return False
+
+
+def test_raw_tenant_header_reads_only_decrease():
+    """MUTATION: add `request.headers.get("X-Tenant-Id")` to a handler -> red.
+
+    The kernel is meant to be the one tenant reader (spec §1.1). Without a
+    pin, the 27 that exist today would quietly become 28 the next time
+    someone needed a tenant in a hurry.
+    """
+    def collect(tree, path):
+        return [f'{_rel(path)}:{node.lineno}' for node in ast.walk(tree)
+                if _is_tenant_header_read(node)]
+
+    sites, scanned = _scan(collect, skip=('r6/access.py',))
+    assert len(sites) <= _RAW_TENANT_READS, _report(
+        sites, _RAW_TENANT_READS,
+        'Read the tenant through r6.access.tenant_from_request.')
+
+
+def test_every_ratchet_names_its_playbook_chunk():
+    """A pin without a migration plan is a number nobody will ever lower."""
+    source = pathlib.Path(__file__).read_text(encoding='utf-8')
+    assert 'docs/2026-08-05-healthclaw-2.0-playbook.md' in source
+    for pin in ('_ROUTES_IMPORTERS',
+                '_RAW_TENANT_READS',
+                '_POST_COMMIT_AUDIT_CALLSITES',
+                '_GOD_MODULE_LINES'):
+        assert f'{pin} = ' in source, f'{pin} lost its pin'
+
+
+@pytest.mark.parametrize('pin,value', [
+    ('routes.py importers', _ROUTES_IMPORTERS),
+    ('post-commit audit callsites', _POST_COMMIT_AUDIT_CALLSITES),
+    ('god-module lines', _GOD_MODULE_LINES),
+])
+def test_no_ratchet_is_already_at_zero(pin, value):
+    """When one reaches 0, delete its ratchet and add the grep guard instead.
+
+    A ratchet pinned at 0 is doing a tripwire's job with a counter's
+    machinery. The playbook's chunk A7 is exactly this transition for the
+    tenant-header read: ratchet until 0, then forbid outright.
+    """
+    assert value > 0, (
+        f'{pin} is at 0 — replace the ratchet with a hard guard (playbook A7)')

@@ -1,0 +1,422 @@
+{% extends "base.html" %}
+{% block surface %}surface-paper{% endblock %}
+{% block bstheme %}light{% endblock %}
+
+{% block title %}FAQ — HealthClaw Guardrails{% endblock %}
+
+{% block head %}
+<style>
+/* FAQ — page-specific, built only from the tokens in healthclaw.css so it
+   cannot drift from the system. Body sizes were 0.875rem/0.92rem here; the
+   design system's floor is 1rem because iOS zooms the page on a smaller
+   control and 14px prose is hard to read at arm's length. */
+.faq-hero { padding: var(--s7) 0 var(--s5); border-bottom: 2px solid var(--rule-firm);
+            margin-bottom: var(--s6); }
+.faq-hero h1 { font-size: clamp(1.75rem, 3.6vw, 2.375rem); }
+.faq-hero p { color: var(--ink-soft); max-width: var(--measure);
+              margin-top: var(--s3); font-size: 1.1875rem; line-height: 1.55; }
+
+.faq-section-title {
+  font-family: var(--mono); font-size: 0.75rem; font-weight: 400;
+  letter-spacing: 0.09em; text-transform: uppercase; color: var(--ink-faint);
+  margin-top: var(--s7); margin-bottom: var(--s3);
+  padding-bottom: var(--s2); border-bottom: 1px solid var(--rule);
+}
+
+.faq-item { border-bottom: 1px solid var(--rule); background: transparent; }
+.faq-question {
+  display: flex; justify-content: space-between; align-items: center;
+  gap: var(--s4); padding: var(--s4) 0; cursor: pointer;
+  font-weight: 600; font-size: 1.0625rem; color: var(--ink);
+  min-height: var(--tap); user-select: none;
+}
+.faq-question:hover { color: var(--signal); }
+.faq-question .faq-icon {
+  flex-shrink: 0; width: 1.2rem; text-align: center; color: var(--ink-faint);
+  font-family: var(--mono); transition: transform 140ms ease-out;
+}
+.faq-item.open .faq-icon { transform: rotate(45deg); color: var(--signal); }
+.faq-answer {
+  display: none; padding: 0 0 var(--s5); max-width: var(--measure);
+  font-size: 1rem; color: var(--ink-soft); line-height: 1.65;
+}
+.faq-item.open .faq-answer { display: block; }
+.faq-answer code {
+  background: var(--signal-wash); color: var(--signal-deep);
+  padding: 0.1em 0.35em; border-radius: var(--radius); font-size: 0.9em;
+}
+.faq-answer a { color: var(--signal); }
+
+.faq-cta {
+  border: 1px solid var(--rule-firm); border-radius: var(--radius);
+  background: var(--paper-raise); padding: var(--s6);
+  margin-top: var(--s8); margin-bottom: var(--s6);
+}
+.faq-cta h3 { font-size: 1.375rem; margin-bottom: var(--s2); }
+.faq-cta p { color: var(--ink-soft); font-size: 1rem; margin-bottom: var(--s4); }
+
+@media (prefers-reduced-motion: reduce) {
+  .faq-question .faq-icon { transition: none; }
+}
+
+.faq-cta__actions { display: flex; gap: var(--s3); flex-wrap: wrap; }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="faq-hero">
+  <h1>Frequently Asked Questions</h1>
+  <p>Everything you need to know about HealthClaw Guardrails, FHIR, and AI-safe clinical data access.</p>
+</div>
+
+<div class="row justify-content-center">
+<div class="col-lg-9">
+
+<!-- ===== WHAT IS THIS ===== -->
+<div class="faq-section-title">What is HealthClaw Guardrails?</div>
+
+<div class="faq-item open">
+  <div class="faq-question" onclick="toggleFaq(this)">
+    What exactly is HealthClaw Guardrails?
+    <span class="faq-icon"><i class="fas fa-plus"></i></span>
+  </div>
+  <div class="faq-answer">
+    <p>HealthClaw Guardrails is an open-source <strong>security proxy</strong> that sits between any AI agent and any FHIR health data server. It enforces safety and compliance rules on every request — automatically, without changing your agent code or your FHIR server.</p>
+    <p>Think of it as a security guard that every AI health request must pass through. The guard redacts PHI, logs every access, requires extra authorization for writes, and blocks clinical changes until a human confirms them.</p>
+    <p>It's a <a href="https://healthclaw.io" target="_blank" rel="noopener noreferrer">healthclaw.io</a> open source project.</p>
+  </div>
+</div>
+
+<div class="faq-item">
+  <div class="faq-question" onclick="toggleFaq(this)">
+    Is this a FHIR server?
+    <span class="faq-icon"><i class="fas fa-plus"></i></span>
+  </div>
+  <div class="faq-answer">
+    <p><strong>No.</strong> In local/demo mode it stores JSON blobs in SQLite — purely for testing the guardrail patterns. In production use, you point it at a real FHIR server (HAPI, Epic, Medplum, AWS HealthLake) and it acts as a transparent proxy that enforces guardrails on every request going through.</p>
+    <p>All guardrails — PHI redaction, audit trail, step-up auth, human-in-the-loop — apply regardless of whether you're using local mode or a real upstream server.</p>
+  </div>
+</div>
+
+<div class="faq-item">
+  <div class="faq-question" onclick="toggleFaq(this)">
+    What FHIR versions are supported?
+    <span class="faq-icon"><i class="fas fa-plus"></i></span>
+  </div>
+  <div class="faq-answer">
+    <p>Two profiles:</p>
+    <ul>
+      <li><strong>FHIR R4 with US Core v9</strong> — Stable, widely deployed US healthcare resources. AllergyIntolerance, Immunization, MedicationRequest, Procedure, DiagnosticReport, CarePlan, Coverage, and 13+ more types. These are safe for production use.</li>
+      <li><strong>FHIR R6 v6.0.0-ballot3</strong> — Experimental ballot resources: Permission, SubscriptionTopic, DeviceAlert, NutritionIntake. These are for research and may change before R6 final release.</li>
+    </ul>
+    <p>Both flow through the same guardrail stack.</p>
+  </div>
+</div>
+
+<!-- ===== SECURITY & PHI ===== -->
+<div class="faq-section-title">Security &amp; PHI</div>
+
+<div class="faq-item">
+  <div class="faq-question" onclick="toggleFaq(this)">
+    What PHI is redacted and how?
+    <span class="faq-icon"><i class="fas fa-plus"></i></span>
+  </div>
+  <div class="faq-answer">
+    <p>Applied on every read path, including upstream FHIR server responses:</p>
+    <ul>
+      <li><strong>Names</strong> → truncated to initials (Maria Elena Rivera → M. E. Rivera)</li>
+      <li><strong>Identifiers</strong> → masked to last 4 characters (MRN12345 → ***2345)</li>
+      <li><strong>Addresses</strong> → stripped to city, state, country only</li>
+      <li><strong>Birth dates</strong> → truncated to year only (1985-03-15 → 1985)</li>
+      <li><strong>Phone / email / telecom</strong> → fully removed</li>
+      <li><strong>Photos</strong> → removed</li>
+    </ul>
+    <p>This is a conservative de-identification preview at the read layer, not a legal determination. Data is stored unredacted; minimization happens at response time and expert review is required before disclosure.</p>
+  </div>
+</div>
+
+<div class="faq-item">
+  <div class="faq-question" onclick="toggleFaq(this)">
+    What is step-up authorization?
+    <span class="faq-icon"><i class="fas fa-plus"></i></span>
+  </div>
+  <div class="faq-answer">
+    <p>Reads are open (with tenant header). Writes require an additional HMAC-SHA256 signed token — the <strong>step-up token</strong>.</p>
+    <p>Tokens are generated at <code>/r6/fhir/internal/step-up-token</code>, signed with your <code>STEP_UP_SECRET</code>, include a 128-bit nonce, and expire after 5 minutes. They are tenant-bound — a token for tenant A cannot be used for tenant B.</p>
+    <p>This prevents an AI agent from autonomously writing clinical data without explicit human intent behind the token issuance.</p>
+  </div>
+</div>
+
+<div class="faq-item">
+  <div class="faq-question" onclick="toggleFaq(this)">
+    What is human-in-the-loop enforcement?
+    <span class="faq-icon"><i class="fas fa-plus"></i></span>
+  </div>
+  <div class="faq-answer">
+    <p>Clinical resource writes (Observation, Condition, MedicationRequest, DiagnosticReport, AllergyIntolerance, Procedure, CarePlan, Immunization, NutritionIntake, DeviceAlert) return <strong>HTTP 428 Precondition Required</strong> unless the request includes the header <code>X-Human-Confirmed: true</code>.</p>
+    <p>This forces whatever system is issuing the write to explicitly set that header — meaning a human or human-authorized workflow confirmed the action. The AI agent cannot bypass this on its own.</p>
+    <p><em>Limitation: this is header-based, not cryptographic. A future version will use signed human-confirmation tokens.</em></p>
+  </div>
+</div>
+
+<div class="faq-item">
+  <div class="faq-question" onclick="toggleFaq(this)">
+    Is the audit trail truly immutable?
+    <span class="faq-icon"><i class="fas fa-plus"></i></span>
+  </div>
+  <div class="faq-answer">
+    <p>Close to it. The database itself refuses any UPDATE or DELETE on audit rows, on both Postgres and SQLite. Application code cannot change a row, even through raw SQL.</p>
+    <p>Every resource access writes an AuditEvent recording the tenant, agent, resource, and outcome.</p>
+    <p><em>Limits: a database owner can still disable the trigger, and Postgres TRUNCATE bypasses it. For a tamper-evident ledger, also ship audit events to an external append-only store.</em></p>
+  </div>
+</div>
+
+<!-- ===== AI AGENTS & MCP ===== -->
+<div class="faq-section-title">AI Agents &amp; MCP</div>
+
+<div class="faq-item">
+  <div class="faq-question" onclick="toggleFaq(this)">
+    What is MCP and why does it matter for health AI?
+    <span class="faq-icon"><i class="fas fa-plus"></i></span>
+  </div>
+  <div class="faq-answer">
+    <p><strong>Model Context Protocol (MCP)</strong> is an open standard that lets AI agents connect to tools and data sources in a structured, describable way. Instead of writing custom API integrations for every AI framework, you expose your capabilities as MCP tools and any MCP-compatible agent can use them.</p>
+    <p>For health AI, this is significant: it means an AI agent can be connected to FHIR health data without you having to trust that agent with raw API keys, unrestricted data access, or unaudited writes. HealthClaw Guardrails is the security layer that makes that connection safe.</p>
+  </div>
+</div>
+
+<div class="faq-item">
+  <div class="faq-question" onclick="toggleFaq(this)">
+    What are the 14 MCP tools?
+    <span class="faq-icon"><i class="fas fa-plus"></i></span>
+  </div>
+  <div class="faq-answer">
+    <p><strong>Read tools</strong> (no step-up required):</p>
+    <ul>
+      <li><code>context.get</code> — Retrieve a pre-built, time-limited context envelope</li>
+      <li><code>fhir.read</code> — Read a resource (auto-redacted)</li>
+      <li><code>fhir.search</code> — Search with patient, code, status, date filters</li>
+      <li><code>fhir.validate</code> — Structural validation before any write</li>
+      <li><code>fhir.stats</code> — Observation statistics (count/min/max/mean)</li>
+      <li><code>fhir.lastn</code> — Most recent N observations per code</li>
+      <li><code>fhir.permission_evaluate</code> — R6 access control with human-readable reasoning</li>
+      <li><code>fhir.subscription_topics</code> — List SubscriptionTopics</li>
+      <li><code>curatr.evaluate</code> — Data quality evaluation for patient health records</li>
+    </ul>
+    <p><strong>Write tools</strong> (require step-up token + human confirmation for clinical types):</p>
+    <ul>
+      <li><code>fhir.propose_write</code> — Validate and preview a write without committing</li>
+      <li><code>fhir.commit_write</code> — Commit with full guardrail enforcement</li>
+      <li><code>curatr.apply_fix</code> — Apply patient-approved data quality fixes with Provenance</li>
+    </ul>
+  </div>
+</div>
+
+<div class="faq-item">
+  <div class="faq-question" onclick="toggleFaq(this)">
+    What is Curatr?
+    <span class="faq-icon"><i class="fas fa-plus"></i></span>
+  </div>
+  <div class="faq-answer">
+    <p>Curatr is a <strong>patient-facing data quality skill</strong>. Your health records often contain coding errors — ICD-9 codes that were retired in 2015, missing required fields, or medication codes that don't match any known drug. These errors affect how AI tools interpret your health, and how insurers and providers see you.</p>
+    <p>Curatr evaluates your FHIR resources against live public terminology services (no account needed), explains issues in plain language with their real-world impact, and lets you approve fixes. Every approved fix creates a FHIR Provenance record with full attribution. It supports: Condition, AllergyIntolerance, MedicationRequest, Immunization, Procedure, DiagnosticReport.</p>
+    <p>The goal: your health data belongs to you. You should be able to see what's wrong with it and decide how to fix it.</p>
+  </div>
+</div>
+
+<!-- ===== CONVERSATIONAL GATEWAYS ===== -->
+<div class="faq-section-title">Conversational Gateways</div>
+
+<div class="faq-item">
+  <div class="faq-question" onclick="toggleFaq(this)">
+    How do I actually <em>talk</em> to HealthClaw?
+    <span class="faq-icon"><i class="fas fa-plus"></i></span>
+  </div>
+  <div class="faq-answer">
+    <p>HealthClaw is the data + guardrail layer. You chat with it through a <strong>gateway</strong> — anything that's an MCP client and renders responses in a UI you have. Four supported gateways today:</p>
+    <ul>
+      <li><strong>OpenClaw</strong> — a Telegram bot. Fixed slash commands (<code>/conditions</code>, <code>/labs</code>, <code>/curatr</code>, <code>/approve</code>). Best if you only want one chat channel with predictable behavior.</li>
+      <li><strong>Hermes</strong> (Nous Research) — multi-gateway agent. Telegram + Discord + Slack + WhatsApp + Signal + CLI + HTTP. Self-improving: skills get better as you use them.</li>
+      <li><strong>PromptOpinion</strong> — a healthcare AI assembly platform. HealthClaw is published there as a Superpower + Agent; you "Add to Workspace" and chat in the browser.</li>
+      <li><strong>Claude Desktop / Claude Code</strong> — Anthropic's clients connect over native MCP to a HealthClaw MCP server you run on your own computer; the published <code>.mcp.json</code> config points at one. Assistants you use in a browser or app — Claude.ai, ChatGPT, Perplexity — cannot connect to HealthClaw during the beta: the hosted MCP endpoint refuses them. The read token from the connect page works with a server you run yourself.</li>
+    </ul>
+    <p>All four use the same MCP server, the same skills library, and the same guardrails. Pick by where you want to type, not by what you can do.</p>
+    <p><strong>One exception right now:</strong> the Telegram surface is not currently served — the bot has been out of service since June — so OpenClaw, and the Telegram channel of Hermes, describe what those components are rather than somewhere you can reach us today.</p>
+  </div>
+</div>
+
+<div class="faq-item">
+  <div class="faq-question" onclick="toggleFaq(this)">
+    What is Hermes and how is it different from OpenClaw?
+    <span class="faq-icon"><i class="fas fa-plus"></i></span>
+  </div>
+  <div class="faq-answer">
+    <p><strong>Hermes</strong> is Nous Research's self-improving agent (<a href="https://github.com/nousresearch/hermes-agent" target="_blank" rel="noopener noreferrer">github.com/nousresearch/hermes-agent</a>). Two practical differences from OpenClaw:</p>
+    <ul>
+      <li><strong>Many chat channels, one agent.</strong> OpenClaw is Telegram. Hermes is Telegram + Discord + Slack + WhatsApp + Signal + CLI + HTTP. Same persona, same skills, same MCP server — different surfaces.</li>
+      <li><strong>It learns.</strong> Hermes captures every conversation and lets you save working call patterns as skills, refine the persona on misfires, and search past sessions. The skills HealthClaw ships are starting points; Hermes refines them in <code>~/.hermes/skills/healthclaw/</code> as you use it.</li>
+    </ul>
+    <p>OpenClaw and Hermes can run side-by-side. They share the same MCP server, so there's no migration cost.</p>
+  </div>
+</div>
+
+<div class="faq-item">
+  <div class="faq-question" onclick="toggleFaq(this)">
+    How do I set up Hermes with HealthClaw?
+    <span class="faq-icon"><i class="fas fa-plus"></i></span>
+  </div>
+  <div class="faq-answer">
+    <p>Two commands once Hermes itself is installed:</p>
+    <pre>git clone https://github.com/aks129/HealthClawGuardrails
+cd HealthClawGuardrails
+./hermes/install.sh</pre>
+    <p>That installer is idempotent. It copies all skills to <code>~/.hermes/skills/healthclaw/</code>, installs the HealthClaw <code>SOUL.md</code> persona at <code>~/.hermes/personas/healthclaw.md</code>, and merges three MCP server entries (hosted demo, local Docker, SHARP-on-MCP) into <code>~/.hermes/config.json</code>.</p>
+    <p>Then:</p>
+    <pre>hermes
+&gt; /persona healthclaw
+&gt; show me my conditions</pre>
+    <p>Full walkthrough including the three connection modes (hosted, local, SHARP) is on the <a href="{{ url_for('wiki') }}#hermes-quickstart">Wiki — Hermes Quick Start</a>. Flags: <code>--dry-run</code> previews; <code>--skills-only</code> refreshes just the skills if Hermes has edited them.</p>
+  </div>
+</div>
+
+<div class="faq-item">
+  <div class="faq-question" onclick="toggleFaq(this)">
+    What is SOUL.md? Is it the same as AGENTS.md?
+    <span class="faq-icon"><i class="fas fa-plus"></i></span>
+  </div>
+  <div class="faq-answer">
+    <p>Same purpose, different ecosystem.</p>
+    <ul>
+      <li><code>AGENTS.md</code> — OpenClaw's persona format. One per persona workspace (Sally-PCP, Mary-pharmacy, Dom-fitness, Kristy-scheduler).</li>
+      <li><code>SOUL.md</code> — Hermes' persona format. One per persona, loaded via <code>/persona &lt;name&gt;</code> at the start of a session.</li>
+    </ul>
+    <p>HealthClaw ships its Hermes persona at <code>hermes/SOUL.md</code>. The installer puts it at <code>~/.hermes/personas/healthclaw.md</code>. It covers tool selection, step-up token acquisition, the human-in-the-loop confirm flow, guardrail narration, and hard rules (no inventing FHIR resource types, no bypassing step-up auth, no claiming demo data is real).</p>
+  </div>
+</div>
+
+<div class="faq-item">
+  <div class="faq-question" onclick="toggleFaq(this)">
+    What is agentskills.io?
+    <span class="faq-icon"><i class="fas fa-plus"></i></span>
+  </div>
+  <div class="faq-answer">
+    <p>The open standard for skill definitions that Hermes uses natively. A skill is a markdown file with YAML frontmatter declaring its <code>name</code>, <code>description</code>, <code>references</code>, optional <code>tools</code> list, and version. The body is a natural-language playbook.</p>
+    <p>HealthClaw's <code>/skills</code> directory ships ten of these — getting-started, curatr, fhir-r6-guardrails, phi-redaction, fhir-upstream-proxy, fasten-connect, healthex-export, healthex-export-redacted, personal-health-records, and hermes. They're auto-indexed at <a href="{{ url_for('skills_index') }}">/skills</a> on this site, and the same files install into both OpenClaw and Hermes.</p>
+  </div>
+</div>
+
+<div class="faq-item">
+  <div class="faq-question" onclick="toggleFaq(this)">
+    Is HealthClaw on the PromptOpinion Marketplace?
+    <span class="faq-icon"><i class="fas fa-plus"></i></span>
+  </div>
+  <div class="faq-answer">
+    <p>Yes — both as an <strong>Agent</strong> and as an <strong>MCP Superpower</strong>. HealthClaw was the FHIR IQ team's submission to the PromptOpinion <a href="https://agents-assemble.devpost.com/" target="_blank" rel="noopener noreferrer">Agents Assemble Challenge</a> on Devpost.</p>
+    <ul>
+      <li><strong>Agent</strong> — <a href="https://app.promptopinion.ai/marketplace/agent/019e183d-c819-733f-9a91-6cf6756d4bed" target="_blank" rel="noopener noreferrer">HealthClaw Clinical Reviewer</a> orchestrates the MCP tools and narrates what the guardrails did.</li>
+      <li><strong>Superpower (MCP server)</strong> — <a href="https://app.promptopinion.ai/marketplace/mcp/019e1831-3d6f-7f72-99c2-cb8f2efab57e" target="_blank" rel="noopener noreferrer">HealthClaw</a> exposes 16 tools with the full guardrail stack.</li>
+    </ul>
+    <p>Both listings are Open Access — no credentials to add to a PromptOpinion workspace. Click <em>Add to Workspace</em>, pick a model, start chatting. The hosted MCP server is seeded with synthetic Grover Keeling sample data so you can try everything without standing up anything locally.</p>
+  </div>
+</div>
+
+<div class="faq-item">
+  <div class="faq-question" onclick="toggleFaq(this)">
+    What is SHARP-on-MCP and why does HealthClaw advertise it?
+    <span class="faq-icon"><i class="fas fa-plus"></i></span>
+  </div>
+  <div class="faq-answer">
+    <p>SHARP-on-MCP (Standardised Healthcare Agent Remote Protocol) is a vendor-neutral spec for how an MCP server in healthcare receives its FHIR context. Instead of every MCP server running its own OAuth dance against every EHR, the <em>agent host</em> obtains a SMART-on-FHIR access token and forwards it on every call via three headers:</p>
+    <ul>
+      <li><code>X-FHIR-Server-URL</code> — the upstream FHIR base (Epic, Cerner, MEDITECH, etc.)</li>
+      <li><code>X-FHIR-Access-Token</code> — the SMART access token</li>
+      <li><code>X-Patient-ID</code> — optional patient banner / launch context</li>
+    </ul>
+    <p>HealthClaw's MCP server advertises SHARP compliance in its <code>initialize</code> response under <code>capabilities.experimental.{fhir_context_required, sharp}</code>, and PromptOpinion compliance under <code>capabilities.extensions["ai.promptopinion/fhir-context"]</code>. Both specs use the same headers, so one HealthClaw deployment works against any SMART-launched agent host in either ecosystem.</p>
+  </div>
+</div>
+
+<!-- ===== SETUP & DEPLOYMENT ===== -->
+<div class="faq-section-title">Setup &amp; Deployment</div>
+
+<div class="faq-item">
+  <div class="faq-question" onclick="toggleFaq(this)">
+    How do I connect it to my real FHIR server?
+    <span class="faq-icon"><i class="fas fa-plus"></i></span>
+  </div>
+  <div class="faq-answer">
+    <p>Set the <code>FHIR_UPSTREAM_URL</code> environment variable:</p>
+    <pre>FHIR_UPSTREAM_URL=https://hapi.fhir.org/baseR4 python main.py</pre>
+    <p>All guardrails remain active. Reads are fetched from upstream, redacted, and audited. Writes are validated locally first, then forwarded with step-up auth enforcement. Upstream URLs never leak to clients.</p>
+    <p>Tested with: HAPI FHIR R4/R5, SMART Health IT, Epic Sandbox.</p>
+  </div>
+</div>
+
+<div class="faq-item">
+  <div class="faq-question" onclick="toggleFaq(this)">
+    What environment variables do I need?
+    <span class="faq-icon"><i class="fas fa-plus"></i></span>
+  </div>
+  <div class="faq-answer">
+    <p><strong>Required in production:</strong></p>
+    <ul>
+      <li><code>STEP_UP_SECRET</code> — HMAC secret for step-up tokens. Auto-generated on Vercel.</li>
+      <li><code>SQLALCHEMY_DATABASE_URI</code> — Use PostgreSQL in production (default: SQLite)</li>
+    </ul>
+    <p><strong>Optional:</strong></p>
+    <ul>
+      <li><code>FHIR_UPSTREAM_URL</code> — Connect to a real FHIR server</li>
+      <li><code>SESSION_SECRET</code> — Flask session key</li>
+      <li><code>FHIR_UPSTREAM_TIMEOUT</code> — Upstream request timeout in seconds (default 15)</li>
+      <li><code>REDIS_URL</code> — For rate limiting and sessions (default: redis://redis:6379/0)</li>
+    </ul>
+  </div>
+</div>
+
+<div class="faq-item">
+  <div class="faq-question" onclick="toggleFaq(this)">
+    Can I use this in production?
+    <span class="faq-icon"><i class="fas fa-plus"></i></span>
+  </div>
+  <div class="faq-answer">
+    <p>The guardrail patterns are production-grade. The local storage mode (SQLite JSON blobs) is not — it lacks indexed search, horizontal scaling, and proper query performance. For production:</p>
+    <ul>
+      <li>Use upstream proxy mode pointing at a real FHIR server</li>
+      <li>Set a strong <code>STEP_UP_SECRET</code></li>
+      <li>Use PostgreSQL for the audit database</li>
+      <li>Enable Redis for rate limiting</li>
+      <li>Deploy behind HTTPS</li>
+    </ul>
+    <p>The human-in-the-loop mechanism is currently header-based, not cryptographically signed. Treat it as a pattern demonstration rather than a production-grade confirmation mechanism.</p>
+  </div>
+</div>
+
+<!-- ===== CTA ===== -->
+<div class="faq-cta">
+  <h3>Want to go deeper?</h3>
+  <p>The Wiki covers architecture, guardrail patterns, FHIR concepts, and how each component works.</p>
+  <div class="faq-cta__actions">
+    <a href="{{ url_for('wiki') }}" class="r6-btn r6-btn-primary">
+      <i class="fas fa-book"></i> Read the Wiki
+    </a>
+    <a href="{{ url_for('r6_dashboard') }}" class="r6-btn r6-btn-outline">
+      <i class="fas fa-heartbeat"></i> Try the Dashboard
+    </a>
+    <a href="https://github.com/aks129/HealthClawGuardrails" target="_blank" rel="noopener noreferrer" class="btn-github">
+      <i class="fab fa-github"></i> GitHub
+    </a>
+  </div>
+</div>
+
+</div><!-- /col -->
+</div><!-- /row -->
+{% endblock %}
+
+{% block scripts %}
+<script>
+function toggleFaq(el) {
+  var item = el.closest('.faq-item');
+  item.classList.toggle('open');
+}
+</script>
+{% endblock %}

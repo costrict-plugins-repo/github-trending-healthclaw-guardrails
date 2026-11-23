@@ -1,0 +1,55 @@
+{
+  "name": "healthclaw-marketplace",
+  "owner": {
+    "name": "aks129",
+    "email": "dev@healthclaw.io"
+  },
+  "metadata": {
+    "description": "Clinical AI skills for FHIR guardrails, PHI redaction, EHR integration, personal health management, and biomedical research — from healthclaw.io and SmartHealthConnect.",
+    "version": "1.3.0",
+    "pluginRoot": "./"
+  },
+  "plugins": [
+    {
+      "name": "healthclaw-guardrails",
+      "source": "./",
+      "description": "FHIR AI agent guardrails with 29 MCP tools including Compiled Truth (current state + evidence timeline) and Wearables (Garmin, Oura, Polar, Suunto, Whoop, Fitbit, Strava via Open Wearables). PHI redaction on every read, step-up auth for writes, immutable audit, tenant isolation, Curatr data quality, Fasten Connect EHR ingestion. FHIR R4 US Core v9 + R6 ballot3.",
+      "version": "1.3.0",
+      "author": {
+        "name": "aks129"
+      },
+      "homepage": "https://healthclaw.io",
+      "repository": "https://github.com/aks129/HealthClawGuardrails",
+      "license": "MIT",
+      "keywords": [
+        "fhir", "fhir-r4", "fhir-r6", "hl7", "mcp", "healthcare",
+        "phi", "hipaa", "guardrails", "audit-trail", "step-up-auth",
+        "curatr", "ehr", "fasten", "medplum", "us-core"
+      ],
+      "category": "healthcare",
+      "tags": ["fhir", "hipaa", "mcp", "guardrails", "redaction", "ehr", "clinical-ai"]
+    },
+    {
+      "name": "smarthealthconnect",
+      "source": {
+        "source": "url",
+        "url": "https://github.com/aks129/SmartHealthConnect.git"
+      },
+      "description": "Personal health management skills — preventive care gap tracking (HEDIS), medication refill monitoring, healthy habits dashboard, diet & exercise analytics, pediatric immunization schedules, and biomedical research / clinical trial monitoring.",
+      "version": "1.0.0",
+      "author": {
+        "name": "aks129"
+      },
+      "homepage": "https://github.com/aks129/SmartHealthConnect",
+      "repository": "https://github.com/aks129/SmartHealthConnect",
+      "license": "MIT",
+      "keywords": [
+        "fhir", "personal-health", "preventive-care", "hedis", "medications",
+        "pediatric", "immunizations", "wellness", "clinical-trials", "research"
+      ],
+      "category": "healthcare",
+      "tags": ["fhir", "personal-health", "wellness", "preventive-care", "pediatric"],
+      "strict": false
+    }
+  ]
+}

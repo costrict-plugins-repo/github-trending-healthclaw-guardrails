@@ -1,0 +1,139 @@
+{% extends "base.html" %}
+{% block surface %}surface-paper{% endblock %}
+{% block bstheme %}light{% endblock %}
+{% block title %}Skills · HealthClaw Guardrails{% endblock %}
+
+{% block head %}
+<style>
+  /* Skills catalogue. This block used to redeclare a whole palette
+     (--cyan, --bg-card, --border, --gray ...) that shadowed the site's own,
+     and asked for 'JetBrains Mono', which base.html has never loaded — so
+     every identifier here silently fell back to the platform monospace.
+     Both are the same defect: a second owner for a fact the design system
+     already owns. Tokens only now. */
+  .skills-hero { padding: var(--s6) 0 var(--s6);
+                 border-bottom: 2px solid var(--rule-firm); margin-bottom: var(--s6); }
+  .skills-eyebrow {
+    font-family: var(--mono); font-size: 0.75rem; letter-spacing: 0.09em;
+    text-transform: uppercase; color: var(--ink-faint); margin-bottom: var(--s3);
+  }
+  .skills-title { font-size: clamp(1.75rem, 3.6vw, 2.375rem); }
+  .skills-sub { font-size: 1.1875rem; color: var(--ink-soft);
+                max-width: var(--measure); margin-top: var(--s3); line-height: 1.55; }
+
+  .skills-grid {
+    display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+    gap: var(--s4); margin-bottom: var(--s7);
+  }
+  .skill-card {
+    background: var(--paper-raise); border: 1px solid var(--rule);
+    border-radius: var(--radius); padding: var(--s5);
+    display: flex; flex-direction: column;
+    transition: border-color 140ms ease-out;
+  }
+  .skill-card:hover { border-color: var(--rule-firm); }
+  .skill-card.entry { border-color: var(--signal); background: var(--signal-wash); }
+  .skill-name {
+    font-family: var(--mono); font-size: 0.9375rem; color: var(--signal-deep);
+    margin-bottom: var(--s2); word-break: break-word;
+  }
+  .skill-desc { font-size: 1rem; color: var(--ink-soft); line-height: 1.55;
+                flex-grow: 1; margin-bottom: var(--s4); }
+  .skill-footer {
+    display: flex; justify-content: space-between; align-items: center;
+    gap: var(--s3); font-family: var(--mono); font-size: 0.8125rem;
+    padding-top: var(--s3); border-top: 1px solid var(--rule);
+  }
+  .skill-meta { color: var(--ink-faint); }
+  .skill-link { color: var(--signal); text-decoration: none; }
+  .skill-link:hover { color: var(--signal-deep); text-decoration: underline; }
+
+  .quickstart-banner {
+    border: 1px solid var(--rule-firm); border-radius: var(--radius);
+    background: var(--paper-raise); padding: var(--s6);
+    margin: 0 0 var(--s6);
+    display: flex; align-items: center; gap: var(--s5); flex-wrap: wrap;
+  }
+  .quickstart-banner-text { flex: 1 1 280px; }
+  .quickstart-banner h3 { font-size: 1.375rem; margin: 0 0 var(--s2); }
+  .quickstart-banner p { color: var(--ink-soft); font-size: 1rem;
+                         line-height: 1.55; margin: 0; }
+  .quickstart-btn {
+    background: var(--ink); color: var(--paper); border: 1px solid var(--ink);
+    min-height: var(--tap); padding: 0 var(--s4);
+    display: inline-flex; align-items: center; border-radius: var(--radius);
+    font-family: var(--sans); font-size: 1rem; font-weight: 500;
+    text-decoration: none; cursor: pointer;
+    transition: background-color 140ms ease-out, border-color 140ms ease-out;
+  }
+  .quickstart-btn:hover { background: var(--signal); border-color: var(--signal);
+                          color: var(--paper); }
+
+  .skills-note { color: var(--ink-faint); font-size: 0.9375rem;
+                 margin-bottom: var(--s7); }
+
+  /* healthclaw.css carries a global reduced-motion override, but the policy
+     is restated where the motion is declared: a style block that gets copied
+     to another page must carry its own guard, and a reviewer reading this
+     block should not have to know a second file exists. */
+  @media (prefers-reduced-motion: reduce) {
+    .skill-card, .quickstart-btn { transition: none; }
+  }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="skills-hero">
+  <div class="skills-eyebrow">Skill catalogue · {{ skills|length }} loaded</div>
+  <h1 class="skills-title">OpenClaw skills</h1>
+  <p class="skills-sub">
+    Drop-in skills that teach Claude (and the OpenClaw personas — Sally, Mary,
+    Dom, Kristy) how to use HealthClaw guardrails, redact PHI, talk to upstream
+    FHIR servers, run data-quality curation, and pull personal health records.
+    Each skill triggers when its description matches the conversation.
+  </p>
+</div>
+
+<div class="quickstart-banner">
+  <div class="quickstart-banner-text">
+    <h3>New here? Start with the quickstart guide</h3>
+    <p>
+      A 30-minute walk from zero to a private, agent-mediated view of your own
+      records — OpenClaw, a FHIR server, your EHR connection, and HealthClaw,
+      all running on your machine.
+    </p>
+  </div>
+  <a class="quickstart-btn" href="{{ url_for('static', filename='healthclaw-quickstart.pdf') }}"
+     download>
+    <i class="fas fa-download me-1"></i>Download the PDF
+  </a>
+</div>
+
+<div class="skills-grid">
+  {% for s in skills %}
+  <div class="skill-card {% if s.slug == 'getting-started' %}entry{% endif %}">
+    <div class="skill-name">{{ s.name }}</div>
+    <div class="skill-desc">{{ s.description }}</div>
+    <div class="skill-footer">
+      <span class="skill-meta">
+        {% if s.version %}v{{ s.version }} · {% endif %}{{ s.license or 'MIT' }}
+      </span>
+      <a class="skill-link"
+         href="https://github.com/aks129/HealthClawGuardrails/blob/main/skills/{{ s.slug }}/SKILL.md"
+         target="_blank" rel="noopener">
+        SKILL.md →
+      </a>
+    </div>
+  </div>
+  {% else %}
+  <div class="skill-card">
+    <div class="skill-desc">No skills loaded.</div>
+  </div>
+  {% endfor %}
+</div>
+
+<div class="skills-note">
+  Source: <a href="https://github.com/aks129/HealthClawGuardrails/tree/main/skills"
+            class="skill-link" target="_blank" rel="noopener">github.com/aks129/HealthClawGuardrails/tree/main/skills</a>
+</div>
+{% endblock %}
